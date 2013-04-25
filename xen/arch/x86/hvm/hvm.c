@@ -3242,7 +3242,8 @@ static hvm_hypercall_t *const hvm_hypercall64_table[NR_hypercalls] = {
     HYPERCALL(set_timer_op),
     HYPERCALL(hvm_op),
     HYPERCALL(sysctl),
-    HYPERCALL(tmem_op)
+    HYPERCALL(tmem_op),
+    HYPERCALL(v4v_op)
 };
 
 #define COMPAT_CALL(x)                                        \
@@ -3259,7 +3260,8 @@ static hvm_hypercall_t *const hvm_hypercall32_table[NR_hypercalls] = {
     COMPAT_CALL(set_timer_op),
     HYPERCALL(hvm_op),
     HYPERCALL(sysctl),
-    HYPERCALL(tmem_op)
+    HYPERCALL(tmem_op),
+    HYPERCALL(v4v_op)
 };
 
 int hvm_do_hypercall(struct cpu_user_regs *regs)
