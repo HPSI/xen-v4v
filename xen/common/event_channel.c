@@ -51,6 +51,14 @@
 
 #define consumer_is_xen(e) (!!(e)->xen_consumer)
 
+/*jo : modification*/
+#define v4v_dprintk(format, args...)		\
+    do {					\
+        printk("%s:%d " format,			\
+               __FILE__, __LINE__, ## args );	\
+    } while ( 1 == 0 )
+
+
 /*
  * The function alloc_unbound_xen_event_channel() allows an arbitrary
  * notifier function to be specified. However, very few unique functions
@@ -602,6 +610,7 @@ int evtchn_send(struct domain *d, unsigned int lport)
     switch ( lchn->state )
     {
     case ECS_INTERDOMAIN:
+        //v4v_dprintk("evt_chn_send : INTERDOMAIN\n");
         rd    = lchn->u.interdomain.remote_dom;
         rport = lchn->u.interdomain.remote_port;
         rchn  = evtchn_from_port(rd, rport);
@@ -612,12 +621,15 @@ int evtchn_send(struct domain *d, unsigned int lport)
             evtchn_set_pending(rvcpu, rport);
         break;
     case ECS_IPI:
+        //v4v_dprintk("evtchn_send : ECS_IPI\n");
         evtchn_set_pending(ld->vcpu[lchn->notify_vcpu_id], lport);
         break;
     case ECS_UNBOUND:
+        //v4v_dprintk("evtchn_send : UNBOUND\n");
         /* silently drop the notification */
         break;
     default:
+        //v4v_dprintk("evtchn_send : default\n");
         ret = -EINVAL;
     }
 
