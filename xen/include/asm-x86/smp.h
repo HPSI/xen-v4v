@@ -12,7 +12,7 @@
 #endif
 
 #ifndef __ASSEMBLY__
-#include <asm/bitops.h>
+#include <xen/bitops.h>
 #include <asm/mpspec.h>
 #endif
 
@@ -29,7 +29,8 @@ DECLARE_PER_CPU(cpumask_var_t, cpu_core_mask);
 
 void smp_send_nmi_allbutself(void);
 
-void  send_IPI_mask(const cpumask_t *mask, int vector);
+void send_IPI_mask(const cpumask_t *, int vector);
+void send_IPI_self(int vector);
 
 extern void (*mtrr_hook) (void);
 
@@ -37,7 +38,6 @@ extern void zap_low_mappings(void);
 
 #define MAX_APICID 256
 extern u32 x86_cpu_to_apicid[];
-extern u32 cpu_2_logical_apicid[];
 
 #define cpu_physical_id(cpu)	x86_cpu_to_apicid[cpu]
 
@@ -54,7 +54,6 @@ int cpu_add(uint32_t apic_id, uint32_t acpi_id, uint32_t pxm);
 #define raw_smp_processor_id() (get_processor_id())
 
 int hard_smp_processor_id(void);
-int logical_smp_processor_id(void);
 
 void __stop_this_cpu(void);
 

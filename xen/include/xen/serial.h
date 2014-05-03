@@ -9,6 +9,7 @@
 #ifndef __XEN_SERIAL_H__
 #define __XEN_SERIAL_H__
 
+#include <xen/init.h>
 #include <xen/spinlock.h>
 
 struct cpu_user_regs;
@@ -29,6 +30,14 @@ enum serial_port_state {
     serial_unused,
     serial_parsed,
     serial_initialized
+};
+
+struct vuart_info {
+    paddr_t base_addr;          /* Base address of the UART */
+    unsigned long size;         /* Size of the memory region */
+    unsigned long data_off;     /* Data register offset */
+    unsigned long status_off;   /* Status register offset */
+    unsigned long status;       /* Ready status value */
 };
 
 struct serial_port {
@@ -61,8 +70,9 @@ struct uart_driver {
     /* Driver suspend/resume. */
     void (*suspend)(struct serial_port *);
     void (*resume)(struct serial_port *);
-    /* Return number of characters the port can hold for transmit. */
-    unsigned int (*tx_ready)(struct serial_port *);
+    /* Return number of characters the port can hold for transmit,
+     * or -EIO if port is inaccesible */
+    int (*tx_ready)(struct serial_port *);
     /* Put a character onto the serial line. */
     void (*putc)(struct serial_port *, char);
     /* Flush accumulated characters. */
@@ -71,13 +81,18 @@ struct uart_driver {
     int  (*getc)(struct serial_port *, char *);
     /* Get IRQ number for this port's serial line: returns -1 if none. */
     int  (*irq)(struct serial_port *);
+    /* Get IRQ device node for this port's serial line: returns NULL if none. */
+    const struct dt_irq *(*dt_irq_get)(struct serial_port *);
+    /* Get serial information */
+    const struct vuart_info *(*vuart_info)(struct serial_port *);
 };
 
 /* 'Serial handles' are composed from the following fields. */
-#define SERHND_IDX      (3<<0) /* COM1, COM2, or DBGP?                    */
+#define SERHND_IDX      (3<<0) /* COM1, COM2, DBGP, DTUART?               */
 # define SERHND_COM1    (0<<0)
 # define SERHND_COM2    (1<<0)
 # define SERHND_DBGP    (2<<0)
+# define SERHND_DTUART  (0<<0) /* Steal SERHND_COM1 value */
 #define SERHND_HI       (1<<2) /* Mux/demux each transferred char by MSB. */
 #define SERHND_LO       (1<<3) /* Ditto, except that the MSB is cleared.  */
 #define SERHND_COOKED   (1<<4) /* Newline/carriage-return translation?    */
@@ -120,6 +135,12 @@ void serial_end_log_everything(int handle);
 /* Return irq number for specified serial port (identified by index). */
 int serial_irq(int idx);
 
+/* Return irq device node for specified serial port (identified by index). */
+const struct dt_irq *serial_dt_irq(int idx);
+
+/* Retrieve basic UART information to emulate it (base address, size...) */
+const struct vuart_info* serial_vuart_info(int idx);
+
 /* Serial suspend/resume. */
 void serial_suspend(void);
 void serial_resume(void);
@@ -150,7 +171,7 @@ struct ns16550_defaults {
 void ns16550_init(int index, struct ns16550_defaults *defaults);
 void ehci_dbgp_init(void);
 
-void pl011_init(int index, unsigned long register_base_address);
+void __init dt_uart_init(void);
 
 struct physdev_dbgp_op;
 int dbgp_op(const struct physdev_dbgp_op *);
@@ -163,7 +184,7 @@ int dbgp_op(const struct physdev_dbgp_op *);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

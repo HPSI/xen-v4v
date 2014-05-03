@@ -32,7 +32,6 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <inttypes.h>
-#include <errno.h>
 #include "xc_private.h"
 #include "xenctrl.h"
 #include "xg_save_restore.h"
@@ -457,16 +456,11 @@ void xc_compression_free_context(xc_interface *xch, comp_ctx *ctx)
 {
     if (!ctx) return;
 
-    if (ctx->inputbuf)
-        free(ctx->inputbuf);
-    if (ctx->sendbuf_pfns)
-        free(ctx->sendbuf_pfns);
-    if (ctx->cache_base)
-        free(ctx->cache_base);
-    if (ctx->pfn2cache)
-        free(ctx->pfn2cache);
-    if (ctx->cache)
-        free(ctx->cache);
+    free(ctx->inputbuf);
+    free(ctx->sendbuf_pfns);
+    free(ctx->cache_base);
+    free(ctx->pfn2cache);
+    free(ctx->cache);
     free(ctx);
 }
 
@@ -544,7 +538,7 @@ error:
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

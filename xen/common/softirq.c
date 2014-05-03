@@ -58,7 +58,7 @@ void process_pending_softirqs(void)
 
 asmlinkage void do_softirq(void)
 {
-    ASSERT(!in_atomic());
+    ASSERT_NOT_IN_ATOMIC();
     __do_softirq(0);
 }
 
@@ -100,7 +100,7 @@ void __init softirq_init(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

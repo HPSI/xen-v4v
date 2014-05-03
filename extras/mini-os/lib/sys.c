@@ -27,8 +27,11 @@
 #include <netfront.h>
 #include <blkfront.h>
 #include <fbfront.h>
+#include <tpmfront.h>
+#include <tpm_tis.h>
 #include <xenbus.h>
 #include <xenstore.h>
+#include <poll.h>
 
 #include <sys/types.h>
 #include <sys/unistd.h>
@@ -294,6 +297,16 @@ int read(int fd, void *buf, size_t nbytes)
 	    return blkfront_posix_read(fd, buf, nbytes);
         }
 #endif
+#ifdef CONFIG_TPMFRONT
+        case FTYPE_TPMFRONT: {
+	    return tpmfront_posix_read(fd, buf, nbytes);
+        }
+#endif
+#ifdef CONFIG_TPM_TIS
+        case FTYPE_TPM_TIS: {
+	    return tpm_tis_posix_read(fd, buf, nbytes);
+        }
+#endif
 	default:
 	    break;
     }
@@ -330,6 +343,14 @@ int write(int fd, const void *buf, size_t nbytes)
 	case FTYPE_BLK:
 	    return blkfront_posix_write(fd, buf, nbytes);
 #endif
+#ifdef CONFIG_TPMFRONT
+	case FTYPE_TPMFRONT:
+	    return tpmfront_posix_write(fd, buf, nbytes);
+#endif
+#ifdef CONFIG_TPM_TIS
+	case FTYPE_TPM_TIS:
+	    return tpm_tis_posix_write(fd, buf, nbytes);
+#endif
 	default:
 	    break;
     }
@@ -340,37 +361,54 @@ int write(int fd, const void *buf, size_t nbytes)
 
 off_t lseek(int fd, off_t offset, int whence)
 {
+    off_t* target = NULL;
     switch(files[fd].type) {
 #ifdef CONFIG_BLKFRONT
        case FTYPE_BLK:
-	  switch (whence) {
-	     case SEEK_SET:
-		files[fd].file.offset = offset;
-		break;
-	     case SEEK_CUR:
-		files[fd].file.offset += offset;
-		break;
-	     case SEEK_END:
-		{
-		   struct stat st;
-		   int ret;
-		   ret = fstat(fd, &st);
-		   if (ret)
-		      return -1;
-		   files[fd].file.offset = st.st_size + offset;
-		   break;
-		}
-	     default:
-		errno = EINVAL;
-		return -1;
-	  }
-	  return files[fd].file.offset;
-	  break;
+          target = &files[fd].blk.offset;
+          break;
 #endif
-       default: /* Not implemented on this FTYPE */
-	  errno = ESPIPE;
-	  return (off_t) -1;
+#ifdef CONFIG_TPMFRONT
+       case FTYPE_TPMFRONT:
+          target = &files[fd].tpmfront.offset;
+          break;
+#endif
+#ifdef CONFIG_TPM_TIS
+       case FTYPE_TPM_TIS:
+          target = &files[fd].tpm_tis.offset;
+          break;
+#endif
+       case FTYPE_FILE:
+          target = &files[fd].file.offset;
+          break;
+       default:
+          /* Not implemented for this filetype */
+          errno = ESPIPE;
+          return (off_t) -1;
     }
+
+    switch (whence) {
+       case SEEK_SET:
+          *target = offset;
+          break;
+       case SEEK_CUR:
+          *target += offset;
+          break;
+       case SEEK_END:
+          {
+             struct stat st;
+             int ret;
+             ret = fstat(fd, &st);
+             if (ret)
+                return -1;
+             *target = st.st_size + offset;
+             break;
+          }
+       default:
+          errno = EINVAL;
+          return -1;
+    }
+    return *target;
 }
 
 int fsync(int fd) {
@@ -417,6 +455,18 @@ int close(int fd)
 #ifdef CONFIG_BLKFRONT
 	case FTYPE_BLK:
             shutdown_blkfront(files[fd].blk.dev);
+	    files[fd].type = FTYPE_NONE;
+	    return 0;
+#endif
+#ifdef CONFIG_TPMFRONT
+	case FTYPE_TPMFRONT:
+            shutdown_tpmfront(files[fd].tpmfront.dev);
+	    files[fd].type = FTYPE_NONE;
+	    return 0;
+#endif
+#ifdef CONFIG_TPM_TIS
+	case FTYPE_TPM_TIS:
+            shutdown_tpm_tis(files[fd].tpm_tis.dev);
 	    files[fd].type = FTYPE_NONE;
 	    return 0;
 #endif
@@ -488,6 +538,14 @@ int fstat(int fd, struct stat *buf)
 #ifdef CONFIG_BLKFRONT
 	case FTYPE_BLK:
 	   return blkfront_posix_fstat(fd, buf);
+#endif
+#ifdef CONFIG_TPMFRONT
+	case FTYPE_TPMFRONT:
+	   return tpmfront_posix_fstat(fd, buf);
+#endif
+#ifdef CONFIG_TPM_TIS
+	case FTYPE_TPM_TIS:
+	   return tpm_tis_posix_fstat(fd, buf);
 #endif
 	default:
 	    break;
@@ -619,6 +677,29 @@ static void dump_set(int nfds, fd_set *readfds, fd_set *writefds, fd_set *except
 }
 #else
 #define dump_set(nfds, readfds, writefds, exceptfds, timeout)
+#endif
+
+#ifdef LIBC_DEBUG
+static void dump_pollfds(struct pollfd *pfd, int nfds, int timeout)
+{
+    int i, comma, fd;
+
+    printk("[");
+    comma = 0;
+    for (i = 0; i < nfds; i++) {
+        fd = pfd[i].fd;
+        if (comma)
+            printk(", ");
+        printk("%d(%c)/%02x", fd, file_types[files[fd].type],
+            pfd[i].events);
+            comma = 1;
+    }
+    printk("]");
+
+    printk(", %d, %d", nfds, timeout);
+}
+#else
+#define dump_pollfds(pfds, nfds, timeout)
 #endif
 
 /* Just poll without blocking */
@@ -926,6 +1007,98 @@ out:
     return ret;
 }
 
+/* Wrap around select */
+int poll(struct pollfd _pfd[], nfds_t _nfds, int _timeout)
+{
+    int n, ret;
+    int i, fd;
+    struct timeval _timeo, *timeo = NULL;
+    fd_set rfds, wfds, efds;
+    int max_fd = -1;
+
+    DEBUG("poll(");
+    dump_pollfds(_pfd, _nfds, _timeout);
+    DEBUG(")\n");
+
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+
+    n = 0;
+
+    for (i = 0; i < _nfds; i++) {
+        fd = _pfd[i].fd;
+        _pfd[i].revents = 0;
+
+        /* fd < 0, revents = 0, which is already set */
+        if (fd < 0) continue;
+
+        /* fd is invalid, revents = POLLNVAL, increment counter */
+        if (fd >= NOFILE || files[fd].type == FTYPE_NONE) {
+            n++;
+            _pfd[i].revents |= POLLNVAL;
+            continue;
+        }
+
+        /* normal case, map POLL* into readfds and writefds:
+         * POLLIN  -> readfds
+         * POLLOUT -> writefds
+         * POLL*   -> none
+         */
+        if (_pfd[i].events & POLLIN)
+            FD_SET(fd, &rfds);
+        if (_pfd[i].events & POLLOUT)
+            FD_SET(fd, &wfds);
+        /* always set exceptfds */
+        FD_SET(fd, &efds);
+        if (fd > max_fd)
+            max_fd = fd;
+    }
+
+    /* should never sleep when we already have events */
+    if (n) {
+        _timeo.tv_sec  = 0;
+        _timeo.tv_usec = 0;
+        timeo = &_timeo;
+    } else if (_timeout >= 0) {
+        /* normal case, construct _timeout, might sleep */
+        _timeo.tv_sec  = _timeout / 1000;
+        _timeo.tv_usec = (_timeout % 1000) * 1000;
+        timeo = &_timeo;
+    } else {
+        /* _timeout < 0, block forever */
+        timeo = NULL;
+    }
+
+
+    ret = select(max_fd+1, &rfds, &wfds, &efds, timeo);
+    /* error in select, just return, errno is set by select() */
+    if (ret < 0)
+        return ret;
+
+    for (i = 0; i < _nfds; i++) {
+        fd = _pfd[i].fd;
+
+        /* the revents has already been set for all error case */
+        if (fd < 0 || fd >= NOFILE || files[fd].type == FTYPE_NONE)
+            continue;
+
+        if (FD_ISSET(fd, &rfds) || FD_ISSET(fd, &wfds) || FD_ISSET(fd, &efds))
+            n++;
+        if (FD_ISSET(fd, &efds)) {
+            /* anything bad happens we set POLLERR */
+            _pfd[i].revents |= POLLERR;
+            continue;
+        }
+        if (FD_ISSET(fd, &rfds))
+            _pfd[i].revents |= POLLIN;
+        if (FD_ISSET(fd, &wfds))
+            _pfd[i].revents |= POLLOUT;
+    }
+
+    return n;
+}
+
 #ifdef HAVE_LWIP
 int socket(int domain, int type, int protocol)
 {
@@ -983,8 +1156,7 @@ LWIP_STUB(int, getsockname, (int s, struct sockaddr *name, socklen_t *namelen), 
 static char *syslog_ident;
 void openlog(const char *ident, int option, int facility)
 {
-    if (syslog_ident)
-        free(syslog_ident);
+    free(syslog_ident);
     syslog_ident = strdup(ident);
 }
 
@@ -1303,7 +1475,6 @@ unsupported_function(int, tcgetattr, 0);
 unsupported_function(int, grantpt, -1);
 unsupported_function(int, unlockpt, -1);
 unsupported_function(char *, ptsname, NULL);
-unsupported_function(int, poll, -1);
 
 /* net/if.h */
 unsupported_function_log(unsigned int, if_nametoindex, -1);

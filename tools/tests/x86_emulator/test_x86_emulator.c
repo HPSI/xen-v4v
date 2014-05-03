@@ -7,6 +7,8 @@
 #include <xen/xen.h>
 #include <sys/mman.h>
 
+#define __packed __attribute__((packed))
+
 #include "x86_emulate/x86_emulate.h"
 #include "blowfish.h"
 
@@ -21,7 +23,21 @@
 #define EFLG_PF (1<<2)
 #define EFLG_CF (1<<0)
 
+static unsigned int bytes_read;
+
 static int read(
+    unsigned int seg,
+    unsigned long offset,
+    void *p_data,
+    unsigned int bytes,
+    struct x86_emulate_ctxt *ctxt)
+{
+    bytes_read += bytes;
+    memcpy(p_data, (void *)offset, bytes);
+    return X86EMUL_OKAY;
+}
+
+static int fetch(
     unsigned int seg,
     unsigned long offset,
     void *p_data,
@@ -86,19 +102,31 @@ static int cpuid(
 
 static inline uint64_t xgetbv(uint32_t xcr)
 {
-    uint64_t res;
+    uint32_t lo, hi;
 
-    asm ( ".byte 0x0f, 0x01, 0xd0" : "=A" (res) : "c" (xcr) );
+    asm ( ".byte 0x0f, 0x01, 0xd0" : "=a" (lo), "=d" (hi) : "c" (xcr) );
 
-    return res;
+    return ((uint64_t)hi << 32) | lo;
 }
 
 #define cpu_has_avx ({ \
-    unsigned int eax = 1, ecx = 0, edx; \
-    cpuid(&eax, &edx, &ecx, &edx, NULL); \
+    unsigned int eax = 1, ecx = 0; \
+    cpuid(&eax, &eax, &ecx, &eax, NULL); \
     if ( !(ecx & (1U << 27)) || ((xgetbv(0) & 6) != 6) ) \
         ecx = 0; \
     (ecx & (1U << 28)) != 0; \
+})
+
+#define cpu_has_avx2 ({ \
+    unsigned int eax = 1, ebx, ecx = 0; \
+    cpuid(&eax, &ebx, &ecx, &eax, NULL); \
+    if ( !(ecx & (1U << 27)) || ((xgetbv(0) & 6) != 6) ) \
+        ebx = 0; \
+    else { \
+        eax = 7, ecx = 0; \
+        cpuid(&eax, &ebx, &ecx, &eax, NULL); \
+    } \
+    (ebx & (1U << 5)) != 0; \
 })
 
 int get_fpu(
@@ -111,14 +139,14 @@ int get_fpu(
     {
     case X86EMUL_FPU_fpu:
         break;
-    case X86EMUL_FPU_ymm:
-        if ( cpu_has_avx )
+    case X86EMUL_FPU_mmx:
+        if ( cpu_has_mmx )
             break;
     case X86EMUL_FPU_xmm:
         if ( cpu_has_sse )
             break;
-    case X86EMUL_FPU_mmx:
-        if ( cpu_has_mmx )
+    case X86EMUL_FPU_ymm:
+        if ( cpu_has_avx )
             break;
     default:
         return X86EMUL_UNHANDLEABLE;
@@ -128,7 +156,7 @@ int get_fpu(
 
 static struct x86_emulate_ops emulops = {
     .read       = read,
-    .insn_fetch = read,
+    .insn_fetch = fetch,
     .write      = write,
     .cmpxchg    = cmpxchg,
     .cpuid      = cpuid,
@@ -150,8 +178,8 @@ int main(int argc, char **argv)
 
     ctxt.regs = &regs;
     ctxt.force_writeback = 0;
-    ctxt.addr_size = 32;
-    ctxt.sp_size   = 32;
+    ctxt.addr_size = 8 * sizeof(void *);
+    ctxt.sp_size   = 8 * sizeof(void *);
 
     res = mmap((void *)0x100000, MMAP_SZ, PROT_READ|PROT_WRITE|PROT_EXEC,
                MAP_FIXED|MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
@@ -416,6 +444,44 @@ int main(int argc, char **argv)
         goto fail;
     printf("okay\n");
 
+#ifndef __x86_64__
+    printf("%-40s", "Testing arpl %cx,(%%eax)...");
+    instr[0] = 0x63; instr[1] = 0x08;
+    regs.eflags = 0x200;
+    regs.eip    = (unsigned long)&instr[0];
+    regs.ecx    = 0x22222222;
+    regs.eax    = (unsigned long)res;
+    *res        = 0x33331111;
+    bytes_read  = 0;
+    rc = x86_emulate(&ctxt, &emulops);
+    if ( (rc != X86EMUL_OKAY) ||
+         (*res != 0x33331112) ||
+         (regs.ecx != 0x22222222) ||
+         !(regs.eflags & EFLG_ZF) ||
+         (regs.eip != (unsigned long)&instr[2]) )
+        goto fail;
+#else
+    printf("%-40s", "Testing movsxd (%%rax),%%rcx...");
+    instr[0] = 0x48; instr[1] = 0x63; instr[2] = 0x08;
+    regs.eip    = (unsigned long)&instr[0];
+    regs.ecx    = 0x123456789abcdef;
+    regs.eax    = (unsigned long)res;
+    *res        = 0xfedcba98;
+    bytes_read  = 0;
+    rc = x86_emulate(&ctxt, &emulops);
+    if ( (rc != X86EMUL_OKAY) ||
+         (*res != 0xfedcba98) ||
+         (regs.ecx != 0xfffffffffedcba98) ||
+         (regs.eip != (unsigned long)&instr[3]) )
+        goto fail;
+    if ( bytes_read != 4 )
+    {
+        printf("%u bytes read - ", bytes_read);
+        goto fail;
+    }
+#endif
+    printf("okay\n");
+
     printf("%-40s", "Testing xadd %%ax,(%%ecx)...");
     instr[0] = 0x66; instr[1] = 0x0f; instr[2] = 0xc1; instr[3] = 0x01;
     regs.eflags = 0x200;
@@ -433,7 +499,11 @@ int main(int argc, char **argv)
     printf("okay\n");
 
     printf("%-40s", "Testing dec %%ax...");
+#ifndef __x86_64__
     instr[0] = 0x66; instr[1] = 0x48;
+#else
+    instr[0] = 0x66; instr[1] = 0xff; instr[2] = 0xc8;
+#endif
     regs.eflags = 0x200;
     regs.eip    = (unsigned long)&instr[0];
     regs.eax    = 0x00000000;
@@ -441,7 +511,7 @@ int main(int argc, char **argv)
     if ( (rc != X86EMUL_OKAY) ||
          (regs.eax != 0x0000ffff) ||
          ((regs.eflags&0x240) != 0x200) ||
-         (regs.eip != (unsigned long)&instr[2]) )
+         (regs.eip != (unsigned long)&instr[2 + (ctxt.addr_size > 32)]) )
         goto fail;
     printf("okay\n");
 
@@ -629,6 +699,73 @@ int main(int argc, char **argv)
     else
         printf("skipped\n");
 
+    printf("%-40s", "Testing vmovdqu %ymm2,(%ecx)...");
+    if ( stack_exec && cpu_has_avx )
+    {
+        extern const unsigned char vmovdqu_to_mem[];
+
+        asm volatile ( "vpcmpeqb %%xmm2, %%xmm2, %%xmm2\n"
+                       ".pushsection .test, \"a\", @progbits\n"
+                       "vmovdqu_to_mem: vmovdqu %%ymm2, (%0)\n"
+                       ".popsection" :: "c" (NULL) );
+
+        memcpy(instr, vmovdqu_to_mem, 15);
+        memset(res, 0x55, 128);
+        memset(res + 16, 0xff, 16);
+        memset(res + 20, 0x00, 16);
+        regs.eip    = (unsigned long)&instr[0];
+        regs.ecx    = (unsigned long)res;
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) || memcmp(res, res + 16, 64) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
+    printf("%-40s", "Testing vmovdqu (%edx),%ymm4...");
+    if ( stack_exec && cpu_has_avx )
+    {
+        extern const unsigned char vmovdqu_from_mem[];
+
+#if 0 /* Don't use AVX2 instructions for now */
+        asm volatile ( "vpcmpgtb %%ymm4, %%ymm4, %%ymm4\n"
+#else
+        asm volatile ( "vpcmpgtb %%xmm4, %%xmm4, %%xmm4\n\t"
+                       "vinsertf128 $1, %%xmm4, %%ymm4, %%ymm4\n"
+#endif
+                       ".pushsection .test, \"a\", @progbits\n"
+                       "vmovdqu_from_mem: vmovdqu (%0), %%ymm4\n"
+                       ".popsection" :: "d" (NULL) );
+
+        memcpy(instr, vmovdqu_from_mem, 15);
+        memset(res + 4, 0xff, 16);
+        regs.eip    = (unsigned long)&instr[0];
+        regs.ecx    = 0;
+        regs.edx    = (unsigned long)res;
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( rc != X86EMUL_OKAY )
+            goto fail;
+#if 0 /* Don't use AVX2 instructions for now */
+        asm ( "vpcmpeqb %%ymm2, %%ymm2, %%ymm2\n\t"
+              "vpcmpeqb %%ymm4, %%ymm2, %%ymm0\n\t"
+              "vpmovmskb %%ymm1, %0" : "=r" (rc) );
+#else
+        asm ( "vextractf128 $1, %%ymm4, %%xmm3\n\t"
+              "vpcmpeqb %%xmm2, %%xmm2, %%xmm2\n\t"
+              "vpcmpeqb %%xmm4, %%xmm2, %%xmm0\n\t"
+              "vpcmpeqb %%xmm3, %%xmm2, %%xmm1\n\t"
+              "vpmovmskb %%xmm0, %0\n\t"
+              "vpmovmskb %%xmm1, %1" : "=r" (rc), "=r" (i) );
+        rc |= i << 16;
+#endif
+        if ( rc != 0xffffffff )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
     printf("%-40s", "Testing movsd %xmm5,(%ecx)...");
     memset(res, 0x77, 64);
     memset(res + 10, 0x66, 8);
@@ -683,12 +820,67 @@ int main(int argc, char **argv)
     else
         printf("skipped\n");
 
+    printf("%-40s", "Testing vmovsd %xmm5,(%ecx)...");
+    memset(res, 0x88, 64);
+    memset(res + 10, 0x77, 8);
+    if ( stack_exec && cpu_has_avx )
+    {
+        extern const unsigned char vmovsd_to_mem[];
+
+        asm volatile ( "vbroadcastsd %0, %%ymm5\n"
+                       ".pushsection .test, \"a\", @progbits\n"
+                       "vmovsd_to_mem: vmovsd %%xmm5, (%1)\n"
+                       ".popsection" :: "m" (res[10]), "c" (NULL) );
+
+        memcpy(instr, vmovsd_to_mem, 15);
+        regs.eip    = (unsigned long)&instr[0];
+        regs.ecx    = (unsigned long)(res + 2);
+        regs.edx    = 0;
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( (rc != X86EMUL_OKAY) || memcmp(res, res + 8, 32) )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+    {
+        printf("skipped\n");
+        memset(res + 2, 0x77, 8);
+    }
+
+    printf("%-40s", "Testing vmovaps (%edx),%ymm7...");
+    if ( stack_exec && cpu_has_avx )
+    {
+        extern const unsigned char vmovaps_from_mem[];
+
+        asm volatile ( "vxorps %%ymm7, %%ymm7, %%ymm7\n"
+                       ".pushsection .test, \"a\", @progbits\n"
+                       "vmovaps_from_mem: vmovaps (%0), %%ymm7\n"
+                       ".popsection" :: "d" (NULL) );
+
+        memcpy(instr, vmovaps_from_mem, 15);
+        regs.eip    = (unsigned long)&instr[0];
+        regs.ecx    = 0;
+        regs.edx    = (unsigned long)res;
+        rc = x86_emulate(&ctxt, &emulops);
+        if ( rc != X86EMUL_OKAY )
+            goto fail;
+        asm ( "vcmpeqps %1, %%ymm7, %%ymm0\n\t"
+              "vmovmskps %%ymm0, %0" : "=r" (rc) : "m" (res[8]) );
+        if ( rc != 0xff )
+            goto fail;
+        printf("okay\n");
+    }
+    else
+        printf("skipped\n");
+
     for ( j = 1; j <= 2; j++ )
     {
 #if defined(__i386__)
         if ( j == 2 ) break;
         memcpy(res, blowfish32_code, sizeof(blowfish32_code));
 #else
+        ctxt.addr_size = 16 << j;
+        ctxt.sp_size   = 16 << j;
         memcpy(res, (j == 1) ? blowfish32_code : blowfish64_code,
                (j == 1) ? sizeof(blowfish32_code) : sizeof(blowfish64_code));
 #endif

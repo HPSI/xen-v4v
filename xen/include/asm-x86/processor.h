@@ -35,6 +35,7 @@
  * EFLAGS bits
  */
 #define X86_EFLAGS_CF	0x00000001 /* Carry Flag */
+#define X86_EFLAGS_MBS	0x00000002 /* Resvd bit */
 #define X86_EFLAGS_PF	0x00000004 /* Parity Flag */
 #define X86_EFLAGS_AF	0x00000010 /* Auxillary carry Flag */
 #define X86_EFLAGS_ZF	0x00000040 /* Zero Flag */
@@ -87,6 +88,7 @@
 #define X86_CR4_PCIDE		0x20000 /* enable PCID */
 #define X86_CR4_OSXSAVE	0x40000 /* enable XSAVE/XRSTOR */
 #define X86_CR4_SMEP		0x100000/* enable SMEP */
+#define X86_CR4_SMAP		0x200000/* enable SMAP */
 
 /*
  * Trap/fault mnemonics.
@@ -160,6 +162,7 @@ struct cpuinfo_x86 {
     __u8 x86_model;
     __u8 x86_mask;
     int  cpuid_level;    /* Maximum supported CPUID level, -1=no CPUID */
+    __u32 extended_cpuid_level; /* Maximum supported CPUID extended level */
     unsigned int x86_capability[NCAPINTS];
     char x86_vendor_id[16];
     char x86_model_id[64];
@@ -409,7 +412,7 @@ static always_inline void __mwait(unsigned long eax, unsigned long ecx)
 #define IOBMP_BYTES             8192
 #define IOBMP_INVALID_OFFSET    0x8000
 
-struct tss_struct {
+struct __packed __cacheline_aligned tss_struct {
     unsigned short	back_link,__blh;
     union { u64 rsp0, esp0; };
     union { u64 rsp1, esp1; };
@@ -423,12 +426,22 @@ struct tss_struct {
     u16 bitmap;
     /* Pads the TSS to be cacheline-aligned (total size is 0x80). */
     u8 __cacheline_filler[24];
-} __cacheline_aligned __attribute__((packed));
+};
 
-#define IST_DF  1UL
-#define IST_NMI 2UL
-#define IST_MCE 3UL
-#define IST_MAX 3UL
+#define IST_NONE 0UL
+#define IST_DF   1UL
+#define IST_NMI  2UL
+#define IST_MCE  3UL
+#define IST_MAX  3UL
+
+/* Set the interrupt stack table used by a particular interrupt
+ * descriptor table entry. */
+static always_inline void set_ist(idt_entry_t *idt, unsigned long ist)
+{
+    /* IST is a 3 bit field, 32 bits into the IDT entry. */
+    ASSERT(ist <= IST_MAX);
+    idt->a = (idt->a & ~(7UL << 32)) | (ist << 32);
+}
 
 #define IDT_ENTRIES 256
 extern idt_entry_t idt_table[];
@@ -449,17 +462,6 @@ long set_gdt(struct vcpu *d,
              unsigned long *frames, 
              unsigned int entries);
 
-#define write_debugreg(reg, val) do {                       \
-    unsigned long __val = val;                              \
-    asm volatile ( "mov %0,%%db" #reg : : "r" (__val) );    \
-} while (0)
-#define read_debugreg(reg) ({                               \
-    unsigned long __val;                                    \
-    asm volatile ( "mov %%db" #reg ",%0" : "=r" (__val) );  \
-    __val;                                                  \
-})
-long set_debugreg(struct vcpu *p, int reg, unsigned long value);
-
 /* REP NOP (PAUSE) is a good thing to insert into busy-wait loops. */
 static always_inline void rep_nop(void)
 {
@@ -468,41 +470,13 @@ static always_inline void rep_nop(void)
 
 #define cpu_relax() rep_nop()
 
-/* Prefetch instructions for Pentium III and AMD Athlon */
-#ifdef 	CONFIG_MPENTIUMIII
-
-#define ARCH_HAS_PREFETCH
-extern always_inline void prefetch(const void *x)
-{
-    asm volatile ( "prefetchnta (%0)" : : "r"(x) );
-}
-
-#elif CONFIG_X86_USE_3DNOW
-
-#define ARCH_HAS_PREFETCH
-#define ARCH_HAS_PREFETCHW
-#define ARCH_HAS_SPINLOCK_PREFETCH
-
-extern always_inline void prefetch(const void *x)
-{
-    asm volatile ( "prefetch (%0)" : : "r"(x) );
-}
-
-extern always_inline void prefetchw(const void *x)
-{
-    asm volatile ( "prefetchw (%0)" : : "r"(x) );
-}
-#define spin_lock_prefetch(x)	prefetchw(x)
-
-#endif
-
 void show_stack(struct cpu_user_regs *regs);
-void show_stack_overflow(unsigned int cpu, unsigned long esp);
+void show_stack_overflow(unsigned int cpu, const struct cpu_user_regs *regs);
 void show_registers(struct cpu_user_regs *regs);
 void show_execution_state(struct cpu_user_regs *regs);
 #define dump_execution_state() run_in_exception_handler(show_execution_state)
 void show_page_walk(unsigned long addr);
-void fatal_trap(int trapnr, struct cpu_user_regs *regs);
+void noreturn fatal_trap(int trapnr, struct cpu_user_regs *regs);
 
 void compat_show_guest_stack(struct vcpu *, struct cpu_user_regs *, int lines);
 
@@ -535,6 +509,10 @@ DECLARE_TRAP_HANDLER(alignment_check);
 DECLARE_TRAP_HANDLER(spurious_interrupt_bug);
 #undef DECLARE_TRAP_HANDLER
 
+void trap_nop(void);
+void enable_nmis(void);
+void noreturn do_nmi_crash(struct cpu_user_regs *regs);
+
 void syscall_enter(void);
 void sysenter_entry(void);
 void sysenter_eflags_saved(void);
@@ -552,6 +530,8 @@ void microcode_set_module(unsigned int);
 int microcode_update(XEN_GUEST_HANDLE_PARAM(const_void), unsigned long len);
 int microcode_resume_cpu(int cpu);
 
+void pv_cpuid(struct cpu_user_regs *regs);
+
 #endif /* !__ASSEMBLY__ */
 
 #endif /* __ASM_X86_PROCESSOR_H */
@@ -559,7 +539,7 @@ int microcode_resume_cpu(int cpu);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

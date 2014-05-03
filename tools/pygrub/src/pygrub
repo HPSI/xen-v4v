@@ -360,11 +360,7 @@ class Grub:
                 curline = len(img.lines) - 1
 
         if self.isdone:
-           # Fix to allow pygrub command-line editing in Lilo bootloader (used by IA64)
-           if platform.machine() == 'ia64':
-              origimg.reset(img.lines, img.path)
-           else:
-              origimg.reset(img.lines)
+           origimg.reset(img.lines)
 
     def edit_line(self, line):
         self.screen.erase()
@@ -416,24 +412,16 @@ class Grub:
         if not os.access(fn, os.R_OK):
             raise RuntimeError, "Unable to access %s" %(fn,)
 
-        if platform.machine() == 'ia64':
-            cfg_list = map(lambda x: (x,grub.LiloConf.LiloConfigFile), 
-                           # common distributions
-                           ["/efi/debian/elilo.conf", "/efi/gentoo/elilo.conf", 
-                            "/efi/redflag/elilo.conf", "/efi/redhat/elilo.conf", 
-                            "/efi/SuSE/elilo.conf",] + 
-                           # fallbacks
-                           ["/efi/boot/elilo.conf", "/elilo.conf",])
-        else:
-            cfg_list = map(lambda x: (x,grub.GrubConf.Grub2ConfigFile),
-                           ["/boot/grub/grub.cfg", "/grub/grub.cfg",
-                            "/boot/grub2/grub.cfg", "/grub2/grub.cfg"]) + \
-                       map(lambda x: (x,grub.ExtLinuxConf.ExtLinuxConfigFile),
-                           ["/boot/isolinux/isolinux.cfg",
-                            "/boot/extlinux.conf"]) + \
-                       map(lambda x: (x,grub.GrubConf.GrubConfigFile),
-                           ["/boot/grub/menu.lst", "/boot/grub/grub.conf",
-                            "/grub/menu.lst", "/grub/grub.conf"])
+        cfg_list = map(lambda x: (x,grub.GrubConf.Grub2ConfigFile),
+                       ["/boot/grub/grub.cfg", "/grub/grub.cfg",
+                        "/boot/grub2/grub.cfg", "/grub2/grub.cfg"]) + \
+                   map(lambda x: (x,grub.ExtLinuxConf.ExtLinuxConfigFile),
+                       ["/boot/isolinux/isolinux.cfg",
+                        "/boot/extlinux/extlinux.conf",
+                        "/boot/extlinux.conf"]) + \
+                   map(lambda x: (x,grub.GrubConf.GrubConfigFile),
+                       ["/boot/grub/menu.lst", "/boot/grub/grub.conf",
+                        "/grub/menu.lst", "/grub/grub.conf"])
 
         if not fs:
             # set the config file and parse it
@@ -595,7 +583,17 @@ def run_grub(file, entry, fs, cfg_args):
         sel = g.run()
 
     g = Grub(file, fs)
-    if interactive:
+
+    if list_entries:
+        for i in range(len(g.cf.images)):
+            img = g.cf.images[i]
+            print "title: %s" % img.title
+            print "  root: %s" % img.root
+            print "  kernel: %s" % img.kernel[1]
+            print "  args: %s" % img.args
+            print "  initrd: %s" % img.initrd[1]
+
+    if interactive and not list_entries:
         curses.wrapper(run_main)
     else:
         sel = g.cf.default
@@ -603,7 +601,7 @@ def run_grub(file, entry, fs, cfg_args):
     # set the entry to boot as requested
     if entry is not None:
         idx = get_entry_idx(g.cf, entry)
-        if idx is not None and idx > 0 and idx < len(g.cf.images):
+        if idx is not None and idx >= 0 and idx < len(g.cf.images):
            sel = idx
 
     if sel == -1:
@@ -702,7 +700,7 @@ if __name__ == "__main__":
     sel = None
     
     def usage():
-        print >> sys.stderr, "Usage: %s [-q|--quiet] [-i|--interactive] [-n|--not-really] [--output=] [--kernel=] [--ramdisk=] [--args=] [--entry=] [--output-directory=] [--output-format=sxp|simple|simple0] <image>" %(sys.argv[0],)
+        print >> sys.stderr, "Usage: %s [-q|--quiet] [-i|--interactive] [-l|--list-entries] [-n|--not-really] [--output=] [--kernel=] [--ramdisk=] [--args=] [--entry=] [--output-directory=] [--output-format=sxp|simple|simple0] [--offset=] <image>" %(sys.argv[0],)
 
     def copy_from_image(fs, file_to_read, file_type, output_directory,
                         not_really):
@@ -736,9 +734,9 @@ if __name__ == "__main__":
             dataoff += len(data)
 
     try:
-        opts, args = getopt.gnu_getopt(sys.argv[1:], 'qinh::',
-                                   ["quiet", "interactive", "not-really", "help", 
-                                    "output=", "output-format=", "output-directory=",
+        opts, args = getopt.gnu_getopt(sys.argv[1:], 'qilnh::',
+                                   ["quiet", "interactive", "list-entries", "not-really", "help",
+                                    "output=", "output-format=", "output-directory=", "offset=",
                                     "entry=", "kernel=", 
                                     "ramdisk=", "args=", "isconfig", "debug"])
     except getopt.GetoptError:
@@ -753,7 +751,9 @@ if __name__ == "__main__":
     output = None
     entry = None
     interactive = True
+    list_entries = False
     isconfig = False
+    part_offs = None
     debug = False
     not_really = False
     output_format = "sxp"
@@ -771,6 +771,8 @@ if __name__ == "__main__":
             interactive = False
         elif o in ("-i", "--interactive"):
             interactive = True
+        elif o in ("-l", "--list-entries"):
+            list_entries = True
         elif o in ("-n", "--not-really"):
             not_really = True
         elif o in ("-h", "--help"):
@@ -784,6 +786,13 @@ if __name__ == "__main__":
             incfg["ramdisk"] = a
         elif o in ("--args",):
             incfg["args"] = a
+        elif o in ("--offset",):
+            try:
+                part_offs = [ int(a) ]
+            except ValueError:
+                print "offset value must be an integer"
+                usage()
+                sys.exit(1)
         elif o in ("--entry",):
             entry = a
             # specifying the entry to boot implies non-interactive
@@ -794,7 +803,7 @@ if __name__ == "__main__":
             debug = True
         elif o in ("--output-format",):
             if a not in ["sxp", "simple", "simple0"]:
-                print "unkonwn output format %s" % a
+                print "unknown output format %s" % a
                 usage()
                 sys.exit(1)
             output_format = a
@@ -827,7 +836,8 @@ if __name__ == "__main__":
         bootfsoptions = ""
 
     # get list of offsets into file which start partitions
-    part_offs = get_partition_offsets(file)
+    if part_offs is None:
+        part_offs = get_partition_offsets(file)
 
     for offset in part_offs:
         try:
@@ -854,6 +864,9 @@ if __name__ == "__main__":
 		traceback.print_exc()
             fs = None
             continue
+
+    if list_entries:
+        sys.exit(0)
 
     # Did looping through partitions find us a kernel?
     if not fs:

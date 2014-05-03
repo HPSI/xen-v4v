@@ -22,7 +22,6 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdarg.h>
-#include <xenctrl.h>
 
 #include "utils.h"
 #include "talloc.h"
@@ -606,7 +605,7 @@ static int dom0_init(void)
 	if (port == -1)
 		return -1;
 
-	dom0 = new_domain(NULL, 0, port); 
+	dom0 = new_domain(NULL, xenbus_master_domid(), port);
 	if (dom0 == NULL)
 		return -1;
 
@@ -640,7 +639,7 @@ void domain_init(void)
 		barf_perror("Failed to allocate domain gnttab handle");
 
 	*xcg_handle = xc_gnttab_open(NULL, 0);
-	if (*xcg_handle < 0)
+	if (*xcg_handle == NULL)
 		xprintf("WARNING: Failed to open connection to gnttab\n");
 	else
 		talloc_set_destructor(xcg_handle, close_xcg_handle);

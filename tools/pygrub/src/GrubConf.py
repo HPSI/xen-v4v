@@ -67,7 +67,11 @@ class GrubDiskPart(object):
         return self._disk
     def set_disk(self, val):
         val = val.replace("(", "").replace(")", "")
-        self._disk = int(val[2:])
+        if val.startswith("/dev/xvd"):
+            disk = val[len("/dev/xvd")]
+            self._disk = ord(disk)-ord('a')
+        else:
+            self._disk = int(val[2:])
     disk = property(get_disk, set_disk)
 
     def get_part(self):
@@ -344,7 +348,9 @@ class Grub2Image(_GrubImage):
                 
     commands = {'set:root': 'root',
                 'linux': 'kernel',
+                'linux16': 'kernel',
                 'initrd': 'initrd',
+                'initrd16': 'initrd',
                 'echo': None,
                 'insmod': None,
                 'search': None}
@@ -390,7 +396,7 @@ class Grub2ConfigFile(_GrubConfigFile):
                 continue
 
             # new image
-            title_match = re.match('^menuentry ["\'](.*)["\'] (.*){', l)
+            title_match = re.match('^menuentry ["\'](.*?)["\'] (.*){', l)
             if title_match:
                 if img is not None:
                     raise RuntimeError, "syntax error: cannot nest menuentry (%d %s)" % (len(img),img)
@@ -427,6 +433,8 @@ class Grub2ConfigFile(_GrubConfigFile):
                 if self.commands[com] is not None:
                     if arg.strip() == "${saved_entry}":
                         arg = "0"
+                    elif arg.strip() == "${next_entry}":
+                        arg = "0"
                     setattr(self, self.commands[com], arg.strip())
                 else:
                     logging.info("Ignored directive %s" %(com,))
@@ -454,7 +462,7 @@ class Grub2ConfigFile(_GrubConfigFile):
                 }
         
 if __name__ == "__main__":
-    if sys.argv < 3:
+    if len(sys.argv) < 3:
         raise RuntimeError, "Need a grub version (\"grub\" or \"grub2\") and a grub.conf or grub.cfg to read"
     if sys.argv[1] == "grub":
         g = GrubConfigFile(sys.argv[2])

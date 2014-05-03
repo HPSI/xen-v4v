@@ -251,25 +251,25 @@ struct ehci_dbg_port {
  * For most devices, interfaces don't coordinate with each other, so
  * such requests may be made at any time.
  */
-struct usb_ctrlrequest {
+struct __packed usb_ctrlrequest {
     u8 bRequestType;
     u8 bRequest;
     __le16 wValue;
     __le16 wIndex;
     __le16 wLength;
-} __attribute__ ((packed));
+};
 
 /* USB_DT_DEBUG: for special highspeed devices, replacing serial console */
 
 #define USB_DT_DEBUG    0x0a
 
-struct usb_debug_descriptor {
+struct __packed usb_debug_descriptor {
     u8 bLength;
     u8 bDescriptorType;
     /* bulk endpoints with 8 byte maxpacket */
     u8 bDebugInEndpoint;
     u8 bDebugOutEndpoint;
-} __attribute__((packed));
+};
 
 #define USB_DEBUG_DEVNUM 127
 
@@ -946,11 +946,6 @@ try_again:
         dbgp_printk("could not find attached debug device\n");
         goto err;
     }
-    if ( ret < 0 )
-    {
-        dbgp_printk("attached device is not a debug device\n");
-        goto err;
-    }
     dbgp->out.endpoint = dbgp_desc.bDebugOutEndpoint;
     dbgp->in.endpoint = dbgp_desc.bDebugInEndpoint;
 
@@ -1099,6 +1094,9 @@ try_next_port:
     dbgp_printk("n_ports:    %u\n", n_ports);
     ehci_dbgp_status(dbgp, "");
 
+    if ( n_ports == 0 )
+        return -1;
+
     for ( i = 1; i <= n_ports; i++ )
     {
         portsc = readl(&dbgp->ehci_regs->port_status[i-1]);
@@ -1204,7 +1202,7 @@ static void ehci_dbgp_putc(struct serial_port *port, char c)
         ehci_dbgp_flush(port);
 }
 
-static unsigned int ehci_dbgp_tx_ready(struct serial_port *port)
+static int ehci_dbgp_tx_ready(struct serial_port *port)
 {
     struct ehci_dbgp *dbgp = port->uart;
 
@@ -1482,31 +1480,25 @@ void __init ehci_dbgp_init(void)
     }
     else if ( strncmp(opt_dbgp + 4, "@pci", 4) == 0 )
     {
-        unsigned long val = simple_strtoul(opt_dbgp + 8, &e, 16);
+        unsigned int bus, slot, func;
 
-        dbgp->bus = val;
-        if ( dbgp->bus != val || *e != ':' )
+        e = parse_pci(opt_dbgp + 8, NULL, &bus, &slot, &func);
+        if ( !e || *e )
             return;
 
-        val = simple_strtoul(e + 1, &e, 16);
-        if ( PCI_SLOT(PCI_DEVFN(val, 0)) != val || *e != '.' )
-            return;
-        dbgp->slot = val;
+        dbgp->bus = bus;
+        dbgp->slot = slot;
+        dbgp->func = func;
 
-        val = simple_strtoul(e + 1, &e, 16);
-        if ( PCI_FUNC(PCI_DEVFN(0, val)) != val || *e )
-            return;
-        dbgp->func = val;
-
-        if ( !pci_device_detect(0, dbgp->bus, dbgp->slot, dbgp->func) )
+        if ( !pci_device_detect(0, bus, slot, func) )
             return;
 
-        dbgp->cap = __find_dbgp(dbgp->bus, dbgp->slot, dbgp->func);
+        dbgp->cap = __find_dbgp(bus, slot, func);
         if ( !dbgp->cap )
             return;
 
         dbgp_printk("Using EHCI debug port on %02x:%02x.%u\n",
-                    dbgp->bus, dbgp->slot, dbgp->func);
+                    bus, slot, func);
     }
     else
         return;

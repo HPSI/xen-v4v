@@ -38,23 +38,131 @@
  * The application's registration hooks should be called ONLY via
  * these macros, with the ctx locked.  Likewise all the "occurred"
  * entrypoints from the application should assert(!in_hook);
+ *
+ * During the hook call - including while the arguments are being
+ * evaluated - ev->nexus is guaranteed to be valid and refer to the
+ * nexus which is being used for this event registration.  The
+ * arguments should specify ev->nexus for the for_libxl argument and
+ * ev->nexus->for_app_reg (or a pointer to it) for for_app_reg.
  */
-#define OSEVENT_HOOK_INTERN(retval, hookname, ...) do {                      \
-    if (CTX->osevent_hooks) {                                                \
-        CTX->osevent_in_hook++;                                              \
-        retval CTX->osevent_hooks->hookname(CTX->osevent_user, __VA_ARGS__); \
-        CTX->osevent_in_hook--;                                              \
-    }                                                                        \
+#define OSEVENT_HOOK_INTERN(retval, failedp, evkind, hookop, nexusop, ...) do { \
+    if (CTX->osevent_hooks) {                                           \
+        CTX->osevent_in_hook++;                                         \
+        libxl__osevent_hook_nexi *nexi = &CTX->hook_##evkind##_nexi_idle; \
+        osevent_hook_pre_##nexusop(gc, ev, nexi, &ev->nexus);            \
+        retval CTX->osevent_hooks->evkind##_##hookop                    \
+            (CTX->osevent_user, __VA_ARGS__);                           \
+        if ((failedp))                                                  \
+            osevent_hook_failed_##nexusop(gc, ev, nexi, &ev->nexus);     \
+        CTX->osevent_in_hook--;                                         \
+    }                                                                   \
 } while (0)
 
-#define OSEVENT_HOOK(hookname, ...) ({                                       \
-    int osevent_hook_rc = 0;                                                 \
-    OSEVENT_HOOK_INTERN(osevent_hook_rc = , hookname, __VA_ARGS__);          \
-    osevent_hook_rc;                                                         \
+#define OSEVENT_HOOK(evkind, hookop, nexusop, ...) ({                   \
+    int osevent_hook_rc = 0;                                    \
+    OSEVENT_HOOK_INTERN(osevent_hook_rc =, !!osevent_hook_rc,   \
+                        evkind, hookop, nexusop, __VA_ARGS__);          \
+    osevent_hook_rc;                                            \
 })
 
-#define OSEVENT_HOOK_VOID(hookname, ...) \
-    OSEVENT_HOOK_INTERN(/* void */, hookname, __VA_ARGS__)
+#define OSEVENT_HOOK_VOID(evkind, hookop, nexusop, ...)                         \
+    OSEVENT_HOOK_INTERN(/* void */, 0, evkind, hookop, nexusop, __VA_ARGS__)
+
+/*
+ * The application's calls to libxl_osevent_occurred_... may be
+ * indefinitely delayed with respect to the rest of the program (since
+ * they are not necessarily called with any lock held).  So the
+ * for_libxl value we receive may be (almost) arbitrarily old.  All we
+ * know is that it came from this ctx.
+ *
+ * Therefore we may not free the object referred to by any for_libxl
+ * value until we free the whole libxl_ctx.  And if we reuse it we
+ * must be able to tell when an old use turns up, and discard the
+ * stale event.
+ *
+ * Thus we cannot use the ev directly as the for_libxl value - we need
+ * a layer of indirection.
+ *
+ * We do this by keeping a pool of libxl__osevent_hook_nexus structs,
+ * and use pointers to them as for_libxl values.  In fact, there are
+ * two pools: one for fds and one for timeouts.  This ensures that we
+ * don't risk a type error when we upcast nexus->ev.  In each nexus
+ * the ev is either null or points to a valid libxl__ev_time or
+ * libxl__ev_fd, as applicable.
+ *
+ * We /do/ allow ourselves to reassociate an old nexus with a new ev
+ * as otherwise we would have to leak nexi.  (This reassociation
+ * might, of course, be an old ev being reused for a new purpose so
+ * simply comparing the ev pointer is not sufficient.)  Thus the
+ * libxl_osevent_occurred functions need to check that the condition
+ * allegedly signalled by this event actually exists.
+ *
+ * The nexi and the lists are all protected by the ctx lock.
+ */
+
+struct libxl__osevent_hook_nexus {
+    void *ev;
+    void *for_app_reg;
+    LIBXL_SLIST_ENTRY(libxl__osevent_hook_nexus) next;
+};
+
+static void *osevent_ev_from_hook_nexus(libxl_ctx *ctx,
+           libxl__osevent_hook_nexus *nexus /* pass  void *for_libxl */)
+{
+    return nexus->ev;
+}
+
+static void osevent_release_nexus(libxl__gc *gc,
+                                  libxl__osevent_hook_nexi *nexi_idle,
+                                  libxl__osevent_hook_nexus *nexus)
+{
+    nexus->ev = 0;
+    LIBXL_SLIST_INSERT_HEAD(nexi_idle, nexus, next);
+}
+
+/*----- OSEVENT* hook functions for nexusop "alloc" -----*/
+static void osevent_hook_pre_alloc(libxl__gc *gc, void *ev,
+                                   libxl__osevent_hook_nexi *nexi_idle,
+                                   libxl__osevent_hook_nexus **nexus_r)
+{
+    libxl__osevent_hook_nexus *nexus = LIBXL_SLIST_FIRST(nexi_idle);
+    if (nexus) {
+        LIBXL_SLIST_REMOVE_HEAD(nexi_idle, next);
+    } else {
+        nexus = libxl__zalloc(NOGC, sizeof(*nexus));
+    }
+    nexus->ev = ev;
+    *nexus_r = nexus;
+}
+static void osevent_hook_failed_alloc(libxl__gc *gc, void *ev,
+                                      libxl__osevent_hook_nexi *nexi_idle,
+                                      libxl__osevent_hook_nexus **nexus)
+{
+    osevent_release_nexus(gc, nexi_idle, *nexus);
+}
+
+/*----- OSEVENT* hook functions for nexusop "release" -----*/
+static void osevent_hook_pre_release(libxl__gc *gc, void *ev,
+                                     libxl__osevent_hook_nexi *nexi_idle,
+                                     libxl__osevent_hook_nexus **nexus)
+{
+    osevent_release_nexus(gc, nexi_idle, *nexus);
+}
+static void osevent_hook_failed_release(libxl__gc *gc, void *ev,
+                                        libxl__osevent_hook_nexi *nexi_idle,
+                                        libxl__osevent_hook_nexus **nexus)
+{
+    abort();
+}
+
+/*----- OSEVENT* hook functions for nexusop "noop" -----*/
+static void osevent_hook_pre_noop(libxl__gc *gc, void *ev,
+                                  libxl__osevent_hook_nexi *nexi_idle,
+                                  libxl__osevent_hook_nexus **nexus) { }
+static void osevent_hook_failed_noop(libxl__gc *gc, void *ev,
+                                     libxl__osevent_hook_nexi *nexi_idle,
+                                     libxl__osevent_hook_nexus **nexus) { }
+
 
 /*
  * fd events
@@ -72,7 +180,8 @@ int libxl__ev_fd_register(libxl__gc *gc, libxl__ev_fd *ev,
 
     DBG("ev_fd=%p register fd=%d events=%x", ev, fd, events);
 
-    rc = OSEVENT_HOOK(fd_register, fd, &ev->for_app_reg, events, ev);
+    rc = OSEVENT_HOOK(fd,register, alloc, fd, &ev->nexus->for_app_reg,
+                      events, ev->nexus);
     if (rc) goto out;
 
     ev->fd = fd;
@@ -97,7 +206,7 @@ int libxl__ev_fd_modify(libxl__gc *gc, libxl__ev_fd *ev, short events)
 
     DBG("ev_fd=%p modify fd=%d events=%x", ev, ev->fd, events);
 
-    rc = OSEVENT_HOOK(fd_modify, ev->fd, &ev->for_app_reg, events);
+    rc = OSEVENT_HOOK(fd,modify, noop, ev->fd, &ev->nexus->for_app_reg, events);
     if (rc) goto out;
 
     ev->events = events;
@@ -119,7 +228,7 @@ void libxl__ev_fd_deregister(libxl__gc *gc, libxl__ev_fd *ev)
 
     DBG("ev_fd=%p deregister fd=%d", ev, ev->fd);
 
-    OSEVENT_HOOK_VOID(fd_deregister, ev->fd, ev->for_app_reg);
+    OSEVENT_HOOK_VOID(fd,deregister, release, ev->fd, ev->nexus->for_app_reg);
     LIBXL_LIST_REMOVE(ev, entry);
     ev->fd = -1;
 
@@ -158,25 +267,20 @@ static int time_rel_to_abs(libxl__gc *gc, int ms, struct timeval *abs_out)
     return 0;
 }
 
-static void time_insert_finite(libxl__gc *gc, libxl__ev_time *ev)
-{
-    libxl__ev_time *evsearch;
-    LIBXL_TAILQ_INSERT_SORTED(&CTX->etimes, entry, ev, evsearch, /*empty*/,
-                              timercmp(&ev->abs, &evsearch->abs, >));
-    ev->infinite = 0;
-}
-
 static int time_register_finite(libxl__gc *gc, libxl__ev_time *ev,
                                 struct timeval absolute)
 {
     int rc;
+    libxl__ev_time *evsearch;
 
-    rc = OSEVENT_HOOK(timeout_register, &ev->for_app_reg, absolute, ev);
+    rc = OSEVENT_HOOK(timeout,register, alloc, &ev->nexus->for_app_reg,
+                      absolute, ev->nexus);
     if (rc) return rc;
 
     ev->infinite = 0;
     ev->abs = absolute;
-    time_insert_finite(gc, ev);
+    LIBXL_TAILQ_INSERT_SORTED(&CTX->etimes, entry, ev, evsearch, /*empty*/,
+                              timercmp(&ev->abs, &evsearch->abs, >));
 
     return 0;
 }
@@ -184,7 +288,12 @@ static int time_register_finite(libxl__gc *gc, libxl__ev_time *ev,
 static void time_deregister(libxl__gc *gc, libxl__ev_time *ev)
 {
     if (!ev->infinite) {
-        OSEVENT_HOOK_VOID(timeout_deregister, &ev->for_app_reg);
+        struct timeval right_away = { 0, 0 };
+        if (ev->nexus) /* only set if app provided hooks */
+            ev->nexus->ev = 0;
+        OSEVENT_HOOK_VOID(timeout,modify,
+                          noop /* release nexus in _occurred_ */,
+                          &ev->nexus->for_app_reg, right_away);
         LIBXL_TAILQ_REMOVE(&CTX->etimes, ev, entry);
     }
 }
@@ -254,69 +363,6 @@ int libxl__ev_time_register_rel(libxl__gc *gc, libxl__ev_time *ev,
     return rc;
 }
 
-int libxl__ev_time_modify_abs(libxl__gc *gc, libxl__ev_time *ev,
-                              struct timeval absolute)
-{
-    int rc;
-
-    CTX_LOCK;
-
-    DBG("ev_time=%p modify abs==%lu.%06lu",
-        ev, (unsigned long)absolute.tv_sec, (unsigned long)absolute.tv_usec);
-
-    assert(libxl__ev_time_isregistered(ev));
-
-    if (ev->infinite) {
-        rc = time_register_finite(gc, ev, absolute);
-        if (rc) goto out;
-    } else {
-        rc = OSEVENT_HOOK(timeout_modify, &ev->for_app_reg, absolute);
-        if (rc) goto out;
-
-        LIBXL_TAILQ_REMOVE(&CTX->etimes, ev, entry);
-        ev->abs = absolute;
-        time_insert_finite(gc, ev);
-    }
-
-    rc = 0;
- out:
-    time_done_debug(gc,__func__,ev,rc);
-    CTX_UNLOCK;
-    return rc;
-}
-
-int libxl__ev_time_modify_rel(libxl__gc *gc, libxl__ev_time *ev,
-                              int milliseconds)
-{
-    struct timeval absolute;
-    int rc;
-
-    CTX_LOCK;
-
-    DBG("ev_time=%p modify ms=%d", ev, milliseconds);
-
-    assert(libxl__ev_time_isregistered(ev));
-
-    if (milliseconds < 0) {
-        time_deregister(gc, ev);
-        ev->infinite = 1;
-        rc = 0;
-        goto out;
-    }
-
-    rc = time_rel_to_abs(gc, milliseconds, &absolute);
-    if (rc) goto out;
-
-    rc = libxl__ev_time_modify_abs(gc, ev, absolute);
-    if (rc) goto out;
-
-    rc = 0;
- out:
-    time_done_debug(gc,__func__,ev,rc);
-    CTX_UNLOCK;
-    return rc;
-}
-
 void libxl__ev_time_deregister(libxl__gc *gc, libxl__ev_time *ev)
 {
     CTX_LOCK;
@@ -333,6 +379,17 @@ void libxl__ev_time_deregister(libxl__gc *gc, libxl__ev_time *ev)
     time_done_debug(gc,__func__,ev,0);
     CTX_UNLOCK;
     return;
+}
+
+static void time_occurs(libxl__egc *egc, libxl__ev_time *etime)
+{
+    DBG("ev_time=%p occurs abs=%lu.%06lu",
+        etime, (unsigned long)etime->abs.tv_sec,
+        (unsigned long)etime->abs.tv_usec);
+
+    libxl__ev_time_callback *func = etime->func;
+    etime->func = 0;
+    func(egc, etime, &etime->abs);
 }
 
 
@@ -532,8 +589,7 @@ int libxl__ev_xswatch_register(libxl__gc *gc, libxl__ev_xswatch *w,
  out_rc:
     if (use)
         LIBXL_SLIST_INSERT_HEAD(&CTX->watch_freeslots, use, empty);
-    if (path_copy)
-        free(path_copy);
+    free(path_copy);
     CTX_UNLOCK;
     return rc;
 }
@@ -566,6 +622,159 @@ void libxl__ev_xswatch_deregister(libxl__gc *gc, libxl__ev_xswatch *w)
     w->path = NULL;
 
     CTX_UNLOCK;
+}
+
+/*
+ * evtchn
+ */
+
+static int evtchn_revents_check(libxl__egc *egc, int revents)
+{
+    EGC_GC;
+
+    if (revents & ~POLLIN) {
+        LOG(ERROR, "unexpected poll event on event channel fd: %x", revents);
+        LIBXL__EVENT_DISASTER(egc,
+                   "unexpected poll event on event channel fd", 0, 0);
+        libxl__ev_fd_deregister(gc, &CTX->evtchn_efd);
+        return ERROR_FAIL;
+    }
+
+    assert(revents & POLLIN);
+
+    return 0;
+}
+
+static void evtchn_fd_callback(libxl__egc *egc, libxl__ev_fd *ev,
+                               int fd, short events, short revents)
+{
+    EGC_GC;
+    libxl__ev_evtchn *evev;
+    int r, rc;
+    evtchn_port_or_error_t port;
+    struct pollfd recheck;
+
+    rc = evtchn_revents_check(egc, revents);
+    if (rc) return;
+
+    for (;;) {
+        /* Check the fd again.  The incoming revent may no longer be
+         * true, because the libxl ctx lock has not necessarily been
+         * held continuously since someone noticed the fd.  Normally
+         * this wouldn't be a problem but evtchn devices don't always
+         * honour O_NONBLOCK (see xenctrl.h). */
+
+        recheck.fd = fd;
+        recheck.events = POLLIN;
+        recheck.revents = 0;
+        r = poll(&recheck, 1, 0);
+        DBG("ev_evtchn recheck r=%d revents=%#x", r, recheck.revents);
+        if (r < 0) {
+            LIBXL__EVENT_DISASTER(egc,
+     "unexpected failure polling event channel fd for recheck",
+                                  errno, 0);
+            return;
+        }
+        if (r == 0)
+            break;
+        rc = evtchn_revents_check(egc, recheck.revents);
+        if (rc) return;
+
+        /* OK, that's that workaround done.  We can actually check for
+         * work for us to do: */
+
+        port = xc_evtchn_pending(CTX->xce);
+        if (port < 0) {
+            if (errno == EAGAIN)
+                break;
+            LIBXL__EVENT_DISASTER(egc,
+     "unexpected failure fetching occurring event port number from evtchn",
+                                  errno, 0);
+            return;
+        }
+
+        LIBXL_LIST_FOREACH(evev, &CTX->evtchns_waiting, entry)
+            if (port == evev->port)
+                goto found;
+        /* not found */
+        DBG("ev_evtchn port=%d no-one cared", port);
+        continue;
+
+    found:
+        DBG("ev_evtchn=%p port=%d signaled", evev, port);
+        evev->waiting = 0;
+        LIBXL_LIST_REMOVE(evev, entry);
+        evev->callback(egc, evev);
+    }
+}
+
+int libxl__ctx_evtchn_init(libxl__gc *gc) {
+    xc_evtchn *xce;
+    int rc, fd;
+
+    if (CTX->xce)
+        return 0;
+
+    xce = xc_evtchn_open(CTX->lg, 0);
+    if (!xce) {
+        LOGE(ERROR,"cannot open libxc evtchn handle");
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    fd = xc_evtchn_fd(xce);
+    assert(fd >= 0);
+
+    rc = libxl_fd_set_nonblock(CTX, fd, 1);
+    if (rc) goto out;
+
+    rc = libxl__ev_fd_register(gc, &CTX->evtchn_efd,
+                               evtchn_fd_callback, fd, POLLIN);
+    if (rc) goto out;
+
+    CTX->xce = xce;
+    return 0;
+
+ out:
+    xc_evtchn_close(xce);
+    return rc;
+}
+
+int libxl__ev_evtchn_wait(libxl__gc *gc, libxl__ev_evtchn *evev)
+{
+    int r, rc;
+
+    DBG("ev_evtchn=%p port=%d wait (was waiting=%d)",
+        evev, evev->port, evev->waiting);
+
+    if (evev->waiting)
+        return 0;
+
+    r = xc_evtchn_unmask(CTX->xce, evev->port);
+    if (r) {
+        LOGE(ERROR,"cannot unmask event channel %d",evev->port);
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    evev->waiting = 1;
+    LIBXL_LIST_INSERT_HEAD(&CTX->evtchns_waiting, evev, entry);
+    return 0;
+
+ out:
+    return rc;
+}
+
+void libxl__ev_evtchn_cancel(libxl__gc *gc, libxl__ev_evtchn *evev)
+{
+    DBG("ev_evtchn=%p port=%d cancel (was waiting=%d)",
+        evev, evev->port, evev->waiting);
+
+    if (!evev->waiting)
+        return;
+
+    evev->waiting = 0;
+    LIBXL_LIST_REMOVE(evev, entry);
 }
 
 /*
@@ -728,10 +937,6 @@ static int beforepoll_internal(libxl__gc *gc, libxl__poller *poller,
             REQUIRE_FD(efd->fd, efd->events, BODY);                    \
                                                                        \
         REQUIRE_FD(poller->wakeup_pipe[0], POLLIN, BODY);              \
-                                                                       \
-        int selfpipe = libxl__fork_selfpipe_active(CTX);               \
-        if (selfpipe >= 0)                                             \
-            REQUIRE_FD(selfpipe, POLLIN, BODY);                        \
                                                                        \
     }while(0)
 
@@ -954,14 +1159,6 @@ static void afterpoll_internal(libxl__egc *egc, libxl__poller *poller,
         if (e) LIBXL__EVENT_DISASTER(egc, "read wakeup", e, 0);
     }
 
-    int selfpipe = libxl__fork_selfpipe_active(CTX);
-    if (selfpipe >= 0 &&
-        afterpoll_check_fd(poller,fds,nfds, selfpipe, POLLIN)) {
-        int e = libxl__self_pipe_eatall(selfpipe);
-        if (e) LIBXL__EVENT_DISASTER(egc, "read sigchld pipe", e, 0);
-        libxl__fork_selfpipe_woken(egc);
-    }
-
     for (;;) {
         libxl__ev_time *etime = LIBXL_TAILQ_FIRST(&CTX->etimes);
         if (!etime)
@@ -974,11 +1171,7 @@ static void afterpoll_internal(libxl__egc *egc, libxl__poller *poller,
 
         time_deregister(gc, etime);
 
-        DBG("ev_time=%p occurs abs=%lu.%06lu",
-            etime, (unsigned long)etime->abs.tv_sec,
-            (unsigned long)etime->abs.tv_usec);
-
-        etime->func(egc, etime, &etime->abs);
+        time_occurs(egc, etime);
     }
 }
 
@@ -1010,35 +1203,59 @@ void libxl_osevent_register_hooks(libxl_ctx *ctx,
 
 
 void libxl_osevent_occurred_fd(libxl_ctx *ctx, void *for_libxl,
-                               int fd, short events, short revents)
+                               int fd, short events_ign, short revents_ign)
 {
-    libxl__ev_fd *ev = for_libxl;
-
     EGC_INIT(ctx);
     CTX_LOCK;
     assert(!CTX->osevent_in_hook);
 
-    assert(fd == ev->fd);
-    revents &= ev->events;
-    if (revents)
-        ev->func(egc, ev, fd, ev->events, revents);
+    libxl__ev_fd *ev = osevent_ev_from_hook_nexus(ctx, for_libxl);
+    if (!ev) goto out;
+    if (ev->fd != fd) goto out;
 
+    struct pollfd check;
+    for (;;) {
+        check.fd = fd;
+        check.events = ev->events;
+        int r = poll(&check, 1, 0);
+        if (!r)
+            goto out;
+        if (r==1)
+            break;
+        assert(r<0);
+        if (errno != EINTR) {
+            LIBXL__EVENT_DISASTER(egc, "failed poll to check for fd", errno, 0);
+            goto out;
+        }
+    }
+
+    if (check.revents)
+        ev->func(egc, ev, fd, ev->events, check.revents);
+
+ out:
     CTX_UNLOCK;
     EGC_FREE;
 }
 
 void libxl_osevent_occurred_timeout(libxl_ctx *ctx, void *for_libxl)
 {
-    libxl__ev_time *ev = for_libxl;
-
     EGC_INIT(ctx);
     CTX_LOCK;
     assert(!CTX->osevent_in_hook);
 
-    assert(!ev->infinite);
-    LIBXL_TAILQ_REMOVE(&CTX->etimes, ev, entry);
-    ev->func(egc, ev, &ev->abs);
+    libxl__osevent_hook_nexus *nexus = for_libxl;
+    libxl__ev_time *ev = osevent_ev_from_hook_nexus(ctx, nexus);
 
+    osevent_release_nexus(gc, &CTX->hook_timeout_nexi_idle, nexus);
+
+    if (!ev) goto out;
+    assert(!ev->infinite);
+
+    LIBXL_TAILQ_REMOVE(&CTX->etimes, ev, entry);
+
+    time_occurs(egc, ev);
+
+ out:
     CTX_UNLOCK;
     EGC_FREE;
 }
@@ -1215,76 +1432,38 @@ int libxl_event_check(libxl_ctx *ctx, libxl_event **event_r,
 }
 
 /*
- * Manipulation of pollers
+ * Utilities for pipes (specifically, useful for self-pipes)
  */
 
-int libxl__poller_init(libxl_ctx *ctx, libxl__poller *p)
+void libxl__pipe_close(int fds[2])
+{
+    if (fds[0] >= 0) close(fds[0]);
+    if (fds[1] >= 0) close(fds[1]);
+    fds[0] = fds[1] = -1;
+}
+
+int libxl__pipe_nonblock(libxl_ctx *ctx, int fds[2])
 {
     int r, rc;
-    p->fd_polls = 0;
-    p->fd_rindices = 0;
 
-    r = pipe(p->wakeup_pipe);
+    r = libxl_pipe(ctx, fds);
     if (r) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "cannot create poller pipe");
+        fds[0] = fds[1] = -1;
         rc = ERROR_FAIL;
         goto out;
     }
 
-    rc = libxl_fd_set_nonblock(ctx, p->wakeup_pipe[0], 1);
+    rc = libxl_fd_set_nonblock(ctx, fds[0], 1);
     if (rc) goto out;
 
-    rc = libxl_fd_set_nonblock(ctx, p->wakeup_pipe[1], 1);
+    rc = libxl_fd_set_nonblock(ctx, fds[1], 1);
     if (rc) goto out;
 
     return 0;
 
  out:
-    libxl__poller_dispose(p);
+    libxl__pipe_close(fds);
     return rc;
-}
-
-void libxl__poller_dispose(libxl__poller *p)
-{
-    if (p->wakeup_pipe[1] > 0) close(p->wakeup_pipe[1]);
-    if (p->wakeup_pipe[0] > 0) close(p->wakeup_pipe[0]);
-    free(p->fd_polls);
-    free(p->fd_rindices);
-}
-
-libxl__poller *libxl__poller_get(libxl_ctx *ctx)
-{
-    /* must be called with ctx locked */
-    int rc;
-
-    libxl__poller *p = LIBXL_LIST_FIRST(&ctx->pollers_idle);
-    if (p) {
-        LIBXL_LIST_REMOVE(p, entry);
-        return p;
-    }
-
-    p = malloc(sizeof(*p));
-    if (!p) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "cannot allocate poller");
-        return 0;
-    }
-    memset(p, 0, sizeof(*p));
-
-    rc = libxl__poller_init(ctx, p);
-    if (rc) return NULL;
-
-    return p;
-}
-
-void libxl__poller_put(libxl_ctx *ctx, libxl__poller *p)
-{
-    LIBXL_LIST_INSERT_HEAD(&ctx->pollers_idle, p, entry);
-}
-
-void libxl__poller_wakeup(libxl__egc *egc, libxl__poller *p)
-{
-    int e = libxl__self_pipe_wakeup(p->wakeup_pipe[1]);
-    if (e) LIBXL__EVENT_DISASTER(egc, "cannot poke watch pipe", e, 0);
 }
 
 int libxl__self_pipe_wakeup(int fd)
@@ -1318,6 +1497,67 @@ int libxl__self_pipe_eatall(int fd)
 }
 
 /*
+ * Manipulation of pollers
+ */
+
+int libxl__poller_init(libxl__gc *gc, libxl__poller *p)
+{
+    int rc;
+    p->fd_polls = 0;
+    p->fd_rindices = 0;
+
+    rc = libxl__pipe_nonblock(CTX, p->wakeup_pipe);
+    if (rc) goto out;
+
+    return 0;
+
+ out:
+    libxl__poller_dispose(p);
+    return rc;
+}
+
+void libxl__poller_dispose(libxl__poller *p)
+{
+    libxl__pipe_close(p->wakeup_pipe);
+    free(p->fd_polls);
+    free(p->fd_rindices);
+}
+
+libxl__poller *libxl__poller_get(libxl__gc *gc)
+{
+    /* must be called with ctx locked */
+    int rc;
+
+    libxl__poller *p = LIBXL_LIST_FIRST(&CTX->pollers_idle);
+    if (p) {
+        LIBXL_LIST_REMOVE(p, entry);
+        return p;
+    }
+
+    p = libxl__zalloc(NOGC, sizeof(*p));
+
+    rc = libxl__poller_init(gc, p);
+    if (rc) {
+        free(p);
+        return NULL;
+    }
+
+    return p;
+}
+
+void libxl__poller_put(libxl_ctx *ctx, libxl__poller *p)
+{
+    if (!p) return;
+    LIBXL_LIST_INSERT_HEAD(&ctx->pollers_idle, p, entry);
+}
+
+void libxl__poller_wakeup(libxl__egc *egc, libxl__poller *p)
+{
+    int e = libxl__self_pipe_wakeup(p->wakeup_pipe[1]);
+    if (e) LIBXL__EVENT_DISASTER(egc, "cannot poke watch pipe", e, 0);
+}
+
+/*
  * Main event loop iteration
  */
 
@@ -1326,7 +1566,7 @@ static int eventloop_iteration(libxl__egc *egc, libxl__poller *poller) {
      * can unlock it when it polls.
      */
     EGC_GC;
-    int rc;
+    int rc, nfds;
     struct timeval now;
     
     rc = libxl__gettimeofday(gc, &now);
@@ -1335,7 +1575,7 @@ static int eventloop_iteration(libxl__egc *egc, libxl__poller *poller) {
     int timeout;
 
     for (;;) {
-        int nfds = poller->fd_polls_allocd;
+        nfds = poller->fd_polls_allocd;
         timeout = -1;
         rc = beforepoll_internal(gc, poller, &nfds, poller->fd_polls,
                                  &timeout, now);
@@ -1353,7 +1593,7 @@ static int eventloop_iteration(libxl__egc *egc, libxl__poller *poller) {
     }
 
     CTX_UNLOCK;
-    rc = poll(poller->fd_polls, poller->fd_polls_allocd, timeout);
+    rc = poll(poller->fd_polls, nfds, timeout);
     CTX_LOCK;
 
     if (rc < 0) {
@@ -1368,8 +1608,7 @@ static int eventloop_iteration(libxl__egc *egc, libxl__poller *poller) {
     rc = libxl__gettimeofday(gc, &now);
     if (rc) goto out;
 
-    afterpoll_internal(egc, poller,
-                       poller->fd_polls_allocd, poller->fd_polls, now);
+    afterpoll_internal(egc, poller, nfds, poller->fd_polls, now);
 
     rc = 0;
  out:
@@ -1386,7 +1625,7 @@ int libxl_event_wait(libxl_ctx *ctx, libxl_event **event_r,
     EGC_INIT(ctx);
     CTX_LOCK;
 
-    poller = libxl__poller_get(ctx);
+    poller = libxl__poller_get(gc);
     if (!poller) { rc = ERROR_FAIL; goto out; }
 
     for (;;) {
@@ -1470,7 +1709,7 @@ void libxl__ao__destroy(libxl_ctx *ctx, libxl__ao *ao)
     AO_GC;
     if (!ao) return;
     LOG(DEBUG,"ao %p: destroy",ao);
-    if (ao->poller) libxl__poller_put(ctx, ao->poller);
+    libxl__poller_put(ctx, ao->poller);
     ao->magic = LIBXL__AO_MAGIC_DESTROYED;
     libxl__free_all(&ao->gc);
     free(ao);
@@ -1500,6 +1739,7 @@ void libxl__ao_complete(libxl__egc *egc, libxl__ao *ao, int rc)
     LOG(DEBUG,"ao %p: complete, rc=%d",ao,rc);
     assert(ao->magic == LIBXL__AO_MAGIC);
     assert(!ao->complete);
+    assert(!ao->nested);
     ao->complete = 1;
     ao->rc = rc;
 
@@ -1561,7 +1801,7 @@ libxl__ao *libxl__ao_create(libxl_ctx *ctx, uint32_t domid,
     if (how) {
         ao->how = *how;
     } else {
-        ao->poller = libxl__poller_get(ctx);
+        ao->poller = libxl__poller_get(&ao->gc);
         if (!ao->poller) goto out;
     }
     libxl__log(ctx,XTL_DEBUG,-1,file,line,func,
@@ -1664,6 +1904,7 @@ void libxl__ao_progress_report(libxl__egc *egc, libxl__ao *ao,
         const libxl_asyncprogress_how *how, libxl_event *ev)
 {
     AO_GC;
+    assert(!ao->nested);
     if (how->callback == dummy_asyncprogress_callback_ignore) {
         LOG(DEBUG,"ao %p: progress report: ignored",ao);
         libxl_event_free(CTX,ev);
@@ -1681,6 +1922,39 @@ void libxl__ao_progress_report(libxl__egc *egc, libxl__ao *ao,
             ao, ev, libxl_event_type_to_string(ev->type));
         libxl__event_occurred(egc, ev);
     }
+}
+
+
+/* nested ao */
+
+_hidden libxl__ao *libxl__nested_ao_create(libxl__ao *parent)
+{
+    /* We only use the parent to get the ctx.  However, we require the
+     * caller to provide us with an ao, not just a ctx, to prove that
+     * they are already in an asynchronous operation.  That will avoid
+     * people using this to (for example) make an ao in a non-ao_how
+     * function somewhere in the middle of libxl. */
+    libxl__ao *child = NULL;
+    libxl_ctx *ctx = libxl__gc_owner(&parent->gc);
+
+    assert(parent->magic == LIBXL__AO_MAGIC);
+
+    child = libxl__zalloc(&ctx->nogc_gc, sizeof(*child));
+    child->magic = LIBXL__AO_MAGIC;
+    child->nested = 1;
+    LIBXL_INIT_GC(child->gc, ctx);
+    libxl__gc *gc = &child->gc;
+
+    LOG(DEBUG,"ao %p: nested ao, parent %p", child, parent);
+    return child;
+}
+
+_hidden void libxl__nested_ao_free(libxl__ao *child)
+{
+    assert(child->magic == LIBXL__AO_MAGIC);
+    assert(child->nested);
+    libxl_ctx *ctx = libxl__gc_owner(&child->gc);
+    libxl__ao__destroy(ctx, child);
 }
 
 

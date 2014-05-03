@@ -283,8 +283,7 @@ static int __init scope_device_count(const void *start, const void *end)
     while ( start < end )
     {
         scope = start;
-        if ( (scope->length < MIN_SCOPE_LEN) ||
-             (scope->entry_type >= ACPI_DMAR_SCOPE_TYPE_RESERVED) )
+        if ( scope->length < MIN_SCOPE_LEN )
         {
             dprintk(XENLOG_WARNING VTDPREFIX, "Invalid device scope.\n");
             return -EINVAL;
@@ -304,14 +303,16 @@ static int __init scope_device_count(const void *start, const void *end)
 
 
 static int __init acpi_parse_dev_scope(
-    const void *start, const void *end, void *acpi_entry, int type, u16 seg)
+    const void *start, const void *end, struct dmar_scope *scope,
+    int type, u16 seg)
 {
-    struct dmar_scope *scope = acpi_entry;
     struct acpi_ioapic_unit *acpi_ioapic_unit;
     const struct acpi_dmar_device_scope *acpi_scope;
     u16 bus, sub_bus, sec_bus;
     const struct acpi_dmar_pci_path *path;
-    int depth, cnt, didx = 0;
+    struct acpi_drhd_unit *drhd = type == DMAR_TYPE ?
+        container_of(scope, struct acpi_drhd_unit, scope) : NULL;
+    int depth, cnt, didx = 0, ret;
 
     if ( (cnt = scope_device_count(start, end)) < 0 )
         return cnt;
@@ -359,14 +360,14 @@ static int __init acpi_parse_dev_scope(
                 dprintk(VTDPREFIX, " MSI HPET: %04x:%02x:%02x.%u\n",
                         seg, bus, path->dev, path->fn);
 
-            if ( type == DMAR_TYPE )
+            if ( drhd )
             {
-                struct acpi_drhd_unit *drhd = acpi_entry;
                 struct acpi_hpet_unit *acpi_hpet_unit;
 
+                ret = -ENOMEM;
                 acpi_hpet_unit = xmalloc(struct acpi_hpet_unit);
                 if ( !acpi_hpet_unit )
-                    return -ENOMEM;
+                    goto out;
                 acpi_hpet_unit->id = acpi_scope->enumeration_id;
                 acpi_hpet_unit->bus = bus;
                 acpi_hpet_unit->dev = path->dev;
@@ -381,10 +382,8 @@ static int __init acpi_parse_dev_scope(
                 dprintk(VTDPREFIX, " endpoint: %04x:%02x:%02x.%u\n",
                         seg, bus, path->dev, path->fn);
 
-            if ( type == DMAR_TYPE )
+            if ( drhd )
             {
-                struct acpi_drhd_unit *drhd = acpi_entry;
-
                 if ( (seg == 0) && (bus == 0) && (path->dev == 2) &&
                      (path->fn == 0) )
                     igd_drhd_address = drhd->address;
@@ -397,12 +396,12 @@ static int __init acpi_parse_dev_scope(
                 dprintk(VTDPREFIX, " IOAPIC: %04x:%02x:%02x.%u\n",
                         seg, bus, path->dev, path->fn);
 
-            if ( type == DMAR_TYPE )
+            if ( drhd )
             {
-                struct acpi_drhd_unit *drhd = acpi_entry;
+                ret = -ENOMEM;
                 acpi_ioapic_unit = xmalloc(struct acpi_ioapic_unit);
                 if ( !acpi_ioapic_unit )
-                    return -ENOMEM;
+                    goto out;
                 acpi_ioapic_unit->apic_id = acpi_scope->enumeration_id;
                 acpi_ioapic_unit->ioapic.bdf.bus = bus;
                 acpi_ioapic_unit->ioapic.bdf.dev = path->dev;
@@ -411,12 +410,25 @@ static int __init acpi_parse_dev_scope(
             }
 
             break;
+
+        default:
+            if ( iommu_verbose )
+                printk(XENLOG_WARNING VTDPREFIX "Unknown scope type %#x\n",
+                       acpi_scope->entry_type);
+            start += acpi_scope->length;
+            continue;
         }
         scope->devices[didx++] = PCI_BDF(bus, path->dev, path->fn);
         start += acpi_scope->length;
    }
 
-    return 0;
+    ret = 0;
+
+ out:
+    if ( ret )
+        xfree(scope->devices);
+
+    return ret;
 }
 
 static int __init acpi_dmar_check_length(
@@ -443,6 +455,9 @@ acpi_parse_one_drhd(struct acpi_dmar_header *header)
     if ( (ret = acpi_dmar_check_length(header, sizeof(*drhd))) != 0 )
         return ret;
 
+    if ( !drhd->address || !(drhd->address + 1) )
+        return -ENODEV;
+
     dmaru = xzalloc(struct acpi_drhd_unit);
     if ( !dmaru )
         return -ENOMEM;
@@ -463,7 +478,7 @@ acpi_parse_one_drhd(struct acpi_dmar_header *header)
     dev_scope_start = (void *)(drhd + 1);
     dev_scope_end = ((void *)drhd) + header->length;
     ret = acpi_parse_dev_scope(dev_scope_start, dev_scope_end,
-                               dmaru, DMAR_TYPE, drhd->segment);
+                               &dmaru->scope, DMAR_TYPE, drhd->segment);
 
     if ( dmaru->include_all )
     {
@@ -565,6 +580,16 @@ acpi_parse_one_rmrr(struct acpi_dmar_header *header)
     if ( (ret = acpi_dmar_check_length(header, sizeof(*rmrr))) != 0 )
         return ret;
 
+    list_for_each_entry(rmrru, &acpi_rmrr_units, list)
+       if ( base_addr <= rmrru->end_address && rmrru->base_address <= end_addr )
+       {
+           printk(XENLOG_ERR VTDPREFIX
+                  "Overlapping RMRRs [%"PRIx64",%"PRIx64"] and [%"PRIx64",%"PRIx64"]\n",
+                  rmrru->base_address, rmrru->end_address,
+                  base_addr, end_addr);
+           return -EEXIST;
+       }
+
     /* This check is here simply to detect when RMRR values are
      * not properly represented in the system memory map and
      * inform the user
@@ -590,7 +615,7 @@ acpi_parse_one_rmrr(struct acpi_dmar_header *header)
     dev_scope_start = (void *)(rmrr + 1);
     dev_scope_end   = ((void *)rmrr) + header->length;
     ret = acpi_parse_dev_scope(dev_scope_start, dev_scope_end,
-                               rmrru, RMRR_TYPE, rmrr->segment);
+                               &rmrru->scope, RMRR_TYPE, rmrr->segment);
 
     if ( ret || (rmrru->scope.devices_cnt == 0) )
         xfree(rmrru);
@@ -683,7 +708,7 @@ acpi_parse_one_atsr(struct acpi_dmar_header *header)
         dev_scope_start = (void *)(atsr + 1);
         dev_scope_end   = ((void *)atsr) + header->length;
         ret = acpi_parse_dev_scope(dev_scope_start, dev_scope_end,
-                                   atsru, ATSR_TYPE, atsr->segment);
+                                   &atsru->scope, ATSR_TYPE, atsr->segment);
     }
     else
     {
@@ -701,7 +726,7 @@ acpi_parse_one_atsr(struct acpi_dmar_header *header)
     }
 
     if ( ret )
-        xfree(atsr);
+        xfree(atsru);
     else
         acpi_register_atsr_unit(atsru);
     return ret;
@@ -744,7 +769,7 @@ static int __init acpi_parse_dmar(struct acpi_table_header *table)
     dmar = (struct acpi_table_dmar *)table;
     dmar_flags = dmar->flags;
 
-    if ( !iommu_enabled )
+    if ( !iommu_enable && !iommu_intremap )
     {
         ret = -EINVAL;
         goto out;
@@ -825,7 +850,18 @@ out:
 
 int __init acpi_dmar_init(void)
 {
-    acpi_get_table(ACPI_SIG_DMAR, 0, &dmar_table);
+    acpi_physical_address dmar_addr;
+    acpi_native_uint dmar_len;
+
+    if ( ACPI_SUCCESS(acpi_get_table_phys(ACPI_SIG_DMAR, 0,
+                                          &dmar_addr, &dmar_len)) )
+    {
+        map_pages_to_xen((unsigned long)__va(dmar_addr), PFN_DOWN(dmar_addr),
+                         PFN_UP(dmar_addr + dmar_len) - PFN_DOWN(dmar_addr),
+                         PAGE_HYPERVISOR);
+        dmar_table = __va(dmar_addr);
+    }
+
     return parse_dmar_table(acpi_parse_dmar);
 }
 

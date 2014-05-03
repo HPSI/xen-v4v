@@ -8,7 +8,7 @@
 #include <xen/string.h>
 #include <asm/bug.h>
 
-void __bug(char *file, int line) __attribute__((noreturn));
+void noreturn __bug(char *file, int line);
 void __warn(char *file, int line);
 
 #define BUG_ON(p)  do { if (unlikely(p)) BUG();  } while (0)
@@ -41,8 +41,10 @@ do {                                                            \
 #ifndef NDEBUG
 #define ASSERT(p) \
     do { if ( unlikely(!(p)) ) assert_failed(#p); } while (0)
+#define debug_build() 1
 #else
 #define ASSERT(p) do { if ( 0 && (p) ); } while (0)
+#define debug_build() 0
 #endif
 
 #define ABS(_x) ({                              \
@@ -57,6 +59,11 @@ do {                                                            \
 #define DIV_ROUND_UP(n, d) (((n) + (d) - 1) / (d))
 
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]) + __must_be_array(x))
+
+#define MASK_EXTR(v, m) (((v) & (m)) / ((m) & -(m)))
+#define MASK_INSR(v, m) (((v) * ((m) & -(m))) & (m))
+
+#define ROUNDUP(x, a) (((x) + (a) - 1) & ~((a) - 1))
 
 #define reserve_bootmem(_p,_l) ((void)0)
 
@@ -78,7 +85,9 @@ extern void debugtrace_printk(const char *fmt, ...);
 #define _p(_x) ((void *)(unsigned long)(_x))
 extern void printk(const char *format, ...)
     __attribute__ ((format (printf, 1, 2)));
-extern void panic(const char *format, ...)
+extern void guest_printk(const struct domain *d, const char *format, ...)
+    __attribute__ ((format (printf, 2, 3)));
+extern void noreturn panic(const char *format, ...)
     __attribute__ ((format (printf, 1, 2)));
 extern long vm_assist(struct domain *, unsigned int, unsigned int);
 extern int __printk_ratelimit(int ratelimit_ms, int ratelimit_burst);
@@ -121,5 +130,7 @@ extern void add_taint(unsigned);
 
 struct cpu_user_regs;
 void dump_execstate(struct cpu_user_regs *);
+
+void init_constructors(void);
 
 #endif /* __LIB_H__ */

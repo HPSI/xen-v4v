@@ -19,6 +19,7 @@ libxl__device_kind = Enumeration("device_kind", [
     (5, "VFB"),
     (6, "VKBD"),
     (7, "CONSOLE"),
+    (8, "VTPM"),
     ])
 
 libxl__console_backend = Enumeration("console_backend", [
@@ -31,4 +32,9 @@ libxl__device_console = Struct("device_console", [
     ("devid", integer),
     ("consback", libxl__console_backend),
     ("output", string),
+    ])
+
+libxl__device_action = Enumeration("device_action", [
+    (1, "ADD"),
+    (2, "REMOVE"),
     ])

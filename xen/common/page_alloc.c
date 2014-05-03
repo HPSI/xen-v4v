@@ -45,6 +45,7 @@
 #include <asm/flushtlb.h>
 #ifdef CONFIG_X86
 #include <asm/p2m.h>
+#include <asm/setup.h> /* for highmem_start only */
 #else
 #define p2m_pod_offline_or_broken_hit(pg) 0
 #define p2m_pod_offline_or_broken_replace(pg) BUG_ON(pg != NULL)
@@ -91,7 +92,7 @@ static unsigned int __initdata nr_bootmem_regions;
 
 static void __init boot_bug(int line)
 {
-    panic("Boot BUG at %s:%d\n", __FILE__, line);
+    panic("Boot BUG at %s:%d", __FILE__, line);
 }
 #define BOOT_BUG_ON(p) if ( p ) boot_bug(__LINE__);
 
@@ -151,6 +152,10 @@ void __init init_boot_pages(paddr_t ps, paddr_t pe)
 {
     unsigned long bad_spfn, bad_epfn;
     const char *p;
+#ifdef CONFIG_X86
+    const unsigned long *badpage = NULL;
+    unsigned int i, array_size;
+#endif
 
     ps = round_pgup(ps);
     pe = round_pgdown(pe);
@@ -160,6 +165,25 @@ void __init init_boot_pages(paddr_t ps, paddr_t pe)
     first_valid_mfn = min_t(unsigned long, ps >> PAGE_SHIFT, first_valid_mfn);
 
     bootmem_region_add(ps >> PAGE_SHIFT, pe >> PAGE_SHIFT);
+
+#ifdef CONFIG_X86
+    /* 
+     * Here we put platform-specific memory range workarounds, i.e.
+     * memory known to be corrupt or otherwise in need to be reserved on
+     * specific platforms.
+     * We get these certain pages and remove them from memory region list.
+     */
+    badpage = get_platform_badpages(&array_size);
+    if ( badpage )
+    {
+        for ( i = 0; i < array_size; i++ )
+        {
+            bootmem_region_zap(*badpage >> PAGE_SHIFT,
+                               (*badpage >> PAGE_SHIFT) + 1);
+            badpage++;
+        }
+    }
+#endif
 
     /* Check new pages against the bad-page list. */
     p = opt_badpage;
@@ -181,12 +205,6 @@ void __init init_boot_pages(paddr_t ps, paddr_t pe)
         else if ( *p != '\0' )
             break;
 
-        if ( bad_epfn == bad_spfn )
-            printk("Marking page %lx as bad\n", bad_spfn);
-        else
-            printk("Marking pages %lx through %lx as bad\n",
-                   bad_spfn, bad_epfn);
-
         bootmem_region_zap(bad_spfn, bad_epfn+1);
     }
 }
@@ -203,6 +221,25 @@ unsigned long __init alloc_boot_pages(
         pg = (r->e - nr_pfns) & ~(pfn_align - 1);
         if ( pg < r->s )
             continue;
+
+#if defined(CONFIG_X86) && !defined(NDEBUG)
+        /*
+         * Filtering pfn_align == 1 since the only allocations using a bigger
+         * alignment are the ones used for setting up the frame table chunks.
+         * Those allocations get remapped anyway, i.e. them not having 1:1
+         * mappings always accessible is not a problem.
+         */
+        if ( highmem_start && pfn_align == 1 &&
+             r->e > PFN_DOWN(highmem_start) )
+        {
+            pg = r->s;
+            if ( pg + nr_pfns > PFN_DOWN(highmem_start) )
+                continue;
+            r->s = pg + nr_pfns;
+            return pg;
+        }
+#endif
+
         _e = r->e;
         r->e = pg;
         bootmem_region_add(pg + nr_pfns, _e);
@@ -220,11 +257,11 @@ unsigned long __init alloc_boot_pages(
  */
 
 #define MEMZONE_XEN 0
-#define NR_ZONES    (PADDR_BITS - PAGE_SHIFT)
+#define NR_ZONES    (PADDR_BITS - PAGE_SHIFT + 1)
 
-#define bits_to_zone(b) (((b) < (PAGE_SHIFT + 1)) ? 0 : ((b) - PAGE_SHIFT - 1))
+#define bits_to_zone(b) (((b) < (PAGE_SHIFT + 1)) ? 1 : ((b) - PAGE_SHIFT))
 #define page_to_zone(pg) (is_xen_heap_page(pg) ? MEMZONE_XEN :  \
-                          (fls(page_to_mfn(pg)) - 1))
+                          (fls(page_to_mfn(pg)) ? : 1))
 
 typedef struct page_list_head heap_by_zone_and_order_t[NR_ZONES][MAX_ORDER+1];
 static heap_by_zone_and_order_t *_heap[MAX_NUMNODES];
@@ -238,6 +275,118 @@ static long midsize_alloc_zone_pages;
 #define MIDSIZE_ALLOC_FRAC 128
 
 static DEFINE_SPINLOCK(heap_lock);
+static long outstanding_claims; /* total outstanding claims by all domains */
+
+unsigned long domain_adjust_tot_pages(struct domain *d, long pages)
+{
+    long dom_before, dom_after, dom_claimed, sys_before, sys_after;
+
+    ASSERT(spin_is_locked(&d->page_alloc_lock));
+    d->tot_pages += pages;
+
+    /*
+     * can test d->claimed_pages race-free because it can only change
+     * if d->page_alloc_lock and heap_lock are both held, see also
+     * domain_set_outstanding_pages below
+     */
+    if ( !d->outstanding_pages )
+        goto out;
+
+    spin_lock(&heap_lock);
+    /* adjust domain outstanding pages; may not go negative */
+    dom_before = d->outstanding_pages;
+    dom_after = dom_before - pages;
+    BUG_ON(dom_before < 0);
+    dom_claimed = dom_after < 0 ? 0 : dom_after;
+    d->outstanding_pages = dom_claimed;
+    /* flag accounting bug if system outstanding_claims would go negative */
+    sys_before = outstanding_claims;
+    sys_after = sys_before - (dom_before - dom_claimed);
+    BUG_ON(sys_after < 0);
+    outstanding_claims = sys_after;
+    spin_unlock(&heap_lock);
+
+out:
+    return d->tot_pages;
+}
+
+int domain_set_outstanding_pages(struct domain *d, unsigned long pages)
+{
+    int ret = -ENOMEM;
+    unsigned long claim, avail_pages;
+
+    /*
+     * take the domain's page_alloc_lock, else all d->tot_page adjustments
+     * must always take the global heap_lock rather than only in the much
+     * rarer case that d->outstanding_pages is non-zero
+     */
+    spin_lock(&d->page_alloc_lock);
+    spin_lock(&heap_lock);
+
+    /* pages==0 means "unset" the claim. */
+    if ( pages == 0 )
+    {
+        outstanding_claims -= d->outstanding_pages;
+        d->outstanding_pages = 0;
+        ret = 0;
+        goto out;
+    }
+
+    /* only one active claim per domain please */
+    if ( d->outstanding_pages )
+    {
+        ret = -EINVAL;
+        goto out;
+    }
+
+    /* disallow a claim not exceeding current tot_pages or above max_pages */
+    if ( (pages <= d->tot_pages) || (pages > d->max_pages) )
+    {
+        ret = -EINVAL;
+        goto out;
+    }
+
+    /* how much memory is available? */
+    avail_pages = total_avail_pages;
+
+    /* Note: The usage of claim means that allocation from a guest *might*
+     * have to come from freeable memory. Using free memory is always better, if
+     * it is available, than using freeable memory.
+     *
+     * But that is OK as once the claim has been made, it still can take minutes
+     * before the claim is fully satisfied. Tmem can make use of the unclaimed
+     * pages during this time (to store ephemeral/freeable pages only,
+     * not persistent pages).
+     */
+    avail_pages += tmem_freeable_pages();
+    avail_pages -= outstanding_claims;
+
+    /*
+     * Note, if domain has already allocated memory before making a claim
+     * then the claim must take tot_pages into account
+     */
+    claim = pages - d->tot_pages;
+    if ( claim > avail_pages )
+        goto out;
+
+    /* yay, claim fits in available memory, stake the claim, success! */
+    d->outstanding_pages = claim;
+    outstanding_claims += d->outstanding_pages;
+    ret = 0;
+
+out:
+    spin_unlock(&heap_lock);
+    spin_unlock(&d->page_alloc_lock);
+    return ret;
+}
+
+void get_outstanding_claims(uint64_t *free_pages, uint64_t *outstanding_pages)
+{
+    spin_lock(&heap_lock);
+    *outstanding_pages = outstanding_claims;
+    *free_pages =  avail_domheap_pages();
+    spin_unlock(&heap_lock);
+}
 
 static unsigned long init_node_heap(int node, unsigned long mfn,
                                     unsigned long nr, bool_t *use_tail)
@@ -249,6 +398,9 @@ static unsigned long init_node_heap(int node, unsigned long mfn,
     unsigned long needed = (sizeof(**_heap) +
                             sizeof(**avail) * NR_ZONES +
                             PAGE_SIZE - 1) >> PAGE_SHIFT;
+#ifdef DIRECTMAP_VIRT_END
+    unsigned long eva = min(DIRECTMAP_VIRT_END, HYPERVISOR_VIRT_END);
+#endif
     int i, j;
 
     if ( !first_node_initialised )
@@ -260,14 +412,14 @@ static unsigned long init_node_heap(int node, unsigned long mfn,
     }
 #ifdef DIRECTMAP_VIRT_END
     else if ( *use_tail && nr >= needed &&
-              (mfn + nr) <= (virt_to_mfn(DIRECTMAP_VIRT_END - 1) + 1) )
+              (mfn + nr) <= (virt_to_mfn(eva - 1) + 1) )
     {
         _heap[node] = mfn_to_virt(mfn + nr - needed);
         avail[node] = mfn_to_virt(mfn + nr - 1) +
                       PAGE_SIZE - sizeof(**avail) * NR_ZONES;
     }
     else if ( nr >= needed &&
-              (mfn + needed) <= (virt_to_mfn(DIRECTMAP_VIRT_END - 1) + 1) )
+              (mfn + needed) <= (virt_to_mfn(eva - 1) + 1) )
     {
         _heap[node] = mfn_to_virt(mfn);
         avail[node] = mfn_to_virt(mfn + needed - 1) +
@@ -374,7 +526,7 @@ static void __init setup_low_mem_virq(void)
 static void check_low_mem_virq(void)
 {
     unsigned long avail_pages = total_avail_pages +
-        (opt_tmem ? tmem_freeable_pages() : 0);
+        (opt_tmem ? tmem_freeable_pages() : 0) - outstanding_claims;
 
     if ( unlikely(avail_pages <= low_mem_virq_th) )
     {
@@ -441,6 +593,15 @@ static struct page_info *alloc_heap_pages(
         return NULL;
 
     spin_lock(&heap_lock);
+
+    /*
+     * Claimed memory is considered unavailable unless the request
+     * is made by a domain with sufficient unclaimed pages.
+     */
+    if ( (outstanding_claims + request >
+          total_avail_pages + tmem_freeable_pages()) &&
+          (d == NULL || d->outstanding_pages < request) )
+        goto not_found;
 
     /*
      * TMEM: When available memory is scarce due to tmem absorbing it, allow
@@ -549,6 +710,11 @@ static struct page_info *alloc_heap_pages(
         /* Initialise fields which have other uses for free pages. */
         pg[i].u.inuse.type_info = 0;
         page_set_owner(&pg[i], NULL);
+
+        /* Ensure cache and RAM are consistent for platforms where the
+         * guest can control its own visibility of/through the cache.
+         */
+        flush_page_to_ram(page_to_mfn(&pg[i]));
     }
 
     spin_unlock(&heap_lock);
@@ -796,7 +962,6 @@ int offline_page(unsigned long mfn, int broken, uint32_t *status)
 {
     unsigned long old_info = 0;
     struct domain *owner;
-    int ret = 0;
     struct page_info *pg;
 
     if ( !mfn_valid(mfn) )
@@ -846,16 +1011,28 @@ int offline_page(unsigned long mfn, int broken, uint32_t *status)
     if ( page_state_is(pg, offlined) )
     {
         reserve_heap_page(pg);
-        *status = PG_OFFLINE_OFFLINED;
+
+        spin_unlock(&heap_lock);
+
+        *status = broken ? PG_OFFLINE_OFFLINED | PG_OFFLINE_BROKEN
+                         : PG_OFFLINE_OFFLINED;
+        return 0;
     }
-    else if ( (owner = page_get_owner_and_reference(pg)) )
+
+    spin_unlock(&heap_lock);
+
+    if ( (owner = page_get_owner_and_reference(pg)) )
     {
         if ( p2m_pod_offline_or_broken_hit(pg) )
-            goto pod_replace;
+        {
+            put_page(pg);
+            p2m_pod_offline_or_broken_replace(pg);
+            *status = PG_OFFLINE_OFFLINED;
+        }
         else
         {
             *status = PG_OFFLINE_OWNED | PG_OFFLINE_PENDING |
-              (owner->domain_id << PG_OFFLINE_OWNER_SHIFT);
+                      (owner->domain_id << PG_OFFLINE_OWNER_SHIFT);
             /* Release the reference since it will not be allocated anymore */
             put_page(pg);
         }
@@ -863,7 +1040,7 @@ int offline_page(unsigned long mfn, int broken, uint32_t *status)
     else if ( old_info & PGC_xen_heap )
     {
         *status = PG_OFFLINE_XENPAGE | PG_OFFLINE_PENDING |
-          (DOMID_XEN << PG_OFFLINE_OWNER_SHIFT);
+                  (DOMID_XEN << PG_OFFLINE_OWNER_SHIFT);
     }
     else
     {
@@ -882,21 +1059,7 @@ int offline_page(unsigned long mfn, int broken, uint32_t *status)
     if ( broken )
         *status |= PG_OFFLINE_BROKEN;
 
-    spin_unlock(&heap_lock);
-
-    return ret;
-
-pod_replace:
-    put_page(pg);
-    spin_unlock(&heap_lock);
-
-    p2m_pod_offline_or_broken_replace(pg);
-    *status = PG_OFFLINE_OFFLINED;
-
-    if ( broken )
-        *status |= PG_OFFLINE_BROKEN;
-
-    return ret;
+    return 0;
 }
 
 /*
@@ -1144,7 +1307,7 @@ void __init scrub_heap_pages(void)
  * XEN-HEAP SUB-ALLOCATOR
  */
 
-#if !defined(CONFIG_X86)
+#if defined(CONFIG_SEPARATE_XENHEAP)
 
 void init_xenheap_pages(paddr_t ps, paddr_t pe)
 {
@@ -1199,6 +1362,13 @@ void free_xenheap_pages(void *v, unsigned int order)
 
 #else
 
+static unsigned int __read_mostly xenheap_bits;
+
+void __init xenheap_max_mfn(unsigned long mfn)
+{
+    xenheap_bits = fls(mfn) + PAGE_SHIFT;
+}
+
 void init_xenheap_pages(paddr_t ps, paddr_t pe)
 {
     init_domheap_pages(ps, pe);
@@ -1210,6 +1380,11 @@ void *alloc_xenheap_pages(unsigned int order, unsigned int memflags)
     unsigned int i;
 
     ASSERT(!in_irq());
+
+    if ( xenheap_bits && (memflags >> _MEMF_bits) > xenheap_bits )
+        memflags &= ~MEMF_bits(~0);
+    if ( !(memflags >> _MEMF_bits) )
+        memflags |= MEMF_bits(xenheap_bits);
 
     pg = alloc_domheap_pages(NULL, order, memflags);
     if ( unlikely(pg == NULL) )
@@ -1256,6 +1431,9 @@ void init_domheap_pages(paddr_t ps, paddr_t pe)
     smfn = round_pgup(ps) >> PAGE_SHIFT;
     emfn = round_pgdown(pe) >> PAGE_SHIFT;
 
+    if ( emfn <= smfn )
+        return;
+
     init_heap_pages(mfn_to_page(smfn), emfn - smfn);
 }
 
@@ -1291,7 +1469,7 @@ int assign_pages(
         if ( unlikely(d->tot_pages == 0) )
             get_knownalive_domain(d);
 
-        d->tot_pages += 1 << order;
+        domain_adjust_tot_pages(d, 1 << order);
     }
 
     for ( i = 0; i < (1 << order); i++ )
@@ -1299,7 +1477,7 @@ int assign_pages(
         ASSERT(page_get_owner(&pg[i]) == NULL);
         ASSERT((pg[i].count_info & ~(PGC_allocated | 1)) == 0);
         page_set_owner(&pg[i], d);
-        wmb(); /* Domain pointer must be visible before updating refcnt. */
+        smp_wmb(); /* Domain pointer must be visible before updating refcnt. */
         pg[i].count_info = PGC_allocated | 1;
         page_list_add_tail(&pg[i], &d->page_list);
     }
@@ -1346,8 +1524,9 @@ struct page_info *alloc_domheap_pages(
 
 void free_domheap_pages(struct page_info *pg, unsigned int order)
 {
-    int            i, drop_dom_ref;
     struct domain *d = page_get_owner(pg);
+    unsigned int i;
+    bool_t drop_dom_ref;
 
     ASSERT(!in_irq());
 
@@ -1375,8 +1554,7 @@ void free_domheap_pages(struct page_info *pg, unsigned int order)
             page_list_del2(&pg[i], &d->page_list, &d->arch.relmem_list);
         }
 
-        d->tot_pages -= 1 << order;
-        drop_dom_ref = (d->tot_pages == 0);
+        drop_dom_ref = !domain_adjust_tot_pages(d, -(1 << order));
 
         spin_unlock_recursive(&d->page_alloc_lock);
 
@@ -1479,10 +1657,12 @@ __initcall(pagealloc_keyhandler_init);
 
 void scrub_one_page(struct page_info *pg)
 {
-    void *p = __map_domain_page(pg);
+    void *p;
 
     if ( unlikely(pg->count_info & PGC_broken) )
         return;
+
+    p = __map_domain_page(pg);
 
 #ifndef NDEBUG
     /* Avoid callers relying on allocations returning zeroed pages. */
@@ -1529,7 +1709,7 @@ __initcall(register_heap_trigger);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

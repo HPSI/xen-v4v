@@ -2,7 +2,7 @@
 # ! - needs translation
 # ? - needs checking
 ?	dom0_vga_console_info		xen.h
-?	xenctl_cpumap			xen.h
+?	xenctl_bitmap			xen.h
 ?	mmu_update			xen.h
 !	mmuext_op			xen.h
 !	start_info			xen.h
@@ -55,10 +55,12 @@
 !	kexec_image			kexec.h
 !	kexec_range			kexec.h
 !	add_to_physmap			memory.h
+!	add_to_physmap_batch		memory.h
 !	foreign_memory_map		memory.h
 !	memory_exchange			memory.h
 !	memory_map			memory.h
 !	memory_reservation		memory.h
+?	mem_access_op		memory.h
 !	pod_target			memory.h
 !	remove_from_physmap		memory.h
 ?	physdev_eoi			physdev.h
@@ -83,6 +85,7 @@
 !	processor_power			platform.h
 ?	processor_px			platform.h
 !	psd_package			platform.h
+?	xenpf_enter_acpi_sleep		platform.h
 ?	xenpf_pcpuinfo			platform.h
 ?	xenpf_pcpu_version		platform.h
 !	sched_poll			sched.h
@@ -97,3 +100,16 @@
 !	vcpu_set_singleshot_timer	vcpu.h
 ?	xenoprof_init			xenoprof.h
 ?	xenoprof_passive		xenoprof.h
+?	flask_access			xsm/flask_op.h
+!	flask_boolean			xsm/flask_op.h
+?	flask_cache_stats		xsm/flask_op.h
+?	flask_hash_stats		xsm/flask_op.h
+!	flask_load			xsm/flask_op.h
+?	flask_ocontext			xsm/flask_op.h
+?	flask_peersid			xsm/flask_op.h
+?	flask_relabel			xsm/flask_op.h
+?	flask_setavc_threshold		xsm/flask_op.h
+?	flask_setenforce		xsm/flask_op.h
+!	flask_sid_context		xsm/flask_op.h
+?	flask_transition		xsm/flask_op.h
+!	flask_userlist			xsm/flask_op.h

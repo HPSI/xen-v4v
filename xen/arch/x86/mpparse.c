@@ -22,7 +22,7 @@
 #include <xen/efi.h>
 #include <xen/sched.h>
 
-#include <asm/bitops.h>
+#include <xen/bitops.h>
 #include <asm/smp.h>
 #include <asm/acpi.h>
 #include <asm/mtrr.h>
@@ -221,7 +221,7 @@ static void __init MP_ioapic_info (struct mpc_config_ioapic *m)
 	if (nr_ioapics >= MAX_IO_APICS) {
 		printk(KERN_CRIT "Max # of I/O APICs (%d) exceeded (found %d).\n",
 			MAX_IO_APICS, nr_ioapics);
-		panic("Recompile kernel with bigger MAX_IO_APICS!.\n");
+		panic("Recompile kernel with bigger MAX_IO_APICS");
 	}
 	if (!m->mpc_apicaddr) {
 		printk(KERN_ERR "WARNING: bogus zero I/O APIC address"
@@ -241,7 +241,7 @@ static void __init MP_intsrc_info (struct mpc_config_intsrc *m)
 			(m->mpc_irqflag >> 2) & 3, m->mpc_srcbus,
 			m->mpc_srcbusirq, m->mpc_dstapic, m->mpc_dstirq);
 	if (++mp_irq_entries == MAX_IRQ_SOURCES)
-		panic("Max # of irq sources exceeded!!\n");
+		panic("Max # of irq sources exceeded");
 }
 
 static void __init MP_lintsrc_info (struct mpc_config_lintsrc *m)
@@ -537,8 +537,6 @@ static inline void __init construct_default_ISA_mptable(int mpc_default_type)
 		MP_lintsrc_info(&lintsrc);
 	}
 }
-
-#define FIX_EFI_MPF FIX_KEXEC_BASE_0
 
 static __init void efi_unmap_mpf(void)
 {
@@ -846,7 +844,7 @@ void __init mp_register_ioapic (
 	if (nr_ioapics >= MAX_IO_APICS) {
 		printk(KERN_ERR "ERROR: Max # of I/O APICs (%d) exceeded "
 			"(found %d)\n", MAX_IO_APICS, nr_ioapics);
-		panic("Recompile kernel with bigger MAX_IO_APICS!\n");
+		panic("Recompile kernel with bigger MAX_IO_APICS");
 	}
 	if (!address) {
 		printk(KERN_ERR "WARNING: Bogus (zero) I/O APIC address"
@@ -945,7 +943,7 @@ void __init mp_override_legacy_irq (
 
 	mp_irqs[mp_irq_entries] = intsrc;
 	if (++mp_irq_entries == MAX_IRQ_SOURCES)
-		panic("Max # of irq sources exceeded!\n");
+		panic("Max # of irq sources exceeded");
 
 	return;
 }
@@ -1011,7 +1009,7 @@ void __init mp_config_acpi_legacy_irqs (void)
 
 		mp_irqs[mp_irq_entries] = intsrc;
 		if (++mp_irq_entries == MAX_IRQ_SOURCES)
-			panic("Max # of irq sources exceeded!\n");
+			panic("Max # of irq sources exceeded");
 	}
 }
 

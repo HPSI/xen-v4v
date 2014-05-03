@@ -110,9 +110,10 @@ static void amd_xc_cpuid_policy(
                     bitmaskof(X86_FEATURE_3DNOWPREFETCH) |
                     bitmaskof(X86_FEATURE_OSVW) |
                     bitmaskof(X86_FEATURE_XOP) |
+                    bitmaskof(X86_FEATURE_LWP) |
                     bitmaskof(X86_FEATURE_FMA4) |
                     bitmaskof(X86_FEATURE_TBM) |
-                    bitmaskof(X86_FEATURE_LWP));
+                    bitmaskof(X86_FEATURE_DBEXT));
         regs[3] &= (0x0183f3ff | /* features shared with 0x00000001:EDX */
                     (is_pae ? bitmaskof(X86_FEATURE_NX) : 0) |
                     (is_64bit ? bitmaskof(X86_FEATURE_LM) : 0) |
@@ -197,6 +198,7 @@ static void intel_xc_cpuid_policy(
 
         /* Only a few features are advertised in Intel's 0x80000001. */
         regs[2] &= (is_64bit ? bitmaskof(X86_FEATURE_LAHF_LM) : 0) |
+                               bitmaskof(X86_FEATURE_3DNOWPREFETCH) |
                                bitmaskof(X86_FEATURE_ABM);
         regs[3] &= ((is_pae ? bitmaskof(X86_FEATURE_NX) : 0) |
                     (is_64bit ? bitmaskof(X86_FEATURE_LM) : 0) |
@@ -371,6 +373,8 @@ static void xc_cpuid_hvm_policy(
                         bitmaskof(X86_FEATURE_ERMS) |
                         bitmaskof(X86_FEATURE_INVPCID) |
                         bitmaskof(X86_FEATURE_RTM)  |
+                        bitmaskof(X86_FEATURE_RDSEED)  |
+                        bitmaskof(X86_FEATURE_ADX)  |
                         bitmaskof(X86_FEATURE_FSGSBASE));
         } else
             regs[1] = 0;
@@ -436,17 +440,15 @@ static void xc_cpuid_pv_policy(
     const unsigned int *input, unsigned int *regs)
 {
     DECLARE_DOMCTL;
+    unsigned int guest_width;
     int guest_64bit, xen_64bit = hypervisor_is_64bit(xch);
     char brand[13];
     uint64_t xfeature_mask;
 
     xc_cpuid_brand_get(brand);
 
-    memset(&domctl, 0, sizeof(domctl));
-    domctl.domain = domid;
-    domctl.cmd = XEN_DOMCTL_get_address_size;
-    do_domctl(xch, &domctl);
-    guest_64bit = (domctl.u.address_size.size == 64);
+    xc_domain_get_guest_width(xch, domid, &guest_width);
+    guest_64bit = (guest_width == 8);
 
     /* Detecting Xen's atitude towards XSAVE */
     memset(&domctl, 0, sizeof(domctl));
@@ -504,6 +506,8 @@ static void xc_cpuid_pv_policy(
                         bitmaskof(X86_FEATURE_BMI2) |
                         bitmaskof(X86_FEATURE_ERMS) |
                         bitmaskof(X86_FEATURE_RTM)  |
+                        bitmaskof(X86_FEATURE_RDSEED)  |
+                        bitmaskof(X86_FEATURE_ADX)  |
                         bitmaskof(X86_FEATURE_FSGSBASE));
         else
             regs[1] = 0;
@@ -590,6 +594,8 @@ static int xc_cpuid_do_domctl(
 static char *alloc_str(void)
 {
     char *s = malloc(33);
+    if ( s == NULL )
+        return s;
     memset(s, 0, 33);
     return s;
 }
@@ -601,6 +607,8 @@ void xc_cpuid_to_str(const unsigned int *regs, char **strs)
     for ( i = 0; i < 4; i++ )
     {
         strs[i] = alloc_str();
+        if ( strs[i] == NULL )
+            continue;
         for ( j = 0; j < 32; j++ )
             strs[i][j] = !!((regs[i] & (1U << (31 - j)))) ? '1' : '0';
     }
@@ -681,7 +689,7 @@ int xc_cpuid_check(
     const char **config,
     char **config_transformed)
 {
-    int i, j;
+    int i, j, rc;
     unsigned int regs[4];
 
     memset(config_transformed, 0, 4 * sizeof(*config_transformed));
@@ -693,6 +701,11 @@ int xc_cpuid_check(
         if ( config[i] == NULL )
             continue;
         config_transformed[i] = alloc_str();
+        if ( config_transformed[i] == NULL )
+        {
+            rc = -ENOMEM;
+            goto fail_rc;
+        }
         for ( j = 0; j < 32; j++ )
         {
             unsigned char val = !!((regs[i] & (1U << (31 - j))));
@@ -709,12 +722,14 @@ int xc_cpuid_check(
     return 0;
 
  fail:
+    rc = -EPERM;
+ fail_rc:
     for ( i = 0; i < 4; i++ )
     {
         free(config_transformed[i]);
         config_transformed[i] = NULL;
     }
-    return -EPERM;
+    return rc;
 }
 
 /*
@@ -759,6 +774,11 @@ int xc_cpuid_set(
         }
         
         config_transformed[i] = alloc_str();
+        if ( config_transformed[i] == NULL )
+        {
+            rc = -ENOMEM;
+            goto fail;
+        }
 
         for ( j = 0; j < 32; j++ )
         {

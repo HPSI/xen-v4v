@@ -99,7 +99,7 @@ struct blkfront_dev *init_blkfront(char *_nodename, struct blkfront_info *info)
 
     struct blkfront_dev *dev;
 
-    char path[strlen(nodename) + 1 + 10 + 1];
+    char path[strlen(nodename) + strlen("/backend-id") + 1];
 
     printk("******************* BLKFRONT for %s **********\n\n\n", nodename);
 
@@ -160,7 +160,7 @@ again:
 
 
     err = xenbus_transaction_end(xbt, 0, &retry);
-    if (err) free(err);
+    free(err);
     if (retry) {
             goto again;
         printk("completing transaction\n");
@@ -189,7 +189,7 @@ done:
 
     {
         XenbusState state;
-        char path[strlen(dev->backend) + 1 + 19 + 1];
+        char path[strlen(dev->backend) + strlen("/feature-flush-cache") + 1];
         snprintf(path, sizeof(path), "%s/mode", dev->backend);
         msg = xenbus_read(XBT_NIL, path, &c);
         if (msg) {
@@ -250,11 +250,11 @@ error:
 
 void shutdown_blkfront(struct blkfront_dev *dev)
 {
-    char* err = NULL;
+    char* err = NULL, *err2;
     XenbusState state;
 
-    char path[strlen(dev->backend) + 1 + 5 + 1];
-    char nodename[strlen(dev->nodename) + 1 + 5 + 1];
+    char path[strlen(dev->backend) + strlen("/state") + 1];
+    char nodename[strlen(dev->nodename) + strlen("/event-channel") + 1];
 
     blkfront_sync(dev);
 
@@ -271,7 +271,7 @@ void shutdown_blkfront(struct blkfront_dev *dev)
     state = xenbus_read_integer(path);
     while (err == NULL && state < XenbusStateClosing)
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-    if (err) free(err);
+    free(err);
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateClosed)) != NULL) {
         printk("shutdown_blkfront: error changing state to %d: %s\n",
@@ -281,7 +281,7 @@ void shutdown_blkfront(struct blkfront_dev *dev)
     state = xenbus_read_integer(path);
     while (state < XenbusStateClosed) {
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-        if (err) free(err);
+        free(err);
     }
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateInitialising)) != NULL) {
@@ -289,19 +289,21 @@ void shutdown_blkfront(struct blkfront_dev *dev)
                 XenbusStateInitialising, err);
         goto close;
     }
-    err = NULL;
     state = xenbus_read_integer(path);
     while (err == NULL && (state < XenbusStateInitWait || state >= XenbusStateClosed))
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
 
 close:
-    if (err) free(err);
-    xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
+    err2 = xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err2);
 
-    snprintf(path, sizeof(path), "%s/ring-ref", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/event-channel", nodename);
-    xenbus_rm(XBT_NIL, path);
+    snprintf(nodename, sizeof(nodename), "%s/ring-ref", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/event-channel", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
 
     if (!err)
         free_blkfront(dev);
@@ -507,14 +509,18 @@ moretodo:
         aiocbp = (void*) (uintptr_t) rsp->id;
         status = rsp->status;
 
-        if (status != BLKIF_RSP_OKAY)
-            printk("block error %d for op %d\n", status, rsp->operation);
-
         switch (rsp->operation) {
         case BLKIF_OP_READ:
         case BLKIF_OP_WRITE:
         {
             int j;
+
+            if (status != BLKIF_RSP_OKAY)
+                printk("%s error %d on %s at offset %llu, num bytes %llu\n",
+                        rsp->operation == BLKIF_OP_READ?"read":"write",
+                        status, aiocbp->aio_dev->nodename,
+                        (unsigned long long) aiocbp->aio_offset,
+                        (unsigned long long) aiocbp->aio_nbytes);
 
             for (j = 0; j < aiocbp->n; j++)
                 gnttab_end_access(aiocbp->gref[j]);
@@ -523,11 +529,17 @@ moretodo:
         }
 
         case BLKIF_OP_WRITE_BARRIER:
+            if (status != BLKIF_RSP_OKAY)
+                printk("write barrier error %d\n", status);
+            break;
         case BLKIF_OP_FLUSH_DISKCACHE:
+            if (status != BLKIF_RSP_OKAY)
+                printk("flush error %d\n", status);
             break;
 
         default:
-            printk("unrecognized block operation %d response\n", rsp->operation);
+            printk("unrecognized block operation %d response (status %d)\n", rsp->operation, status);
+            break;
         }
 
         dev->ring.rsp_cons = ++cons;

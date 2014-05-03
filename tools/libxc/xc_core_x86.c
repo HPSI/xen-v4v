@@ -180,11 +180,9 @@ out:
     if ( live_p2m_frame_list )
         munmap(live_p2m_frame_list, P2M_FLL_ENTRIES * PAGE_SIZE);
 
-    if ( p2m_frame_list_list )
-        free(p2m_frame_list_list);
+    free(p2m_frame_list_list);
 
-    if ( p2m_frame_list )
-        free(p2m_frame_list);
+    free(p2m_frame_list);
 
     errno = err;
     return ret;
@@ -214,7 +212,7 @@ xc_core_arch_map_p2m_writable(xc_interface *xch, unsigned int guest_width, xc_do
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

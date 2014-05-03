@@ -1,9 +1,12 @@
-subdir-y += lib
+subdir-$(arm32) += arm32
+subdir-$(arm64) += arm64
+subdir-y += platforms
 
-obj-y += dummy.o
-obj-y += early_printk.o
-obj-y += entry.o
+obj-$(EARLY_PRINTK) += early_printk.o
+obj-y += cpu.o
 obj-y += domain.o
+obj-y += psci.o
+obj-y += vpsci.o
 obj-y += domctl.o
 obj-y += sysctl.o
 obj-y += domain_build.o
@@ -12,11 +15,11 @@ obj-y += io.o
 obj-y += irq.o
 obj-y += kernel.o
 obj-y += mm.o
-obj-y += mode_switch.o
 obj-y += p2m.o
 obj-y += percpu.o
 obj-y += guestcopy.o
 obj-y += physdev.o
+obj-y += platform.o
 obj-y += setup.o
 obj-y += time.o
 obj-y += smpboot.o
@@ -25,31 +28,29 @@ obj-y += shutdown.o
 obj-y += traps.o
 obj-y += vgic.o
 obj-y += vtimer.o
-obj-y += vpl011.o
+obj-y += vuart.o
 obj-y += hvm.o
+obj-y += device.o
+obj-y += decode.o
+obj-y += processor.o
 
 #obj-bin-y += ....o
 
 ifdef CONFIG_DTB_FILE
 obj-y += dtb.o
 AFLAGS += -DCONFIG_DTB_FILE=\"$(CONFIG_DTB_FILE)\"
-else
-# XXX: When running on the model there is no bootloader to provide a
-# device tree.  It must be linked into Xen.
-$(error CONFIG_DTB_FILE must be set to the absolute filename of a DTB)
 endif
 
-ALL_OBJS := head.o $(ALL_OBJS)
+ALL_OBJS := $(TARGET_SUBARCH)/head.o $(ALL_OBJS)
 
-$(TARGET): $(TARGET)-syms
+$(TARGET): $(TARGET)-syms $(TARGET).axf
+	$(OBJCOPY) -O binary -S $< $@
+
+$(TARGET).axf: $(TARGET)-syms
 	# XXX: VE model loads by VMA so instead of
 	# making a proper ELF we link with LMA == VMA and adjust crudely
 	$(OBJCOPY) --change-addresses +0x80000000 $< $@
 	$(STRIP) $@
-
-#$(TARGET): $(TARGET)-syms $(efi-y) boot/mkelf32
-#	./boot/mkelf32 $(TARGET)-syms $(TARGET) 0x100000 \
-#	`$(NM) -nr $(TARGET)-syms | head -n 1 | sed -e 's/^\([^ ]*\).*/0x\1/'`
 
 ifeq ($(lto),y)
 # Gather all LTO objects together
@@ -80,7 +81,7 @@ $(TARGET)-syms: prelink.o xen.lds $(BASEDIR)/common/symbols-dummy.o
 	    $(@D)/.$(@F).1.o -o $@
 	rm -f $(@D)/.$(@F).[0-9]*
 
-asm-offsets.s: asm-offsets.c
+asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c
 	$(CC) $(filter-out -flto,$(CFLAGS)) -S -o $@ $<
 
 xen.lds: xen.lds.S
@@ -94,3 +95,4 @@ dtb.o: $(CONFIG_DTB_FILE)
 clean::
 	rm -f asm-offsets.s xen.lds
 	rm -f $(BASEDIR)/.xen-syms.[0-9]*
+	rm -f $(TARGET).axf

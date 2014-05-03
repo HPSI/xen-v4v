@@ -94,7 +94,7 @@ struct nestedsvm {
 #define vcpu_nestedsvm(v) (vcpu_nestedhvm(v).u.nsvm)
 
 /* True when l1 guest enabled SVM in EFER */
-#define hvm_svm_enabled(v) \
+#define nsvm_efer_svm_enabled(v) \
     (!!((v)->arch.hvm_vcpu.guest_efer & EFER_SVME))
 
 int nestedsvm_vmcb_map(struct vcpu *v, uint64_t vmcbaddr);
@@ -133,6 +133,9 @@ int nsvm_wrmsr(struct vcpu *v, unsigned int msr, uint64_t msr_content);
 void svm_vmexit_do_clgi(struct cpu_user_regs *regs, struct vcpu *v);
 void svm_vmexit_do_stgi(struct cpu_user_regs *regs, struct vcpu *v);
 bool_t nestedsvm_gif_isset(struct vcpu *v);
+int nsvm_hap_walk_L1_p2m(struct vcpu *v, paddr_t L2_gpa, paddr_t *L1_gpa,
+                         unsigned int *page_order, uint8_t *p2m_acc,
+                         bool_t access_r, bool_t access_w, bool_t access_x);
 
 #define NSVM_INTR_NOTHANDLED     3
 #define NSVM_INTR_NOTINTERCEPTED 2
@@ -145,7 +148,7 @@ int nestedsvm_vcpu_interrupt(struct vcpu *v, const struct hvm_intack intack);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

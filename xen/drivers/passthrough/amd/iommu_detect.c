@@ -39,7 +39,9 @@ static int __init get_iommu_msi_capabilities(
 
     AMD_IOMMU_DEBUG("Found MSI capability block at %#x\n", pos);
 
-    iommu->msi_cap = pos;
+    iommu->msi.msi_attrib.type = PCI_CAP_ID_MSI;
+    iommu->msi.msi_attrib.pos = pos;
+    iommu->msi.msi_attrib.is_64 = 1;
     return 0;
 }
 
@@ -143,11 +145,11 @@ int __init amd_iommu_detect_one_acpi(
     rt = get_iommu_capabilities(iommu->seg, bus, dev, func,
                                 iommu->cap_offset, iommu);
     if ( rt )
-        return -ENODEV;
+        goto out;
 
     rt = get_iommu_msi_capabilities(iommu->seg, bus, dev, func, iommu);
     if ( rt )
-        return -ENODEV;
+        goto out;
 
     rt = pci_ro_device(iommu->seg, bus, PCI_DEVFN(dev, func));
     if ( rt )
@@ -156,6 +158,11 @@ int __init amd_iommu_detect_one_acpi(
                iommu->seg, bus, dev, func, rt);
 
     list_add_tail(&iommu->list, &amd_iommu_head);
+    rt = 0;
 
-    return 0;
+ out:
+    if ( rt )
+        xfree(iommu);
+
+    return rt;
 }

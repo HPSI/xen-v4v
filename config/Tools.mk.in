@@ -22,6 +22,9 @@ AS86                := @AS86@
 LD86                := @LD86@
 BCC                 := @BCC@
 IASL                := @IASL@
+FETCHER             := @FETCHER@
+SEABIOS_PATH        := @seabios_path@
+OVMF_PATH           := @ovmf_path@
 
 # Extra folder for libs/includes
 PREPEND_INCLUDES    := @PREPEND_INCLUDES@
@@ -43,19 +46,21 @@ GIT_HTTP            := @githttp@
 
 # Optional components
 XENSTAT_XENTOP      := @monitors@
-VTPM_TOOLS          := @vtpm@
-LIBXENAPI_BINDINGS  := @xenapi@
 OCAML_TOOLS         := @ocamltools@
-CONFIG_MINITERM     := @miniterm@
-CONFIG_LOMOUNT      := @lomount@
+FLASK_POLICY        := @xsmpolicy@
 CONFIG_OVMF         := @ovmf@
 CONFIG_ROMBIOS      := @rombios@
 CONFIG_SEABIOS      := @seabios@
+CONFIG_QEMU_TRAD    := @qemu_traditional@
+CONFIG_QEMU_XEN     := @qemu_xen@
+CONFIG_BLKTAP1      := @blktap1@
+CONFIG_VTPM         := @vtpm@
 
 #System options
-CONFIG_SYSTEM_LIBAIO:= @system_aio@
 ZLIB                := @zlib@
 CONFIG_LIBICONV     := @libiconv@
 CONFIG_GCRYPT       := @libgcrypt@
 EXTFS_LIBS          := @EXTFS_LIBS@
 CURSES_LIBS         := @CURSES_LIBS@
+
+FILE_OFFSET_BITS    := @FILE_OFFSET_BITS@

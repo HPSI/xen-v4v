@@ -60,7 +60,7 @@ void libxl__xc_domain_restore(libxl__egc *egc, libxl__domain_create_state *dcs,
         state->store_domid, state->console_port,
         state->console_domid,
         hvm, pae, superpages, no_incr_generationid,
-        cbflags,
+        cbflags, dcs->checkpointed_stream,
     };
 
     dcs->shs.ao = ao;
@@ -172,7 +172,7 @@ static void run_helper(libxl__egc *egc, libxl__save_helper_state *shs,
     shs->stdout_what = GCSPRINTF("domain %"PRIu32" save/restore helper"
                                  " stdout pipe", domid);
 
-    *arg++ = getenv("LIBXL_SAVE_HELPER") ?: LIBEXEC "/" "libxl-save-helper";
+    *arg++ = getenv("LIBXL_SAVE_HELPER") ?: PRIVATE_BINDIR "/" "libxl-save-helper";
     *arg++ = mode_arg;
     const char **stream_fd_arg = arg++;
     for (i=0; i<num_argnums; i++)
@@ -185,7 +185,11 @@ static void run_helper(libxl__egc *egc, libxl__save_helper_state *shs,
     for (childfd=0; childfd<2; childfd++) {
         /* Setting up the pipe for the child's fd childfd */
         int fds[2];
-        if (libxl_pipe(CTX,fds)) { rc = ERROR_FAIL; goto out; }
+        if (libxl_pipe(CTX,fds)) {
+            rc = ERROR_FAIL;
+            libxl__carefd_unlock();
+            goto out;
+        }
         int childs_end = childfd==0 ? 0 /*read*/  : 1 /*write*/;
         int our_end    = childfd==0 ? 1 /*write*/ : 0 /*read*/;
         childs_pipes[childfd] = libxl__carefd_record(CTX, fds[childs_end]);

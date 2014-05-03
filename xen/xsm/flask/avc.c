@@ -197,7 +197,7 @@ static void avc_dump_av(struct avc_dump_buf *buf, u16 tclass, u32 av)
     }
 
     if ( av )
-        avc_printk(buf, " 0x%x", av);
+        avc_printk(buf, " %#x", av);
 
     avc_printk(buf, " }");
 }
@@ -360,11 +360,10 @@ static struct avc_node *avc_alloc_node(void)
 {
     struct avc_node *node;
 
-    node = xmalloc(struct avc_node);
+    node = xzalloc(struct avc_node);
     if (!node)
         goto out;
 
-    memset(node, 0, sizeof(*node));
     INIT_RCU_HEAD(&node->rhead);
     INIT_HLIST_NODE(&node->list);
     avc_cache_stats_incr(allocations);
@@ -592,16 +591,16 @@ void avc_audit(u32 ssid, u32 tsid, u16 tclass, u32 requested,
         avc_printk(&buf, "domid=%d ", cdom->domain_id);
     switch ( a ? a->type : 0 ) {
     case AVC_AUDIT_DATA_DEV:
-        avc_printk(&buf, "device=0x%lx ", a->device);
+        avc_printk(&buf, "device=%#lx ", a->device);
         break;
     case AVC_AUDIT_DATA_IRQ:
         avc_printk(&buf, "irq=%d ", a->irq);
         break;
     case AVC_AUDIT_DATA_RANGE:
-        avc_printk(&buf, "range=0x%lx-0x%lx ", a->range.start, a->range.end);
+        avc_printk(&buf, "range=%#lx-%#lx ", a->range.start, a->range.end);
         break;
     case AVC_AUDIT_DATA_MEMORY:
-        avc_printk(&buf, "pte=0x%lx mfn=0x%lx ", a->memory.pte, a->memory.mfn);
+        avc_printk(&buf, "pte=%#lx mfn=%#lx ", a->memory.pte, a->memory.mfn);
         break;
     }
 
@@ -653,11 +652,6 @@ int avc_add_callback(int (*callback)(u32 event, u32 ssid, u32 tsid, u16 tclass,
     avc_callbacks = c;
  out:
     return rc;
-}
-
-static inline int avc_sidcmp(u32 x, u32 y)
-{
-    return (x == y || x == SECSID_WILD || y == SECSID_WILD);
 }
 
 /**

@@ -18,9 +18,11 @@
 #include <glob.h>
 
 #include "libxl_internal.h"
+#include "libxl_arch.h"
 
 #include <xc_dom.h>
 #include <xen/hvm/hvm_info_table.h>
+#include <xen/hvm/hvm_xs_strings.h>
 
 libxl_domain_type libxl__domain_type(libxl__gc *gc, uint32_t domid)
 {
@@ -30,8 +32,7 @@ libxl_domain_type libxl__domain_type(libxl__gc *gc, uint32_t domid)
 
     ret = xc_domain_getinfolist(ctx->xch, domid, 1, &info);
     if (ret != 1 || info.domain != domid) {
-        LIBXL__LOG(CTX, LIBXL__LOG_ERROR,
-                   "unable to get domain type for domid=%"PRIu32, domid);
+        LOG(ERROR, "unable to get domain type for domid=%"PRIu32, domid);
         return LIBXL_DOMAIN_TYPE_INVALID;
     }
     if (info.flags & XEN_DOMINF_hvm_guest)
@@ -133,13 +134,13 @@ static int numa_place_domain(libxl__gc *gc, uint32_t domid,
 {
     int found;
     libxl__numa_candidate candidate;
-    libxl_bitmap candidate_nodemap;
+    libxl_bitmap cpupool_nodemap;
     libxl_cpupoolinfo cpupool_info;
     int i, cpupool, rc = 0;
     uint32_t memkb;
 
     libxl__numa_candidate_init(&candidate);
-    libxl_bitmap_init(&candidate_nodemap);
+    libxl_bitmap_init(&cpupool_nodemap);
 
     /*
      * Extract the cpumap from the cpupool the domain belong to. In fact,
@@ -156,7 +157,7 @@ static int numa_place_domain(libxl__gc *gc, uint32_t domid,
     rc = libxl_domain_need_memory(CTX, info, &memkb);
     if (rc)
         goto out;
-    if (libxl_node_bitmap_alloc(CTX, &candidate_nodemap, 0)) {
+    if (libxl_node_bitmap_alloc(CTX, &cpupool_nodemap, 0)) {
         rc = ERROR_FAIL;
         goto out;
     }
@@ -174,17 +175,19 @@ static int numa_place_domain(libxl__gc *gc, uint32_t domid,
     if (found == 0)
         goto out;
 
-    /* Map the candidate's node map to the domain's info->cpumap */
-    libxl__numa_candidate_get_nodemap(gc, &candidate, &candidate_nodemap);
-    rc = libxl_nodemap_to_cpumap(CTX, &candidate_nodemap, &info->cpumap);
+    /* Map the candidate's node map to the domain's info->nodemap */
+    libxl__numa_candidate_get_nodemap(gc, &candidate, &info->nodemap);
+
+    /* Avoid trying to set the affinity to nodes that might be in the
+     * candidate's nodemap but out of our cpupool. */
+    rc = libxl_cpumap_to_nodemap(CTX, &cpupool_info.cpumap,
+                                 &cpupool_nodemap);
     if (rc)
         goto out;
 
-    /* Avoid trying to set the affinity to cpus that might be in the
-     * nodemap but not in our cpupool. */
-    libxl_for_each_set_bit(i, info->cpumap) {
-        if (!libxl_bitmap_test(&cpupool_info.cpumap, i))
-            libxl_bitmap_reset(&info->cpumap, i);
+    libxl_for_each_set_bit(i, info->nodemap) {
+        if (!libxl_bitmap_test(&cpupool_nodemap, i))
+            libxl_bitmap_reset(&info->nodemap, i);
     }
 
     LOG(DETAIL, "NUMA placement candidate with %d nodes, %d cpus and "
@@ -193,33 +196,60 @@ static int numa_place_domain(libxl__gc *gc, uint32_t domid,
 
  out:
     libxl__numa_candidate_dispose(&candidate);
-    libxl_bitmap_dispose(&candidate_nodemap);
+    libxl_bitmap_dispose(&cpupool_nodemap);
     libxl_cpupoolinfo_dispose(&cpupool_info);
     return rc;
 }
 
-int libxl__build_pre(libxl__gc *gc, uint32_t domid,
-              libxl_domain_build_info *info, libxl__domain_build_state *state)
+static unsigned long timer_mode(const libxl_domain_build_info *info)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
-    int tsc_mode;
-    char *xs_domid, *con_domid;
-    uint32_t rtc_timeoffset;
+    const libxl_timer_mode mode = info->u.hvm.timer_mode;
+    assert(mode >= LIBXL_TIMER_MODE_DELAY_FOR_MISSED_TICKS &&
+           mode <= LIBXL_TIMER_MODE_ONE_MISSED_TICK_PENDING);
+    return ((unsigned long)mode);
+}
 
-    xc_domain_max_vcpus(ctx->xch, domid, info->max_vcpus);
+static void hvm_set_conf_params(xc_interface *handle, uint32_t domid,
+                                libxl_domain_build_info *const info)
+{
+    xc_set_hvm_param(handle, domid, HVM_PARAM_PAE_ENABLED,
+                    libxl_defbool_val(info->u.hvm.pae));
+#if defined(__i386__) || defined(__x86_64__)
+    xc_set_hvm_param(handle, domid, HVM_PARAM_VIRIDIAN,
+                    libxl_defbool_val(info->u.hvm.viridian));
+    xc_set_hvm_param(handle, domid, HVM_PARAM_HPET_ENABLED,
+                    libxl_defbool_val(info->u.hvm.hpet));
+#endif
+    xc_set_hvm_param(handle, domid, HVM_PARAM_TIMER_MODE, timer_mode(info));
+    xc_set_hvm_param(handle, domid, HVM_PARAM_VPT_ALIGN,
+                    libxl_defbool_val(info->u.hvm.vpt_align));
+    xc_set_hvm_param(handle, domid, HVM_PARAM_NESTEDHVM,
+                    libxl_defbool_val(info->u.hvm.nested_hvm));
+}
+
+int libxl__build_pre(libxl__gc *gc, uint32_t domid,
+              libxl_domain_config *d_config, libxl__domain_build_state *state)
+{
+    libxl_domain_build_info *const info = &d_config->b_info;
+    libxl_ctx *ctx = libxl__gc_owner(gc);
+    char *xs_domid, *con_domid;
+    int rc;
+
+    if (xc_domain_max_vcpus(ctx->xch, domid, info->max_vcpus) != 0) {
+        LOG(ERROR, "Couldn't set max vcpu count");
+        return ERROR_FAIL;
+    }
 
     /*
      * Check if the domain has any CPU affinity. If not, try to build
      * up one. In case numa_place_domain() find at least a suitable
-     * candidate, it will affect info->cpumap accordingly; if it
+     * candidate, it will affect info->nodemap accordingly; if it
      * does not, it just leaves it as it is. This means (unless
      * some weird error manifests) the subsequent call to
-     * libxl_set_vcpuaffinity_all() will do the actual placement,
+     * libxl_domain_set_nodeaffinity() will do the actual placement,
      * whatever that turns out to be.
      */
     if (libxl_defbool_val(info->numa_placement)) {
-        int rc;
-
         if (!libxl_bitmap_is_full(&info->cpumap)) {
             LOG(ERROR, "Can run NUMA placement only if no vcpu "
                        "affinity is specified");
@@ -230,50 +260,13 @@ int libxl__build_pre(libxl__gc *gc, uint32_t domid,
         if (rc)
             return rc;
     }
+    libxl_domain_set_nodeaffinity(ctx, domid, &info->nodemap);
     libxl_set_vcpuaffinity_all(ctx, domid, info->max_vcpus, &info->cpumap);
 
-    xc_domain_setmaxmem(ctx->xch, domid, info->target_memkb + LIBXL_MAXMEM_CONSTANT);
-    if (info->type == LIBXL_DOMAIN_TYPE_PV)
-        xc_domain_set_memmap_limit(ctx->xch, domid,
-                (info->max_memkb + info->u.pv.slack_memkb));
-    switch (info->tsc_mode) {
-    case LIBXL_TSC_MODE_DEFAULT:
-        tsc_mode = 0;
-        break;
-    case LIBXL_TSC_MODE_ALWAYS_EMULATE:
-        tsc_mode = 1;
-        break;
-    case LIBXL_TSC_MODE_NATIVE:
-        tsc_mode = 2;
-        break;
-    case LIBXL_TSC_MODE_NATIVE_PARAVIRT:
-        tsc_mode = 3;
-        break;
-    default:
-        abort();
-    }
-    xc_domain_set_tsc_info(ctx->xch, domid, tsc_mode, 0, 0, 0);
-    if (libxl_defbool_val(info->disable_migrate))
-        xc_domain_disable_migrate(ctx->xch, domid);
-
-    rtc_timeoffset = info->rtc_timeoffset;
-    if (libxl_defbool_val(info->localtime)) {
-        time_t t;
-        struct tm *tm;
-
-        t = time(NULL);
-        tm = localtime(&t);
-
-        rtc_timeoffset += tm->tm_gmtoff;
-    }
-
-    if (rtc_timeoffset)
-        xc_domain_set_time_offset(ctx->xch, domid, rtc_timeoffset);
-
-    if (info->type == LIBXL_DOMAIN_TYPE_HVM) {
-        unsigned long shadow;
-        shadow = (info->shadow_memkb + 1023) / 1024;
-        xc_shadow_control(ctx->xch, domid, XEN_DOMCTL_SHADOW_OP_SET_ALLOCATION, NULL, 0, &shadow, 0, NULL);
+    if (xc_domain_setmaxmem(ctx->xch, domid, info->target_memkb +
+        LIBXL_MAXMEM_CONSTANT) < 0) {
+        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Couldn't set max memory");
+        return ERROR_FAIL;
     }
 
     xs_domid = xs_read(ctx->xsh, XBT_NULL, "/tool/xenstored/domid", NULL);
@@ -288,7 +281,12 @@ int libxl__build_pre(libxl__gc *gc, uint32_t domid,
     state->console_port = xc_evtchn_alloc_unbound(ctx->xch, domid, state->console_domid);
     state->vm_generationid_addr = 0;
 
-    return 0;
+    if (info->type == LIBXL_DOMAIN_TYPE_HVM)
+        hvm_set_conf_params(ctx->xch, domid, info);
+
+    rc = libxl__arch_domain_create(gc, d_config, domid);
+
+    return rc;
 }
 
 int libxl__build_post(libxl__gc *gc, uint32_t domid,
@@ -306,26 +304,32 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
     if (rc)
         return rc;
 
+    rc = xc_domain_set_max_evtchn(ctx->xch, domid, info->event_channels);
+    if (rc) {
+        LOG(ERROR, "Failed to set event channel limit to %d (%d)",
+            info->event_channels, rc);
+        return ERROR_FAIL;
+    }
+
     libxl_cpuid_apply_policy(ctx, domid);
     if (info->cpuid != NULL)
         libxl_cpuid_set(ctx, domid, info->cpuid);
 
     ents = libxl__calloc(gc, 12 + (info->max_vcpus * 2) + 2, sizeof(char *));
     ents[0] = "memory/static-max";
-    ents[1] = libxl__sprintf(gc, "%"PRId64, info->max_memkb);
+    ents[1] = GCSPRINTF("%"PRId64, info->max_memkb);
     ents[2] = "memory/target";
-    ents[3] = libxl__sprintf(gc, "%"PRId64,
-                             info->target_memkb - info->video_memkb);
+    ents[3] = GCSPRINTF("%"PRId64, info->target_memkb - info->video_memkb);
     ents[4] = "memory/videoram";
-    ents[5] = libxl__sprintf(gc, "%"PRId64, info->video_memkb);
+    ents[5] = GCSPRINTF("%"PRId64, info->video_memkb);
     ents[6] = "domid";
-    ents[7] = libxl__sprintf(gc, "%d", domid);
+    ents[7] = GCSPRINTF("%d", domid);
     ents[8] = "store/port";
-    ents[9] = libxl__sprintf(gc, "%"PRIu32, state->store_port);
+    ents[9] = GCSPRINTF("%"PRIu32, state->store_port);
     ents[10] = "store/ring-ref";
-    ents[11] = libxl__sprintf(gc, "%lu", state->store_mfn);
+    ents[11] = GCSPRINTF("%lu", state->store_mfn);
     for (i = 0; i < info->max_vcpus; i++) {
-        ents[12+(i*2)]   = libxl__sprintf(gc, "cpu/%d/availability", i);
+        ents[12+(i*2)]   = GCSPRINTF("cpu/%d/availability", i);
         ents[12+(i*2)+1] = libxl_bitmap_test(&info->avail_vcpus, i)
                             ? "online" : "offline";
     }
@@ -334,7 +338,7 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
     if (info->type == LIBXL_DOMAIN_TYPE_HVM) {
         hvm_ents = libxl__calloc(gc, 3, sizeof(char *));
         hvm_ents[0] = "hvmloader/generation-id-address";
-        hvm_ents[1] = libxl__sprintf(gc, "0x%lx", state->vm_generationid_addr);
+        hvm_ents[1] = GCSPRINTF("0x%lx", state->vm_generationid_addr);
     }
 
     dom_path = libxl__xs_get_dompath(gc, domid);
@@ -342,7 +346,7 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
         return ERROR_FAIL;
     }
 
-    vm_path = xs_read(ctx->xsh, XBT_NULL, libxl__sprintf(gc, "%s/vm", dom_path), NULL);
+    vm_path = xs_read(ctx->xsh, XBT_NULL, GCSPRINTF("%s/vm", dom_path), NULL);
 retry_transaction:
     t = xs_transaction_start(ctx->xsh);
 
@@ -373,23 +377,26 @@ int libxl__build_pv(libxl__gc *gc, uint32_t domid,
 
     dom = xc_dom_allocate(ctx->xch, state->pv_cmdline, info->u.pv.features);
     if (!dom) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_allocate failed");
+        LOGE(ERROR, "xc_dom_allocate failed");
         return ERROR_FAIL;
     }
 
-    LOG(DEBUG, "pv kernel mapped %d path %s\n", state->pv_kernel.mapped, state->pv_kernel.path);
+    dom->pvh_enabled = state->pvh_enabled;
+
+    LOG(DEBUG, "pv kernel mapped %d path %s", state->pv_kernel.mapped, state->pv_kernel.path);
+
     if (state->pv_kernel.mapped) {
         ret = xc_dom_kernel_mem(dom,
                                 state->pv_kernel.data,
                                 state->pv_kernel.size);
         if ( ret != 0) {
-            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_kernel_mem failed");
+            LOGE(ERROR, "xc_dom_kernel_mem failed");
             goto out;
         }
     } else {
         ret = xc_dom_kernel_file(dom, state->pv_kernel.path);
         if ( ret != 0) {
-            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_kernel_file failed");
+            LOGE(ERROR, "xc_dom_kernel_file failed");
             goto out;
         }
     }
@@ -397,12 +404,12 @@ int libxl__build_pv(libxl__gc *gc, uint32_t domid,
     if ( state->pv_ramdisk.path && strlen(state->pv_ramdisk.path) ) {
         if (state->pv_ramdisk.mapped) {
             if ( (ret = xc_dom_ramdisk_mem(dom, state->pv_ramdisk.data, state->pv_ramdisk.size)) != 0 ) {
-                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_ramdisk_mem failed");
+                LOGE(ERROR, "xc_dom_ramdisk_mem failed");
                 goto out;
             }
         } else {
             if ( (ret = xc_dom_ramdisk_file(dom, state->pv_ramdisk.path)) != 0 ) {
-                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_ramdisk_file failed");
+                LOGE(ERROR, "xc_dom_ramdisk_file failed");
                 goto out;
             }
         }
@@ -413,38 +420,58 @@ int libxl__build_pv(libxl__gc *gc, uint32_t domid,
     dom->console_domid = state->console_domid;
     dom->xenstore_evtchn = state->store_port;
     dom->xenstore_domid = state->store_domid;
+    dom->claim_enabled = libxl_defbool_val(info->claim_mode);
 
     if ( (ret = xc_dom_boot_xen_init(dom, ctx->xch, domid)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_boot_xen_init failed");
+        LOGE(ERROR, "xc_dom_boot_xen_init failed");
         goto out;
     }
+#ifdef GUEST_RAM_BASE
+    if ( (ret = xc_dom_rambase_init(dom, GUEST_RAM_BASE)) != 0 ) {
+        LOGE(ERROR, "xc_dom_rambase failed");
+        goto out;
+    }
+#endif
     if ( (ret = xc_dom_parse_image(dom)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_parse_image failed");
+        LOGE(ERROR, "xc_dom_parse_image failed");
+        goto out;
+    }
+    if ( (ret = libxl__arch_domain_init_hw_description(gc, info, dom)) != 0 ) {
+        LOGE(ERROR, "libxl__arch_domain_init_hw_description failed");
         goto out;
     }
     if ( (ret = xc_dom_mem_init(dom, info->target_memkb / 1024)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_mem_init failed");
+        LOGE(ERROR, "xc_dom_mem_init failed");
         goto out;
     }
     if ( (ret = xc_dom_boot_mem_init(dom)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_boot_mem_init failed");
+        LOGE(ERROR, "xc_dom_boot_mem_init failed");
+        goto out;
+    }
+    if ( (ret = libxl__arch_domain_finalise_hw_description(gc, info, dom)) != 0 ) {
+        LOGE(ERROR, "libxl__arch_domain_finalise_hw_description failed");
         goto out;
     }
     if ( (ret = xc_dom_build_image(dom)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_build_image failed");
+        LOGE(ERROR, "xc_dom_build_image failed");
         goto out;
     }
     if ( (ret = xc_dom_boot_image(dom)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_boot_image failed");
+        LOGE(ERROR, "xc_dom_boot_image failed");
         goto out;
     }
     if ( (ret = xc_dom_gnttab_init(dom)) != 0 ) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_dom_gnttab_init failed");
+        LOGE(ERROR, "xc_dom_gnttab_init failed");
         goto out;
     }
 
-    state->console_mfn = xc_dom_p2m_host(dom, dom->console_pfn);
-    state->store_mfn = xc_dom_p2m_host(dom, dom->xenstore_pfn);
+    if (xc_dom_feature_translated(dom)) {
+        state->console_mfn = dom->console_pfn;
+        state->store_mfn = dom->xenstore_pfn;
+    } else {
+        state->console_mfn = xc_dom_p2m_host(dom, dom->console_pfn);
+        state->store_mfn = xc_dom_p2m_host(dom, dom->xenstore_pfn);
+    }
 
     libxl__file_reference_unmap(&state->pv_kernel);
     libxl__file_reference_unmap(&state->pv_ramdisk);
@@ -455,13 +482,6 @@ out:
     return ret == 0 ? 0 : ERROR_FAIL;
 }
 
-static unsigned long timer_mode(const libxl_domain_build_info *info)
-{
-    const libxl_timer_mode mode = info->u.hvm.timer_mode;
-    assert(mode != LIBXL_TIMER_MODE_DELAY_FOR_MISSED_TICKS &&
-           mode <= LIBXL_TIMER_MODE_ONE_MISSED_TICK_PENDING);
-    return ((unsigned long)mode);
-}
 static int hvm_build_set_params(xc_interface *handle, uint32_t domid,
                                 libxl_domain_build_info *info,
                                 int store_evtchn, unsigned long *store_mfn,
@@ -490,19 +510,6 @@ static int hvm_build_set_params(xc_interface *handle, uint32_t domid,
 
     xc_get_hvm_param(handle, domid, HVM_PARAM_STORE_PFN, store_mfn);
     xc_get_hvm_param(handle, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
-    xc_set_hvm_param(handle, domid, HVM_PARAM_PAE_ENABLED,
-                     libxl_defbool_val(info->u.hvm.pae));
-#if defined(__i386__) || defined(__x86_64__)
-    xc_set_hvm_param(handle, domid, HVM_PARAM_VIRIDIAN,
-                     libxl_defbool_val(info->u.hvm.viridian));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_HPET_ENABLED,
-                     libxl_defbool_val(info->u.hvm.hpet));
-#endif
-    xc_set_hvm_param(handle, domid, HVM_PARAM_TIMER_MODE, timer_mode(info));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_VPT_ALIGN,
-                     libxl_defbool_val(info->u.hvm.vpt_align));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_NESTEDHVM,
-                     libxl_defbool_val(info->u.hvm.nested_hvm));
     xc_set_hvm_param(handle, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
     xc_set_hvm_param(handle, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
 
@@ -510,11 +517,61 @@ static int hvm_build_set_params(xc_interface *handle, uint32_t domid,
     return 0;
 }
 
-static const char *libxl__domain_firmware(libxl__gc *gc,
-                                          libxl_domain_build_info *info)
+static int hvm_build_set_xs_values(libxl__gc *gc,
+                                   uint32_t domid,
+                                   struct xc_hvm_build_args *args)
+{
+    char *path = NULL;
+    int ret = 0;
+
+    if (args->smbios_module.guest_addr_out) {
+        path = GCSPRINTF("/local/domain/%d/"HVM_XS_SMBIOS_PT_ADDRESS, domid);
+
+        ret = libxl__xs_write(gc, XBT_NULL, path, "0x%"PRIx64,
+                              args->smbios_module.guest_addr_out);
+        if (ret)
+            goto err;
+
+        path = GCSPRINTF("/local/domain/%d/"HVM_XS_SMBIOS_PT_LENGTH, domid);
+
+        ret = libxl__xs_write(gc, XBT_NULL, path, "0x%x",
+                              args->smbios_module.length);
+        if (ret)
+            goto err;
+    }
+
+    if (args->acpi_module.guest_addr_out) {
+        path = GCSPRINTF("/local/domain/%d/"HVM_XS_ACPI_PT_ADDRESS, domid);
+
+        ret = libxl__xs_write(gc, XBT_NULL, path, "0x%"PRIx64,
+                              args->acpi_module.guest_addr_out);
+        if (ret)
+            goto err;
+
+        path = GCSPRINTF("/local/domain/%d/"HVM_XS_ACPI_PT_LENGTH, domid);
+
+        ret = libxl__xs_write(gc, XBT_NULL, path, "0x%x",
+                              args->acpi_module.length);
+        if (ret)
+            goto err;
+    }
+
+    return 0;
+
+err:
+    LOG(ERROR, "failed to write firmware xenstore value, err: %d", ret);
+    return ret;
+}
+
+static int libxl__domain_firmware(libxl__gc *gc,
+                                  libxl_domain_build_info *info,
+                                  struct xc_hvm_build_args *args)
 {
     libxl_ctx *ctx = libxl__gc_owner(gc);
     const char *firmware;
+    int e, rc = ERROR_FAIL;
+    int datalen = 0;
+    void *data;
 
     if (info->u.hvm.firmware)
         firmware = info->u.hvm.firmware;
@@ -528,13 +585,52 @@ static const char *libxl__domain_firmware(libxl__gc *gc,
             firmware = "hvmloader";
             break;
         default:
-            LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "invalid device model version %d",
-                       info->device_model_version);
-            return NULL;
+            LOG(ERROR, "invalid device model version %d",
+                info->device_model_version);
+            return ERROR_FAIL;
             break;
         }
     }
-    return libxl__abs_path(gc, firmware, libxl__xenfirmwaredir_path());
+    args->image_file_name = libxl__abs_path(gc, firmware,
+                                            libxl__xenfirmwaredir_path());
+
+    if (info->u.hvm.smbios_firmware) {
+        data = NULL;
+        e = libxl_read_file_contents(ctx, info->u.hvm.smbios_firmware,
+                                     &data, &datalen);
+        if (e) {
+            LOGEV(ERROR, e, "failed to read SMBIOS firmware file %s",
+                info->u.hvm.smbios_firmware);
+            goto out;
+        }
+        libxl__ptr_add(gc, data);
+        if (datalen) {
+            /* Only accept non-empty files */
+            args->smbios_module.data = data;
+            args->smbios_module.length = (uint32_t)datalen;
+        }
+    }
+
+    if (info->u.hvm.acpi_firmware) {
+        data = NULL;
+        e = libxl_read_file_contents(ctx, info->u.hvm.acpi_firmware,
+                                     &data, &datalen);
+        if (e) {
+            LOGEV(ERROR, e, "failed to read ACPI firmware file %s",
+                info->u.hvm.acpi_firmware);
+            goto out;
+        }
+        libxl__ptr_add(gc, data);
+        if (datalen) {
+            /* Only accept non-empty files */
+            args->acpi_module.data = data;
+            args->acpi_module.length = (uint32_t)datalen;
+        }
+    }
+
+    return 0;
+out:
+    return rc;
 }
 
 int libxl__build_hvm(libxl__gc *gc, uint32_t domid,
@@ -542,30 +638,45 @@ int libxl__build_hvm(libxl__gc *gc, uint32_t domid,
               libxl__domain_build_state *state)
 {
     libxl_ctx *ctx = libxl__gc_owner(gc);
+    struct xc_hvm_build_args args = {};
     int ret, rc = ERROR_FAIL;
-    const char *firmware = libxl__domain_firmware(gc, info);
 
-    if (!firmware)
-        goto out;
-    ret = xc_hvm_build_target_mem(
-        ctx->xch,
-        domid,
-        (info->max_memkb - info->video_memkb) / 1024,
-        (info->target_memkb - info->video_memkb) / 1024,
-        firmware);
-    if (ret) {
-        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, ret, "hvm building failed");
+    memset(&args, 0, sizeof(struct xc_hvm_build_args));
+    /* The params from the configuration file are in Mb, which are then
+     * multiplied by 1 Kb. This was then divided off when calling
+     * the old xc_hvm_build_target_mem() which then turned them to bytes.
+     * Do all this in one step here...
+     */
+    args.mem_size = (uint64_t)(info->max_memkb - info->video_memkb) << 10;
+    args.mem_target = (uint64_t)(info->target_memkb - info->video_memkb) << 10;
+    args.claim_enabled = libxl_defbool_val(info->claim_mode);
+    if (libxl__domain_firmware(gc, info, &args)) {
+        LOG(ERROR, "initializing domain firmware failed");
         goto out;
     }
+
+    ret = xc_hvm_build(ctx->xch, domid, &args);
+    if (ret) {
+        LOGEV(ERROR, ret, "hvm building failed");
+        goto out;
+    }
+
     ret = hvm_build_set_params(ctx->xch, domid, info, state->store_port,
                                &state->store_mfn, state->console_port,
                                &state->console_mfn, state->store_domid,
                                state->console_domid);
     if (ret) {
-        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, ret, "hvm build set params failed");
+        LOGEV(ERROR, ret, "hvm build set params failed");
         goto out;
     }
-    rc = 0;
+
+    ret = hvm_build_set_xs_values(gc, domid, &args);
+    if (ret) {
+        LOG(ERROR, "hvm build set xenstore values failed (ret=%d)", ret);
+        goto out;
+    }
+
+    return 0;
 out:
     return rc;
 }
@@ -574,8 +685,7 @@ int libxl__qemu_traditional_cmd(libxl__gc *gc, uint32_t domid,
                                 const char *cmd)
 {
     char *path = NULL;
-    path = libxl__sprintf(gc, "/local/domain/0/device-model/%d/command",
-                          domid);
+    path = GCSPRINTF("/local/domain/0/device-model/%d/command", domid);
     return libxl__xs_write(gc, XBT_NULL, path, "%s", cmd);
 }
 
@@ -592,8 +702,7 @@ struct libxl__physmap_info {
 static inline char *restore_helper(libxl__gc *gc, uint32_t domid,
         uint64_t phys_offset, char *node)
 {
-    return libxl__sprintf(gc,
-            "/local/domain/0/device-model/%d/physmap/%"PRIx64"/%s",
+    return GCSPRINTF("/local/domain/0/device-model/%d/physmap/%"PRIx64"/%s",
             domid, phys_offset, node);
 }
 
@@ -603,7 +712,6 @@ int libxl__toolstack_restore(uint32_t domid, const uint8_t *buf,
     libxl__save_helper_state *shs = user;
     libxl__domain_create_state *dcs = CONTAINER_OF(shs, *dcs, shs);
     STATE_AO_GC(dcs->ao);
-    libxl_ctx *ctx = CTX;
     int i, ret;
     const uint8_t *ptr = buf;
     uint32_t count = 0, version = 0;
@@ -613,7 +721,7 @@ int libxl__toolstack_restore(uint32_t domid, const uint8_t *buf,
     LOG(DEBUG,"domain=%"PRIu32" toolstack data size=%"PRIu32, domid, size);
 
     if (size < sizeof(version) + sizeof(count)) {
-        LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "wrong size");
+        LOG(ERROR, "wrong size");
         return -1;
     }
 
@@ -621,16 +729,16 @@ int libxl__toolstack_restore(uint32_t domid, const uint8_t *buf,
     ptr += sizeof(version);
 
     if (version != TOOLSTACK_SAVE_VERSION) {
-        LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "wrong version");
+        LOG(ERROR, "wrong version");
         return -1;
     }
 
     memcpy(&count, ptr, sizeof(count));
     ptr += sizeof(count);
- 
+
     if (size < sizeof(version) + sizeof(count) +
             count * (sizeof(struct libxl__physmap_info))) {
-        LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "wrong size");
+        LOG(ERROR, "wrong size");
         return -1;
     }
 
@@ -660,6 +768,10 @@ int libxl__toolstack_restore(uint32_t domid, const uint8_t *buf,
 
 static void domain_suspend_done(libxl__egc *egc,
                         libxl__domain_suspend_state *dss, int rc);
+static void domain_suspend_callback_common_done(libxl__egc *egc,
+                                libxl__domain_suspend_state *dss, int ok);
+static void remus_domain_suspend_callback_common_done(libxl__egc *egc,
+                                libxl__domain_suspend_state *dss, int ok);
 
 /*----- complicated callback, called by xc_domain_save -----*/
 
@@ -725,7 +837,7 @@ static void domain_suspend_switch_qemu_xen_traditional_logdirty
             rc = libxl__xs_read_checked(gc, t, lds->ret_path, &got_ret);
             if (rc) goto out;
 
-            if (strcmp(got, got_ret)) {
+            if (!got_ret || strcmp(got, got_ret)) {
                 LOG(ERROR,"controlling logdirty: qemu was already sent"
                     " command `%s' (xenstore path `%s') but result is `%s'",
                     got, lds->cmd_path, got_ret ? got_ret : "<none>");
@@ -841,7 +953,7 @@ static void switch_logdirty_xswatch(libxl__egc *egc, libxl__ev_xswatch *watch,
         rc = libxl__xs_rm_checked(gc, t, lds->ret_path);
         if (rc) goto out;
 
-        rc = libxl__xs_transaction_commit(gc, &t); 
+        rc = libxl__xs_transaction_commit(gc, &t);
         if (!rc) break;
         if (rc<0) goto out;
     }
@@ -879,17 +991,15 @@ static void switch_logdirty_done(libxl__egc *egc,
 int libxl__domain_suspend_device_model(libxl__gc *gc,
                                        libxl__domain_suspend_state *dss)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
     int ret = 0;
     uint32_t const domid = dss->domid;
     const char *const filename = dss->dm_savefile;
 
     switch (libxl__device_model_version_running(gc, domid)) {
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL: {
-        LIBXL__LOG(ctx, LIBXL__LOG_DEBUG,
-                   "Saving device model state to %s", filename);
+        LOG(DEBUG, "Saving device model state to %s", filename);
         libxl__qemu_traditional_cmd(gc, domid, "save");
-        libxl__wait_for_device_model(gc, domid, "paused", NULL, NULL, NULL);
+        libxl__wait_for_device_model_deprecated(gc, domid, "paused", NULL, NULL, NULL);
         break;
     }
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
@@ -913,12 +1023,13 @@ int libxl__domain_resume_device_model(libxl__gc *gc, uint32_t domid)
     switch (libxl__device_model_version_running(gc, domid)) {
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL: {
         libxl__qemu_traditional_cmd(gc, domid, "continue");
-        libxl__wait_for_device_model(gc, domid, "running", NULL, NULL, NULL);
+        libxl__wait_for_device_model_deprecated(gc, domid, "running", NULL, NULL, NULL);
         break;
     }
     case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
         if (libxl__qmp_resume(gc, domid))
             return ERROR_FAIL;
+        break;
     default:
         return ERROR_INVAL;
     }
@@ -926,16 +1037,41 @@ int libxl__domain_resume_device_model(libxl__gc *gc, uint32_t domid)
     return 0;
 }
 
-int libxl__domain_suspend_common_callback(void *user)
+static void domain_suspend_common_wait_guest(libxl__egc *egc,
+                                             libxl__domain_suspend_state *dss);
+static void domain_suspend_common_guest_suspended(libxl__egc *egc,
+                                         libxl__domain_suspend_state *dss);
+
+static void domain_suspend_common_pvcontrol_suspending(libxl__egc *egc,
+      libxl__xswait_state *xswa, int rc, const char *state);
+static void domain_suspend_common_wait_guest_evtchn(libxl__egc *egc,
+        libxl__ev_evtchn *evev);
+static void suspend_common_wait_guest_watch(libxl__egc *egc,
+      libxl__ev_xswatch *xsw, const char *watch_path, const char *event_path);
+static void suspend_common_wait_guest_check(libxl__egc *egc,
+        libxl__domain_suspend_state *dss);
+static void suspend_common_wait_guest_timeout(libxl__egc *egc,
+      libxl__ev_time *ev, const struct timeval *requested_abs);
+
+static void domain_suspend_common_failed(libxl__egc *egc,
+                                         libxl__domain_suspend_state *dss);
+static void domain_suspend_common_done(libxl__egc *egc,
+                                       libxl__domain_suspend_state *dss,
+                                       bool ok);
+
+static bool domain_suspend_pvcontrol_acked(const char *state) {
+    /* any value other than "suspend", including ENOENT (i.e. !state), is OK */
+    if (!state) return 1;
+    return strcmp(state,"suspend");
+}
+
+/* calls dss->callback_common_done when done */
+static void domain_suspend_callback_common(libxl__egc *egc,
+                                           libxl__domain_suspend_state *dss)
 {
-    libxl__save_helper_state *shs = user;
-    libxl__domain_suspend_state *dss = CONTAINER_OF(shs, *dss, shs);
     STATE_AO_GC(dss->ao);
     unsigned long hvm_s_state = 0, hvm_pvdrv = 0;
-    int ret;
-    char *state = "suspend";
-    int watchdog;
-    xs_transaction_t t;
+    int ret, rc;
 
     /* Convenience aliases */
     const uint32_t domid = dss->domid;
@@ -945,45 +1081,86 @@ int libxl__domain_suspend_common_callback(void *user)
         xc_get_hvm_param(CTX->xch, domid, HVM_PARAM_ACPI_S_STATE, &hvm_s_state);
     }
 
-    if ((hvm_s_state == 0) && (dss->suspend_eventchn >= 0)) {
+    if ((hvm_s_state == 0) && (dss->guest_evtchn.port >= 0)) {
         LOG(DEBUG, "issuing %s suspend request via event channel",
             dss->hvm ? "PVHVM" : "PV");
-        ret = xc_evtchn_notify(dss->xce, dss->suspend_eventchn);
+        ret = xc_evtchn_notify(CTX->xce, dss->guest_evtchn.port);
         if (ret < 0) {
             LOG(ERROR, "xc_evtchn_notify failed ret=%d", ret);
-            return 0;
+            goto err;
         }
-        ret = xc_await_suspend(CTX->xch, dss->xce, dss->suspend_eventchn);
-        if (ret < 0) {
-            LOG(ERROR, "xc_await_suspend failed ret=%d", ret);
-            return 0;
-        }
-        dss->guest_responded = 1;
-        goto guest_suspended;
+
+        dss->guest_evtchn.callback = domain_suspend_common_wait_guest_evtchn;
+        rc = libxl__ev_evtchn_wait(gc, &dss->guest_evtchn);
+        if (rc) goto err;
+
+        rc = libxl__ev_time_register_rel(gc, &dss->guest_timeout,
+                                         suspend_common_wait_guest_timeout,
+                                         60*1000);
+        if (rc) goto err;
+
+        return;
     }
 
     if (dss->hvm && (!hvm_pvdrv || hvm_s_state)) {
         LOG(DEBUG, "Calling xc_domain_shutdown on HVM domain");
-        xc_domain_shutdown(CTX->xch, domid, SHUTDOWN_suspend);
+        ret = xc_domain_shutdown(CTX->xch, domid, SHUTDOWN_suspend);
+        if (ret < 0) {
+            LOGE(ERROR, "xc_domain_shutdown failed");
+            goto err;
+        }
         /* The guest does not (need to) respond to this sort of request. */
         dss->guest_responded = 1;
-    } else {
-        LOG(DEBUG, "issuing %s suspend request via XenBus control node",
-            dss->hvm ? "PVHVM" : "PV");
+        domain_suspend_common_wait_guest(egc, dss);
+        return;
+    }
 
-        libxl__domain_pvcontrol_write(gc, XBT_NULL, domid, "suspend");
+    LOG(DEBUG, "issuing %s suspend request via XenBus control node",
+        dss->hvm ? "PVHVM" : "PV");
 
-        LOG(DEBUG, "wait for the guest to acknowledge suspend request");
-        watchdog = 60;
-        while (!strcmp(state, "suspend") && watchdog > 0) {
-            usleep(100000);
+    libxl__domain_pvcontrol_write(gc, XBT_NULL, domid, "suspend");
 
-            state = libxl__domain_pvcontrol_read(gc, XBT_NULL, domid);
-            if (!state) state = "";
+    dss->pvcontrol.path = libxl__domain_pvcontrol_xspath(gc, domid);
+    if (!dss->pvcontrol.path) goto err;
 
-            watchdog--;
-        }
+    dss->pvcontrol.ao = ao;
+    dss->pvcontrol.what = "guest acknowledgement of suspend request";
+    dss->pvcontrol.timeout_ms = 60 * 1000;
+    dss->pvcontrol.callback = domain_suspend_common_pvcontrol_suspending;
+    libxl__xswait_start(gc, &dss->pvcontrol);
+    return;
 
+ err:
+    domain_suspend_common_failed(egc, dss);
+}
+
+static void domain_suspend_common_wait_guest_evtchn(libxl__egc *egc,
+        libxl__ev_evtchn *evev)
+{
+    libxl__domain_suspend_state *dss = CONTAINER_OF(evev, *dss, guest_evtchn);
+    STATE_AO_GC(dss->ao);
+    /* If we should be done waiting, suspend_common_wait_guest_check
+     * will end up calling domain_suspend_common_guest_suspended or
+     * domain_suspend_common_failed, both of which cancel the evtchn
+     * wait.  So re-enable it now. */
+    libxl__ev_evtchn_wait(gc, &dss->guest_evtchn);
+    suspend_common_wait_guest_check(egc, dss);
+}
+
+static void domain_suspend_common_pvcontrol_suspending(libxl__egc *egc,
+      libxl__xswait_state *xswa, int rc, const char *state)
+{
+    libxl__domain_suspend_state *dss = CONTAINER_OF(xswa, *dss, pvcontrol);
+    STATE_AO_GC(dss->ao);
+    xs_transaction_t t = 0;
+
+    if (!rc && !domain_suspend_pvcontrol_acked(state))
+        /* keep waiting */
+        return;
+
+    libxl__xswait_stop(gc, &dss->pvcontrol);
+
+    if (rc == ERROR_TIMEDOUT) {
         /*
          * Guest appears to not be responding. Cancel the suspend
          * request.
@@ -993,78 +1170,172 @@ int libxl__domain_suspend_common_callback(void *user)
          * against the guest catching up and acknowledging the request
          * at the last minute.
          */
-        if (!strcmp(state, "suspend")) {
-            LOG(ERROR, "guest didn't acknowledge suspend, cancelling request");
-        retry_transaction:
-            t = xs_transaction_start(CTX->xsh);
+        for (;;) {
+            rc = libxl__xs_transaction_start(gc, &t);
+            if (rc) goto err;
 
-            state = libxl__domain_pvcontrol_read(gc, t, domid);
-            if (!state) state = "";
+            rc = libxl__xs_read_checked(gc, t, xswa->path, &state);
+            if (rc) goto err;
 
-            if (!strcmp(state, "suspend"))
-                libxl__domain_pvcontrol_write(gc, t, domid, "");
+            if (domain_suspend_pvcontrol_acked(state))
+                /* last minute ack */
+                break;
 
-            if (!xs_transaction_end(CTX->xsh, t, 0))
-                if (errno == EAGAIN)
-                    goto retry_transaction;
+            rc = libxl__xs_write_checked(gc, t, xswa->path, "");
+            if (rc) goto err;
 
+            rc = libxl__xs_transaction_commit(gc, &t);
+            if (!rc) {
+                LOG(ERROR,
+                    "guest didn't acknowledge suspend, cancelling request");
+                goto err;
+            }
+            if (rc<0) goto err;
         }
-
-        /*
-         * Final check for guest acknowledgement. The guest may have
-         * acknowledged while we were cancelling the request in which
-         * case we lost the race while cancelling and should continue.
-         */
-        if (!strcmp(state, "suspend")) {
-            LOG(ERROR, "guest didn't acknowledge suspend, request cancelled");
-            return 0;
-        }
-
-        LOG(DEBUG, "guest acknowledged suspend request");
-        dss->guest_responded = 1;
+    } else if (rc) {
+        /* some error in xswait's read of xenstore, already logged */
+        goto err;
     }
+
+    assert(domain_suspend_pvcontrol_acked(state));
+    LOG(DEBUG, "guest acknowledged suspend request");
+
+    libxl__xs_transaction_abort(gc, &t);
+    dss->guest_responded = 1;
+    domain_suspend_common_wait_guest(egc,dss);
+    return;
+
+ err:
+    libxl__xs_transaction_abort(gc, &t);
+    domain_suspend_common_failed(egc, dss);
+    return;
+}
+
+static void domain_suspend_common_wait_guest(libxl__egc *egc,
+                                             libxl__domain_suspend_state *dss)
+{
+    STATE_AO_GC(dss->ao);
+    int rc;
 
     LOG(DEBUG, "wait for the guest to suspend");
-    watchdog = 60;
-    while (watchdog > 0) {
-        xc_domaininfo_t info;
 
-        usleep(100000);
-        ret = xc_domain_getinfolist(CTX->xch, domid, 1, &info);
-        if (ret == 1 && info.domain == domid &&
-            (info.flags & XEN_DOMINF_shutdown)) {
-            int shutdown_reason;
+    rc = libxl__ev_xswatch_register(gc, &dss->guest_watch,
+                                    suspend_common_wait_guest_watch,
+                                    "@releaseDomain");
+    if (rc) goto err;
 
-            shutdown_reason = (info.flags >> XEN_DOMINF_shutdownshift)
-                & XEN_DOMINF_shutdownmask;
-            if (shutdown_reason == SHUTDOWN_suspend) {
-                LOG(DEBUG, "guest has suspended");
-                goto guest_suspended;
-            }
-        }
+    rc = libxl__ev_time_register_rel(gc, &dss->guest_timeout,
+                                     suspend_common_wait_guest_timeout,
+                                     60*1000);
+    if (rc) goto err;
+    return;
 
-        watchdog--;
+ err:
+    domain_suspend_common_failed(egc, dss);
+}
+
+static void suspend_common_wait_guest_watch(libxl__egc *egc,
+      libxl__ev_xswatch *xsw, const char *watch_path, const char *event_path)
+{
+    libxl__domain_suspend_state *dss = CONTAINER_OF(xsw, *dss, guest_watch);
+    suspend_common_wait_guest_check(egc, dss);
+}
+
+static void suspend_common_wait_guest_check(libxl__egc *egc,
+        libxl__domain_suspend_state *dss)
+{
+    STATE_AO_GC(dss->ao);
+    xc_domaininfo_t info;
+    int ret;
+    int shutdown_reason;
+
+    /* Convenience aliases */
+    const uint32_t domid = dss->domid;
+
+    ret = xc_domain_getinfolist(CTX->xch, domid, 1, &info);
+    if (ret < 0) {
+        LOGE(ERROR, "unable to check for status of guest %"PRId32"", domid);
+        goto err;
     }
 
-    LOG(ERROR, "guest did not suspend");
-    return 0;
+    if (!(ret == 1 && info.domain == domid)) {
+        LOGE(ERROR, "guest %"PRId32" we were suspending has been destroyed",
+             domid);
+        goto err;
+    }
 
- guest_suspended:
+    if (!(info.flags & XEN_DOMINF_shutdown))
+        /* keep waiting */
+        return;
+
+    shutdown_reason = (info.flags >> XEN_DOMINF_shutdownshift)
+        & XEN_DOMINF_shutdownmask;
+    if (shutdown_reason != SHUTDOWN_suspend) {
+        LOG(DEBUG, "guest %"PRId32" we were suspending has shut down"
+            " with unexpected reason code %d", domid, shutdown_reason);
+        goto err;
+    }
+
+    LOG(DEBUG, "guest has suspended");
+    domain_suspend_common_guest_suspended(egc, dss);
+    return;
+
+ err:
+    domain_suspend_common_failed(egc, dss);
+}
+
+static void suspend_common_wait_guest_timeout(libxl__egc *egc,
+      libxl__ev_time *ev, const struct timeval *requested_abs)
+{
+    libxl__domain_suspend_state *dss = CONTAINER_OF(ev, *dss, guest_timeout);
+    STATE_AO_GC(dss->ao);
+    LOG(ERROR, "guest did not suspend, timed out");
+    domain_suspend_common_failed(egc, dss);
+}
+
+static void domain_suspend_common_guest_suspended(libxl__egc *egc,
+                                         libxl__domain_suspend_state *dss)
+{
+    STATE_AO_GC(dss->ao);
+    int ret;
+
+    libxl__ev_evtchn_cancel(gc, &dss->guest_evtchn);
+    libxl__ev_xswatch_deregister(gc, &dss->guest_watch);
+    libxl__ev_time_deregister(gc, &dss->guest_timeout);
+
     if (dss->hvm) {
         ret = libxl__domain_suspend_device_model(gc, dss);
         if (ret) {
             LOG(ERROR, "libxl__domain_suspend_device_model failed ret=%d", ret);
-            return 0;
+            domain_suspend_common_failed(egc, dss);
+            return;
         }
     }
-    return 1;
+    domain_suspend_common_done(egc, dss, 1);
+}
+
+static void domain_suspend_common_failed(libxl__egc *egc,
+                                         libxl__domain_suspend_state *dss)
+{
+    domain_suspend_common_done(egc, dss, 0);
+}
+
+static void domain_suspend_common_done(libxl__egc *egc,
+                                       libxl__domain_suspend_state *dss,
+                                       bool ok)
+{
+    EGC_GC;
+    assert(!libxl__xswait_inuse(&dss->pvcontrol));
+    libxl__ev_evtchn_cancel(gc, &dss->guest_evtchn);
+    libxl__ev_xswatch_deregister(gc, &dss->guest_watch);
+    libxl__ev_time_deregister(gc, &dss->guest_timeout);
+    dss->callback_common_done(egc, dss, ok);
 }
 
 static inline char *physmap_path(libxl__gc *gc, uint32_t domid,
         char *phys_offset, char *node)
 {
-    return libxl__sprintf(gc,
-            "/local/domain/0/device-model/%d/physmap/%s/%s",
+    return GCSPRINTF("/local/domain/0/device-model/%d/physmap/%s/%s",
             domid, phys_offset, node);
 }
 
@@ -1081,7 +1352,7 @@ int libxl__toolstack_save(uint32_t domid, uint8_t **buf,
     char **entries = NULL;
     struct libxl__physmap_info *pi;
 
-    entries = libxl__xs_directory(gc, 0, libxl__sprintf(gc,
+    entries = libxl__xs_directory(gc, 0, GCSPRINTF(
                 "/local/domain/0/device-model/%d/physmap", domid), &num);
     count = num;
 
@@ -1145,12 +1416,39 @@ int libxl__toolstack_save(uint32_t domid, uint8_t **buf,
     return 0;
 }
 
+static void libxl__domain_suspend_callback(void *data)
+{
+    libxl__save_helper_state *shs = data;
+    libxl__egc *egc = shs->egc;
+    libxl__domain_suspend_state *dss = CONTAINER_OF(shs, *dss, shs);
+
+    dss->callback_common_done = domain_suspend_callback_common_done;
+    domain_suspend_callback_common(egc, dss);
+}
+
+static void domain_suspend_callback_common_done(libxl__egc *egc,
+                                libxl__domain_suspend_state *dss, int ok)
+{
+    libxl__xc_domain_saverestore_async_callback_done(egc, &dss->shs, ok);
+}
+
 /*----- remus callbacks -----*/
 
-static int libxl__remus_domain_suspend_callback(void *data)
+static void libxl__remus_domain_suspend_callback(void *data)
+{
+    libxl__save_helper_state *shs = data;
+    libxl__egc *egc = shs->egc;
+    libxl__domain_suspend_state *dss = CONTAINER_OF(shs, *dss, shs);
+
+    dss->callback_common_done = remus_domain_suspend_callback_common_done;
+    domain_suspend_callback_common(egc, dss);
+}
+
+static void remus_domain_suspend_callback_common_done(libxl__egc *egc,
+                                libxl__domain_suspend_state *dss, int ok)
 {
     /* REMUS TODO: Issue disk and network checkpoint reqs. */
-    return libxl__domain_suspend_common_callback(data);
+    libxl__xc_domain_saverestore_async_callback_done(egc, &dss->shs, ok);
 }
 
 static int libxl__remus_domain_resume_callback(void *data)
@@ -1216,13 +1514,17 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
         &dss->shs.callbacks.save.a;
 
     logdirty_init(&dss->logdirty);
+    libxl__xswait_init(&dss->pvcontrol);
+    libxl__ev_evtchn_init(&dss->guest_evtchn);
+    libxl__ev_xswatch_init(&dss->guest_watch);
+    libxl__ev_time_init(&dss->guest_timeout);
 
     switch (type) {
     case LIBXL_DOMAIN_TYPE_HVM: {
         char *path;
         char *addr;
 
-        path = libxl__sprintf(gc, "%s/hvmloader/generation-id-address",
+        path = GCSPRINTF("%s/hvmloader/generation-id-address",
                               libxl__xs_get_dompath(gc, domid));
         addr = libxl__xs_read(gc, XBT_NULL, path);
 
@@ -1238,11 +1540,12 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
         abort();
     }
 
-    dss->xcflags = (live) ? XCFLAGS_LIVE : 0
-          | (debug) ? XCFLAGS_DEBUG : 0
-          | (dss->hvm) ? XCFLAGS_HVM : 0;
+    dss->xcflags = (live ? XCFLAGS_LIVE : 0)
+          | (debug ? XCFLAGS_DEBUG : 0)
+          | (dss->hvm ? XCFLAGS_HVM : 0);
 
-    dss->suspend_eventchn = -1;
+    dss->guest_evtchn.port = -1;
+    dss->guest_evtchn_lockfd = -1;
     dss->guest_responded = 0;
     dss->dm_savefile = libxl__device_model_savefile(gc, domid);
 
@@ -1252,19 +1555,17 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
             dss->xcflags |= XCFLAGS_CHECKPOINT_COMPRESS;
     }
 
-    dss->xce = xc_evtchn_open(NULL, 0);
-    if (dss->xce == NULL)
-        goto out;
-    else
-    {
-        port = xs_suspend_evtchn_port(dss->domid);
+    port = xs_suspend_evtchn_port(dss->domid);
 
-        if (port >= 0) {
-            dss->suspend_eventchn =
-                xc_suspend_evtchn_init(CTX->xch, dss->xce, dss->domid, port);
+    if (port >= 0) {
+        dss->guest_evtchn.port =
+            xc_suspend_evtchn_init_exclusive(CTX->xch, CTX->xce,
+                                  dss->domid, port, &dss->guest_evtchn_lockfd);
 
-            if (dss->suspend_eventchn < 0)
-                LOG(WARN, "Suspend event channel initialization failed");
+        if (dss->guest_evtchn.port < 0) {
+            LOG(WARN, "Suspend event channel initialization failed");
+            rc = ERROR_FAIL;
+            goto out;
         }
     }
 
@@ -1274,7 +1575,7 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
         callbacks->postcopy = libxl__remus_domain_resume_callback;
         callbacks->checkpoint = libxl__remus_domain_checkpoint_callback;
     } else
-        callbacks->suspend = libxl__domain_suspend_common_callback;
+        callbacks->suspend = libxl__domain_suspend_callback;
 
     callbacks->switch_qemu_logdirty = libxl__domain_suspend_common_switch_qemu_logdirty;
     dss->shs.callbacks.save.toolstack_save = libxl__toolstack_save;
@@ -1313,7 +1614,7 @@ void libxl__xc_domain_save_done(libxl__egc *egc, void *dss_void,
     if (type == LIBXL_DOMAIN_TYPE_HVM) {
         rc = libxl__domain_suspend_device_model(gc, dss);
         if (rc) goto out;
-        
+
         libxl__domain_save_device_model(egc, dss, domain_suspend_done);
         return;
     }
@@ -1423,11 +1724,11 @@ static void domain_suspend_done(libxl__egc *egc,
     /* Convenience aliases */
     const uint32_t domid = dss->domid;
 
-    if (dss->suspend_eventchn > 0)
-        xc_suspend_evtchn_release(CTX->xch, dss->xce, domid,
-                                  dss->suspend_eventchn);
-    if (dss->xce != NULL)
-        xc_evtchn_close(dss->xce);
+    libxl__ev_evtchn_cancel(gc, &dss->guest_evtchn);
+
+    if (dss->guest_evtchn.port > 0)
+        xc_suspend_evtchn_release(CTX->xch, CTX->xce, domid,
+                           dss->guest_evtchn.port, &dss->guest_evtchn_lockfd);
 
     dss->callback(egc, dss, rc);
 }
@@ -1436,10 +1737,7 @@ static void domain_suspend_done(libxl__egc *egc,
 
 char *libxl__uuid2string(libxl__gc *gc, const libxl_uuid uuid)
 {
-    char *s = libxl__sprintf(gc, LIBXL_UUID_FMT, LIBXL_UUID_BYTES(uuid));
-    if (!s)
-        LIBXL__LOG(libxl__gc_owner(gc), LIBXL__LOG_ERROR, "cannot allocate for uuid");
-    return s;
+    return GCSPRINTF(LIBXL_UUID_FMT, LIBXL_UUID_BYTES(uuid));
 }
 
 static const char *userdata_path(libxl__gc *gc, uint32_t domid,
@@ -1447,34 +1745,27 @@ static const char *userdata_path(libxl__gc *gc, uint32_t domid,
                                       const char *wh)
 {
     libxl_ctx *ctx = libxl__gc_owner(gc);
-    char *path, *uuid_string;
+    char *uuid_string;
     libxl_dominfo info;
     int rc;
 
     rc = libxl_domain_info(ctx, &info, domid);
     if (rc) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "unable to find domain info"
-                     " for domain %"PRIu32, domid);
+        LOGE(ERROR, "unable to find domain info for domain %"PRIu32, domid);
         return NULL;
     }
-    uuid_string = libxl__sprintf(gc, LIBXL_UUID_FMT, LIBXL_UUID_BYTES(info.uuid));
+    uuid_string = GCSPRINTF(LIBXL_UUID_FMT, LIBXL_UUID_BYTES(info.uuid));
 
-    path = libxl__sprintf(gc, "/var/lib/xen/"
-                         "userdata-%s.%u.%s.%s",
-                         wh, domid, uuid_string, userdata_userid);
-    if (!path)
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "unable to allocate for"
-                     " userdata path");
-    return path;
+    return GCSPRINTF("/var/lib/xen/userdata-%s.%u.%s.%s",
+                     wh, domid, uuid_string, userdata_userid);
 }
 
 static int userdata_delete(libxl__gc *gc, const char *path)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
     int r;
     r = unlink(path);
     if (r) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "remove failed for %s", path);
+        LOGE(ERROR, "remove failed for %s", path);
         return errno;
     }
     return 0;
@@ -1482,7 +1773,6 @@ static int userdata_delete(libxl__gc *gc, const char *path)
 
 void libxl__userdata_destroyall(libxl__gc *gc, uint32_t domid)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
     const char *pattern;
     glob_t gl;
     int r, i;
@@ -1498,7 +1788,7 @@ void libxl__userdata_destroyall(libxl__gc *gc, uint32_t domid)
     if (r == GLOB_NOMATCH)
         goto out;
     if (r)
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "glob failed for %s", pattern);
+        LOGE(ERROR, "glob failed for %s", pattern);
 
     for (i=0; i<gl.gl_pathc; i++) {
         userdata_delete(gc, gl.gl_pathv[i]);
@@ -1517,8 +1807,6 @@ int libxl_userdata_store(libxl_ctx *ctx, uint32_t domid,
     const char *newfilename;
     int e, rc;
     int fd = -1;
-    FILE *f = NULL;
-    size_t rs;
 
     filename = userdata_path(gc, domid, userdata_userid, "d");
     if (!filename) {
@@ -1539,38 +1827,33 @@ int libxl_userdata_store(libxl_ctx *ctx, uint32_t domid,
 
     rc = ERROR_FAIL;
 
-    fd= open(newfilename, O_RDWR|O_CREAT|O_TRUNC, 0600);
-    if (fd<0)
+    fd = open(newfilename, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0)
         goto err;
 
-    f= fdopen(fd, "wb");
-    if (!f)
+    if (libxl_write_exactly(ctx, fd, data, datalen, "userdata", newfilename))
         goto err;
-    fd = -1;
 
-    rs = fwrite(data, 1, datalen, f);
-    if (rs != datalen) {
-        assert(ferror(f));
+    if (close(fd) < 0) {
+        fd = -1;
         goto err;
     }
+    fd = -1;
 
-    if (fclose(f))
-        goto err;
-    f = 0;
-
-    if (rename(newfilename,filename))
+    if (rename(newfilename, filename))
         goto err;
 
     rc = 0;
 
 err:
-    e = errno;
-    if (f) fclose(f);
-    if (fd>=0) close(fd);
+    if (fd >= 0) {
+        e = errno;
+        close(fd);
+        errno = e;
+    }
 
-    errno = e;
-    if ( rc )
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "cannot write %s for %s",
+    if (rc)
+        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "cannot write/rename %s for %s",
                  newfilename, filename);
 out:
     GC_FREE;

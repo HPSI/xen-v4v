@@ -26,6 +26,7 @@
 #include <xen/compat.h>
 #include <xen/guest_access.h>
 #include <xen/keyhandler.h>
+#include <xen/event_fifo.h>
 #include <asm/current.h>
 
 #include <public/xen.h>
@@ -66,7 +67,7 @@
  * with a pointer, we stash them dynamically in a small lookup array which
  * can be indexed by a small integer.
  */
-static xen_event_channel_notification_t xen_consumers[8];
+static xen_event_channel_notification_t xen_consumers[NR_XEN_CONSUMERS];
 
 /* Default notification action: wake up from wait_on_xen_event_channel(). */
 static void default_xen_notification_fn(struct vcpu *v, unsigned int port)
@@ -129,37 +130,74 @@ static int virq_is_global(uint32_t virq)
 }
 
 
-static int get_free_port(struct domain *d)
+static struct evtchn *alloc_evtchn_bucket(struct domain *d, unsigned int port)
 {
     struct evtchn *chn;
-    int            port;
-    int            i, j;
-
-    if ( d->is_dying )
-        return -EINVAL;
-
-    for ( port = 0; port_is_valid(d, port); port++ )
-        if ( evtchn_from_port(d, port)->state == ECS_FREE )
-            return port;
-
-    if ( port == MAX_EVTCHNS(d) )
-        return -ENOSPC;
+    unsigned int i;
 
     chn = xzalloc_array(struct evtchn, EVTCHNS_PER_BUCKET);
-    if ( unlikely(chn == NULL) )
-        return -ENOMEM;
-    bucket_from_port(d, port) = chn;
+    if ( !chn )
+        return NULL;
 
     for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
     {
         if ( xsm_alloc_security_evtchn(&chn[i]) )
         {
-            for ( j = 0; j < i; j++ )
-                xsm_free_security_evtchn(&chn[j]);
+            while ( i-- )
+                xsm_free_security_evtchn(&chn[i]);
             xfree(chn);
-            return -ENOMEM;
+            return NULL;
         }
+        chn[i].port = port + i;
     }
+    return chn;
+}
+
+static void free_evtchn_bucket(struct domain *d, struct evtchn *bucket)
+{
+    unsigned int i;
+
+    if ( !bucket )
+        return;
+
+    for ( i = 0; i < EVTCHNS_PER_BUCKET; i++ )
+        xsm_free_security_evtchn(bucket + i);
+
+    xfree(bucket);
+}
+
+static int get_free_port(struct domain *d)
+{
+    struct evtchn *chn;
+    struct evtchn **grp;
+    int            port;
+
+    if ( d->is_dying )
+        return -EINVAL;
+
+    for ( port = 0; port_is_valid(d, port); port++ )
+    {
+        if ( port > d->max_evtchn_port )
+            return -ENOSPC;
+        if ( evtchn_from_port(d, port)->state == ECS_FREE )
+            return port;
+    }
+
+    if ( port == d->max_evtchns || port > d->max_evtchn_port )
+        return -ENOSPC;
+
+    if ( !group_from_port(d, port) )
+    {
+        grp = xzalloc_array(struct evtchn *, BUCKETS_PER_GROUP);
+        if ( !grp )
+            return -ENOMEM;
+        group_from_port(d, port) = grp;
+    }
+
+    chn = alloc_evtchn_bucket(d, port);
+    if ( !chn )
+        return -ENOMEM;
+    bucket_from_port(d, port) = chn;
 
     return port;
 }
@@ -167,14 +205,14 @@ static int get_free_port(struct domain *d)
 
 static long evtchn_alloc_unbound(evtchn_alloc_unbound_t *alloc)
 {
-    struct domain *d;
+    struct domain *d ;
     long           rc;
 
-    rc = rcu_lock_target_domain_by_id(alloc->dom, &d);
-    if ( rc )
-        return rc;
+    d = rcu_lock_domain_by_any_id(alloc->dom);
+    if ( d == NULL )
+        return -ESRCH;
 
-    rc = evtchn_alloc_unbound_domain(d, &alloc->port, alloc->remote_dom);
+    rc = evtchn_alloc_unbound_domain(d, &alloc->port, alloc->remote_dom, 1);
     if ( rc )
         ERROR_EXIT_DOM((int)rc, d);
 
@@ -185,7 +223,7 @@ static long evtchn_alloc_unbound(evtchn_alloc_unbound_t *alloc)
 }
 
 int evtchn_alloc_unbound_domain(struct domain *d, evtchn_port_t *port,
-                                domid_t remote_domid)
+                                domid_t remote_domid, bool_t call_xsm)
 {
     struct evtchn *chn;
     int           rc;
@@ -198,13 +236,16 @@ int evtchn_alloc_unbound_domain(struct domain *d, evtchn_port_t *port,
         goto out;
 
     chn = evtchn_from_port(d, free_port);
-    rc = xsm_evtchn_unbound(d, chn, remote_domid);
-    if ( rc )
-        goto out;
+    if ( call_xsm ) {
+        rc = xsm_evtchn_unbound(XSM_TARGET, d, chn, remote_domid);
+        if ( rc )
+            goto out;
+    }
 
     chn->state = ECS_UNBOUND;
     if ( (chn->u.unbound.remote_domid = remote_domid) == DOMID_SELF )
         chn->u.unbound.remote_domid = current->domain->domain_id;
+    evtchn_port_init(d, chn);
 
     *port = free_port;
     /* Everything is fine, returns 0 */
@@ -254,16 +295,17 @@ static long evtchn_bind_interdomain(evtchn_bind_interdomain_t *bind)
          (rchn->u.unbound.remote_domid != ld->domain_id) )
         ERROR_EXIT_DOM(-EINVAL, rd);
 
-    rc = xsm_evtchn_interdomain(ld, lchn, rd, rchn);
+    rc = xsm_evtchn_interdomain(XSM_HOOK, ld, lchn, rd, rchn);
     if ( rc )
         goto out;
 
     lchn->u.interdomain.remote_dom  = rd;
-    lchn->u.interdomain.remote_port = (u16)rport;
+    lchn->u.interdomain.remote_port = rport;
     lchn->state                     = ECS_INTERDOMAIN;
+    evtchn_port_init(ld, lchn);
     
     rchn->u.interdomain.remote_dom  = ld;
-    rchn->u.interdomain.remote_port = (u16)lport;
+    rchn->u.interdomain.remote_port = lport;
     rchn->state                     = ECS_INTERDOMAIN;
 
     /*
@@ -315,6 +357,7 @@ static long evtchn_bind_virq(evtchn_bind_virq_t *bind)
     chn->state          = ECS_VIRQ;
     chn->notify_vcpu_id = vcpu;
     chn->u.virq         = virq;
+    evtchn_port_init(d, chn);
 
     v->virq_to_evtchn[virq] = bind->port = port;
 
@@ -344,6 +387,7 @@ static long evtchn_bind_ipi(evtchn_bind_ipi_t *bind)
     chn = evtchn_from_port(d, port);
     chn->state          = ECS_IPI;
     chn->notify_vcpu_id = vcpu;
+    evtchn_port_init(d, chn);
 
     bind->port = port;
 
@@ -391,7 +435,7 @@ static long evtchn_bind_pirq(evtchn_bind_pirq_t *bind)
     if ( (pirq < 0) || (pirq >= d->nr_pirqs) )
         return -EINVAL;
 
-    if ( !is_hvm_domain(d) && !irq_access_permitted(d, pirq) )
+    if ( !is_hvm_domain(d) && !pirq_access_permitted(d, pirq) )
         return -EPERM;
 
     spin_lock(&d->event_lock);
@@ -422,6 +466,7 @@ static long evtchn_bind_pirq(evtchn_bind_pirq_t *bind)
     chn->state  = ECS_PIRQ;
     chn->u.pirq.irq = pirq;
     link_pirq_port(port, chn, v);
+    evtchn_port_init(d, chn);
 
     bind->port = port;
 
@@ -552,7 +597,7 @@ static long __evtchn_close(struct domain *d1, int port1)
     }
 
     /* Clear pending event to avoid unexpected behavior on re-bind. */
-    clear_bit(port1, &shared_info(d1, evtchn_pending));
+    evtchn_port_clear_pending(d1, chn1);
 
     /* Reset binding to vcpu0 when the channel is freed. */
     chn1->state          = ECS_FREE;
@@ -603,7 +648,7 @@ int evtchn_send(struct domain *d, unsigned int lport)
         return -EINVAL;
     }
 
-    ret = xsm_evtchn_send(ld, lchn);
+    ret = xsm_evtchn_send(XSM_HOOK, ld, lchn);
     if ( ret )
         goto out;
 
@@ -641,43 +686,7 @@ out:
 
 static void evtchn_set_pending(struct vcpu *v, int port)
 {
-    struct domain *d = v->domain;
-    int vcpuid;
-
-    /*
-     * The following bit operations must happen in strict order.
-     * NB. On x86, the atomic bit operations also act as memory barriers.
-     * There is therefore sufficiently strict ordering for this architecture --
-     * others may require explicit memory barriers.
-     */
-
-    if ( test_and_set_bit(port, &shared_info(d, evtchn_pending)) )
-        return;
-
-    if ( !test_bit        (port, &shared_info(d, evtchn_mask)) &&
-         !test_and_set_bit(port / BITS_PER_EVTCHN_WORD(d),
-                           &vcpu_info(v, evtchn_pending_sel)) )
-    {
-        vcpu_mark_events_pending(v);
-    }
-    
-    /* Check if some VCPU might be polling for this event. */
-    if ( likely(bitmap_empty(d->poll_mask, d->max_vcpus)) )
-        return;
-
-    /* Wake any interested (or potentially interested) pollers. */
-    for ( vcpuid = find_first_bit(d->poll_mask, d->max_vcpus);
-          vcpuid < d->max_vcpus;
-          vcpuid = find_next_bit(d->poll_mask, d->max_vcpus, vcpuid+1) )
-    {
-        v = d->vcpu[vcpuid];
-        if ( ((v->poll_evtchn <= 0) || (v->poll_evtchn == port)) &&
-             test_and_clear_bit(vcpuid, d->poll_mask) )
-        {
-            v->poll_evtchn = 0;
-            vcpu_unblock(v);
-        }
-    }
+    evtchn_port_set_pending(v, evtchn_from_port(v->domain, port));
 }
 
 int guest_enabled_event(struct vcpu *v, uint32_t virq)
@@ -763,7 +772,7 @@ void send_global_virq(uint32_t virq)
     ASSERT(virq < NR_VIRQS);
     ASSERT(virq_is_global(virq));
 
-    send_guest_global_virq(global_virq_handlers[virq] ?: dom0, virq);
+    send_guest_global_virq(global_virq_handlers[virq] ?: hardware_domain, virq);
 }
 
 int set_global_virq_handler(struct domain *d, uint32_t virq)
@@ -825,9 +834,9 @@ static long evtchn_status(evtchn_status_t *status)
     struct evtchn   *chn;
     long             rc = 0;
 
-    rc = rcu_lock_target_domain_by_id(dom, &d);
-    if ( rc )
-        return rc;
+    d = rcu_lock_domain_by_any_id(dom);
+    if ( d == NULL )
+        return -ESRCH;
 
     spin_lock(&d->event_lock);
 
@@ -839,7 +848,7 @@ static long evtchn_status(evtchn_status_t *status)
 
     chn = evtchn_from_port(d, port);
 
-    rc = xsm_evtchn_status(d, chn);
+    rc = xsm_evtchn_status(XSM_TARGET, d, chn);
     if ( rc )
         goto out;
 
@@ -946,26 +955,15 @@ long evtchn_bind_vcpu(unsigned int port, unsigned int vcpu_id)
 int evtchn_unmask(unsigned int port)
 {
     struct domain *d = current->domain;
-    struct vcpu   *v;
+    struct evtchn *evtchn;
 
     ASSERT(spin_is_locked(&d->event_lock));
 
     if ( unlikely(!port_is_valid(d, port)) )
         return -EINVAL;
 
-    v = d->vcpu[evtchn_from_port(d, port)->notify_vcpu_id];
-
-    /*
-     * These operations must happen in strict order. Based on
-     * include/xen/event.h:evtchn_set_pending(). 
-     */
-    if ( test_and_clear_bit(port, &shared_info(d, evtchn_mask)) &&
-         test_bit          (port, &shared_info(d, evtchn_pending)) &&
-         !test_and_set_bit (port / BITS_PER_EVTCHN_WORD(d),
-                            &vcpu_info(v, evtchn_pending_sel)) )
-    {
-        vcpu_mark_events_pending(v);
-    }
+    evtchn = evtchn_from_port(d, port);
+    evtchn_port_unmask(d, evtchn);
 
     return 0;
 }
@@ -977,11 +975,11 @@ static long evtchn_reset(evtchn_reset_t *r)
     struct domain *d;
     int i, rc;
 
-    rc = rcu_lock_target_domain_by_id(dom, &d);
-    if ( rc )
-        return rc;
+    d = rcu_lock_domain_by_any_id(dom);
+    if ( d == NULL )
+        return -ESRCH;
 
-    rc = xsm_evtchn_reset(current->domain, d);
+    rc = xsm_evtchn_reset(XSM_TARGET, current->domain, d);
     if ( rc )
         goto out;
 
@@ -996,6 +994,27 @@ out:
     return rc;
 }
 
+static long evtchn_set_priority(const struct evtchn_set_priority *set_priority)
+{
+    struct domain *d = current->domain;
+    unsigned int port = set_priority->port;
+    long ret;
+
+    spin_lock(&d->event_lock);
+
+    if ( !port_is_valid(d, port) )
+    {
+        spin_unlock(&d->event_lock);
+        return -EINVAL;
+    }
+
+    ret = evtchn_port_set_priority(d, evtchn_from_port(d, port),
+                                   set_priority->priority);
+
+    spin_unlock(&d->event_lock);
+
+    return ret;
+}
 
 long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 {
@@ -1008,7 +1027,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&alloc_unbound, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_alloc_unbound(&alloc_unbound);
-        if ( (rc == 0) && (copy_to_guest(arg, &alloc_unbound, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &alloc_unbound, 1) )
             rc = -EFAULT; /* Cleaning up here would be a mess! */
         break;
     }
@@ -1018,7 +1037,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&bind_interdomain, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_bind_interdomain(&bind_interdomain);
-        if ( (rc == 0) && (copy_to_guest(arg, &bind_interdomain, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &bind_interdomain, 1) )
             rc = -EFAULT; /* Cleaning up here would be a mess! */
         break;
     }
@@ -1028,7 +1047,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&bind_virq, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_bind_virq(&bind_virq);
-        if ( (rc == 0) && (copy_to_guest(arg, &bind_virq, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &bind_virq, 1) )
             rc = -EFAULT; /* Cleaning up here would be a mess! */
         break;
     }
@@ -1038,7 +1057,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&bind_ipi, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_bind_ipi(&bind_ipi);
-        if ( (rc == 0) && (copy_to_guest(arg, &bind_ipi, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &bind_ipi, 1) )
             rc = -EFAULT; /* Cleaning up here would be a mess! */
         break;
     }
@@ -1048,7 +1067,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&bind_pirq, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_bind_pirq(&bind_pirq);
-        if ( (rc == 0) && (copy_to_guest(arg, &bind_pirq, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &bind_pirq, 1) )
             rc = -EFAULT; /* Cleaning up here would be a mess! */
         break;
     }
@@ -1074,7 +1093,7 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&status, arg, 1) != 0 )
             return -EFAULT;
         rc = evtchn_status(&status);
-        if ( (rc == 0) && (copy_to_guest(arg, &status, 1) != 0) )
+        if ( !rc && __copy_to_guest(arg, &status, 1) )
             rc = -EFAULT;
         break;
     }
@@ -1105,6 +1124,32 @@ long do_event_channel_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         break;
     }
 
+    case EVTCHNOP_init_control: {
+        struct evtchn_init_control init_control;
+        if ( copy_from_guest(&init_control, arg, 1) != 0 )
+            return -EFAULT;
+        rc = evtchn_fifo_init_control(&init_control);
+        if ( !rc && __copy_to_guest(arg, &init_control, 1) )
+            rc = -EFAULT;
+        break;
+    }
+
+    case EVTCHNOP_expand_array: {
+        struct evtchn_expand_array expand_array;
+        if ( copy_from_guest(&expand_array, arg, 1) != 0 )
+            return -EFAULT;
+        rc = evtchn_fifo_expand_array(&expand_array);
+        break;
+    }
+
+    case EVTCHNOP_set_priority: {
+        struct evtchn_set_priority set_priority;
+        if ( copy_from_guest(&set_priority, arg, 1) != 0 )
+            return -EFAULT;
+        rc = evtchn_set_priority(&set_priority);
+        break;
+    }
+
     default:
         rc = -ENOSYS;
         break;
@@ -1128,7 +1173,7 @@ int alloc_unbound_xen_event_channel(
         goto out;
     chn = evtchn_from_port(d, port);
 
-    rc = xsm_evtchn_unbound(d, chn, remote_domid);
+    rc = xsm_evtchn_unbound(XSM_TARGET, d, chn, remote_domid);
 
     chn->state = ECS_UNBOUND;
     chn->xen_consumer = get_xen_consumer(notification_fn);
@@ -1196,18 +1241,54 @@ void notify_via_xen_event_channel(struct domain *ld, int lport)
     spin_unlock(&ld->event_lock);
 }
 
+void evtchn_check_pollers(struct domain *d, unsigned int port)
+{
+    struct vcpu *v;
+    unsigned int vcpuid;
+
+    /* Check if some VCPU might be polling for this event. */
+    if ( likely(bitmap_empty(d->poll_mask, d->max_vcpus)) )
+        return;
+
+    /* Wake any interested (or potentially interested) pollers. */
+    for ( vcpuid = find_first_bit(d->poll_mask, d->max_vcpus);
+          vcpuid < d->max_vcpus;
+          vcpuid = find_next_bit(d->poll_mask, d->max_vcpus, vcpuid+1) )
+    {
+        v = d->vcpu[vcpuid];
+        if ( ((v->poll_evtchn <= 0) || (v->poll_evtchn == port)) &&
+             test_and_clear_bit(vcpuid, d->poll_mask) )
+        {
+            v->poll_evtchn = 0;
+            vcpu_unblock(v);
+        }
+    }
+}
 
 int evtchn_init(struct domain *d)
 {
+    evtchn_2l_init(d);
+    d->max_evtchn_port = INT_MAX;
+
+    d->evtchn = alloc_evtchn_bucket(d, 0);
+    if ( !d->evtchn )
+        return -ENOMEM;
+
     spin_lock_init(&d->event_lock);
     if ( get_free_port(d) != 0 )
+    {
+        free_evtchn_bucket(d, d->evtchn);
         return -EINVAL;
+    }
     evtchn_from_port(d, 0)->state = ECS_RESERVED;
 
 #if MAX_VIRT_CPUS > BITS_PER_LONG
     d->poll_mask = xmalloc_array(unsigned long, BITS_TO_LONGS(MAX_VIRT_CPUS));
     if ( !d->poll_mask )
+    {
+        free_evtchn_bucket(d, d->evtchn);
         return -ENOMEM;
+    }
     bitmap_zero(d->poll_mask, MAX_VIRT_CPUS);
 #endif
 
@@ -1217,7 +1298,7 @@ int evtchn_init(struct domain *d)
 
 void evtchn_destroy(struct domain *d)
 {
-    int i;
+    unsigned int i, j;
 
     /* After this barrier no new event-channel allocations can occur. */
     BUG_ON(!d->is_dying);
@@ -1232,15 +1313,22 @@ void evtchn_destroy(struct domain *d)
 
     /* Free all event-channel buckets. */
     spin_lock(&d->event_lock);
-    for ( i = 0; i < NR_EVTCHN_BUCKETS; i++ )
+    for ( i = 0; i < NR_EVTCHN_GROUPS; i++ )
     {
-        xsm_free_security_evtchn(d->evtchn[i]);
-        xfree(d->evtchn[i]);
-        d->evtchn[i] = NULL;
+        if ( !d->evtchn_group[i] )
+            continue;
+        for ( j = 0; j < BUCKETS_PER_GROUP; j++ )
+            free_evtchn_bucket(d, d->evtchn_group[i][j]);
+        xfree(d->evtchn_group[i]);
+        d->evtchn_group[i] = NULL;
     }
+    free_evtchn_bucket(d, d->evtchn);
+    d->evtchn = NULL;
     spin_unlock(&d->event_lock);
 
     clear_global_virq_handlers(d);
+
+    evtchn_fifo_destroy(d);
 }
 
 
@@ -1279,11 +1367,11 @@ static void domain_dump_evtchn_info(struct domain *d)
                          d->poll_mask, d->max_vcpus);
     printk("Event channel information for domain %d:\n"
            "Polling vCPUs: {%s}\n"
-           "    port [p/m]\n", d->domain_id, keyhandler_scratch);
+           "    port [p/m/s]\n", d->domain_id, keyhandler_scratch);
 
     spin_lock(&d->event_lock);
 
-    for ( port = 1; port < MAX_EVTCHNS(d); ++port )
+    for ( port = 1; port < d->max_evtchns; ++port )
     {
         const struct evtchn *chn;
         char *ssid;
@@ -1294,10 +1382,12 @@ static void domain_dump_evtchn_info(struct domain *d)
         if ( chn->state == ECS_FREE )
             continue;
 
-        printk("    %4u [%d/%d]: s=%d n=%d x=%d",
+        printk("    %4u [%d/%d/",
                port,
-               !!test_bit(port, &shared_info(d, evtchn_pending)),
-               !!test_bit(port, &shared_info(d, evtchn_mask)),
+               !!evtchn_port_is_pending(d, chn),
+               !!evtchn_port_is_masked(d, chn));
+        evtchn_port_print_state(d, chn);
+        printk("]: s=%d n=%d x=%d",
                chn->state, chn->notify_vcpu_id, chn->xen_consumer);
 
         switch ( chn->state )
@@ -1361,7 +1451,7 @@ __initcall(dump_evtchn_info_key_init);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

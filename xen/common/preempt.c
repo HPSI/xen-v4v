@@ -30,3 +30,12 @@ bool_t in_atomic(void)
 {
     return preempt_count() || in_irq() || !local_irq_is_enabled();
 }
+
+#ifndef NDEBUG
+void ASSERT_NOT_IN_ATOMIC(void)
+{
+    ASSERT(!preempt_count());
+    ASSERT(!in_irq());
+    ASSERT(local_irq_is_enabled());
+}
+#endif

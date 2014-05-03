@@ -53,8 +53,7 @@ nestedhvm_vcpu_reset(struct vcpu *v)
     nv->nv_ioport80 = 0;
     nv->nv_ioportED = 0;
 
-    if (nv->nv_vvmcx)
-        hvm_unmap_guest_frame(nv->nv_vvmcx);
+    hvm_unmap_guest_frame(nv->nv_vvmcx, 1);
     nv->nv_vvmcx = NULL;
     nv->nv_vvmcxaddr = VMCX_EADDR;
     nv->nv_flushp2m = 0;
@@ -88,7 +87,7 @@ nestedhvm_vcpu_initialise(struct vcpu *v)
 void
 nestedhvm_vcpu_destroy(struct vcpu *v)
 {
-    if ( nestedhvm_enabled(v->domain) && hvm_funcs.nhvm_vcpu_destroy )
+    if ( hvm_funcs.nhvm_vcpu_destroy )
         hvm_funcs.nhvm_vcpu_destroy(v);
 }
 

@@ -22,6 +22,7 @@
 #include <asm/hvm/vpt.h>
 #include <asm/event.h>
 #include <asm/apic.h>
+#include <asm/mc146818rtc.h>
 
 #define mode_is(d, name) \
     ((d)->arch.hvm_domain.params[HVM_PARAM_TIMER_MODE] == HVMPTM_##name)
@@ -35,7 +36,7 @@ void hvm_init_guest_time(struct domain *d)
     pl->last_guest_time = 0;
 }
 
-u64 hvm_get_guest_time(struct vcpu *v)
+u64 hvm_get_guest_time_fixed(struct vcpu *v, u64 at_tsc)
 {
     struct pl_time *pl = &v->domain->arch.hvm_domain.pl_time;
     u64 now;
@@ -44,11 +45,15 @@ u64 hvm_get_guest_time(struct vcpu *v)
     ASSERT(is_hvm_vcpu(v));
 
     spin_lock(&pl->pl_time_lock);
-    now = get_s_time() + pl->stime_offset;
-    if ( (int64_t)(now - pl->last_guest_time) > 0 )
-        pl->last_guest_time = now;
-    else
-        now = ++pl->last_guest_time;
+    now = get_s_time_fixed(at_tsc) + pl->stime_offset;
+
+    if ( !at_tsc )
+    {
+        if ( (int64_t)(now - pl->last_guest_time) > 0 )
+            pl->last_guest_time = now;
+        else
+            now = ++pl->last_guest_time;
+    }
     spin_unlock(&pl->pl_time_lock);
 
     return now + v->arch.hvm_vcpu.stime_offset;
@@ -56,7 +61,19 @@ u64 hvm_get_guest_time(struct vcpu *v)
 
 void hvm_set_guest_time(struct vcpu *v, u64 guest_time)
 {
-    v->arch.hvm_vcpu.stime_offset += guest_time - hvm_get_guest_time(v);
+    u64 offset = guest_time - hvm_get_guest_time(v);
+
+    if ( offset )
+    {
+        v->arch.hvm_vcpu.stime_offset += offset;
+        /*
+         * If hvm_vcpu.stime_offset is updated make sure to
+         * also update vcpu time, since this value is used to
+         * calculate the TSC.
+         */
+        if ( v == current )
+            update_vcpu_system_time(v);
+    }
 }
 
 static int pt_irq_vector(struct periodic_time *pt, enum hvm_intsrc src)
@@ -215,17 +232,20 @@ static void pt_timer_fn(void *data)
 int pt_update_irq(struct vcpu *v)
 {
     struct list_head *head = &v->arch.hvm_vcpu.tm_list;
-    struct periodic_time *pt, *temp, *earliest_pt = NULL;
-    uint64_t max_lag = -1ULL;
+    struct periodic_time *pt, *temp, *earliest_pt;
+    uint64_t max_lag;
     int irq, is_lapic;
 
     spin_lock(&v->arch.hvm_vcpu.tm_lock);
 
+    earliest_pt = NULL;
+    max_lag = -1ULL;
     list_for_each_entry_safe ( pt, temp, head, list )
     {
         if ( pt->pending_intr_nr )
         {
-            if ( pt_irq_masked(pt) )
+            /* RTC code takes care of disabling the timer itself. */
+            if ( (pt->irq != RTC_IRQ || !pt->priv) && pt_irq_masked(pt) )
             {
                 /* suspend timer emulation */
                 list_del(&pt->list);
@@ -255,9 +275,7 @@ int pt_update_irq(struct vcpu *v)
     spin_unlock(&v->arch.hvm_vcpu.tm_lock);
 
     if ( is_lapic )
-    {
         vlapic_set_irq(vcpu_vlapic(v), irq, 0);
-    }
     else
     {
         hvm_isa_irq_deassert(v->domain, irq);
@@ -269,8 +287,9 @@ int pt_update_irq(struct vcpu *v)
      * IRR is returned and used to set eoi_exit_bitmap for virtual
      * interrupt delivery case. Otherwise return -1 to do nothing.  
      */ 
-    if ( vlapic_accept_pic_intr(v) &&
-         (&v->domain->arch.hvm_domain)->vpic[0].int_output )
+    if ( !is_lapic &&
+         platform_legacy_irq(irq) && vlapic_accept_pic_intr(v) &&
+         (&v->domain->arch.hvm_domain)->vpic[irq >> 3].int_output )
         return -1;
     else 
         return pt_irq_vector(earliest_pt, hvm_intsrc_lapic);

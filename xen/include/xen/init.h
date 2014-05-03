@@ -10,6 +10,7 @@
 #define __init            __text_section(".init.text")
 #define __exit            __text_section(".exit.text")
 #define __initdata        __section(".init.data")
+#define __initconst       __section(".init.rodata")
 #define __exitdata        __used_section(".exit.data")
 #define __initsetup       __used_section(".init.setup")
 #define __init_call(lvl)  __used_section(".initcall" lvl ".init")
@@ -126,6 +127,14 @@ extern struct kernel_param __setup_start, __setup_end;
 #define __devinitdata __initdata
 #define __devexit __exit
 #define __devexitdata __exitdata
+#endif
+
+#ifdef CONFIG_LATE_HWDOM
+#define __hwdom_init
+#define __hwdom_initdata  __read_mostly
+#else
+#define __hwdom_init      __init
+#define __hwdom_initdata  __initdata
 #endif
 
 #endif /* _LINUX_INIT_H */

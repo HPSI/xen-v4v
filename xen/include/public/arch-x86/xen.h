@@ -70,8 +70,12 @@ typedef unsigned long xen_pfn_t;
 #define PRI_xen_pfn "lx"
 #endif
 
+#define XEN_HAVE_PV_GUEST_ENTRY 1
+
+#define XEN_HAVE_PV_UPCALL_MASK 1
+
 /*
- * SEGMENT DESCRIPTOR TABLES
+ * `incontents 200 segdesc Segment Descriptor Tables
  */
 /*
  * ` enum neg_errnoval
@@ -83,10 +87,23 @@ typedef unsigned long xen_pfn_t;
  * start of the GDT because some stupid OSes export hard-coded selector values
  * in their ABI. These hard-coded values are always near the start of the GDT,
  * so Xen places itself out of the way, at the far end of the GDT.
+ *
+ * NB The LDT is set using the MMUEXT_SET_LDT op of HYPERVISOR_mmuext_op
  */
 #define FIRST_RESERVED_GDT_PAGE  14
 #define FIRST_RESERVED_GDT_BYTE  (FIRST_RESERVED_GDT_PAGE * 4096)
 #define FIRST_RESERVED_GDT_ENTRY (FIRST_RESERVED_GDT_BYTE / 8)
+
+
+/*
+ * ` enum neg_errnoval
+ * ` HYPERVISOR_update_descriptor(u64 pa, u64 desc);
+ * `
+ * ` @pa   The machine physical address of the descriptor to
+ * `       update. Must be either a descriptor page or writable.
+ * ` @desc The descriptor value to update, in the same format as a
+ * `       native descriptor table entry.
+ */
 
 /* Maximum number of virtual CPUs in legacy multi-processor guests. */
 #define XEN_LEGACY_MAX_VCPUS 32
@@ -137,6 +154,15 @@ typedef uint64_t tsc_timestamp_t; /* RDTSC timestamp */
 /*
  * The following is all CPU context. Note that the fpu_ctxt block is filled 
  * in by FXSAVE if the CPU has feature FXSR; otherwise FSAVE is used.
+ *
+ * Also note that when calling DOMCTL_setvcpucontext and VCPU_initialise
+ * for HVM and PVH guests, not all information in this structure is updated:
+ *
+ * - For HVM guests, the structures read include: fpu_ctxt (if
+ * VGCT_I387_VALID is set), flags, user_regs, debugreg[*]
+ *
+ * - PVH guests are the same as HVM guests, but additionally use ctrlreg[3] to
+ * set cr3. All other fields not used should be set to 0.
  */
 struct vcpu_guest_context {
     /* FPU registers come first so they can be aligned for FXSAVE/FXRSTOR. */
@@ -239,7 +265,7 @@ typedef struct arch_shared_info arch_shared_info_t;
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

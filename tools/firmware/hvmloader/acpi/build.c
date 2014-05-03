@@ -23,6 +23,9 @@
 #include "ssdt_pm.h"
 #include "../config.h"
 #include "../util.h"
+#include <xen/hvm/hvm_xs_strings.h>
+
+#define ACPI_MAX_SECONDARY_TABLES 16
 
 #define align16(sz)        (((sz) + 15) & ~15)
 #define fixed_strcpy(d, s) strncpy((d), (s), sizeof(d))
@@ -198,6 +201,52 @@ static struct acpi_20_waet *construct_waet(void)
     return waet;
 }
 
+static int construct_passthrough_tables(unsigned long *table_ptrs,
+                                        int nr_tables)
+{
+    const char *s;
+    uint8_t *acpi_pt_addr;
+    uint32_t acpi_pt_length;
+    struct acpi_header *header;
+    int nr_added;
+    int nr_max = (ACPI_MAX_SECONDARY_TABLES - nr_tables - 1);
+    uint32_t total = 0;
+    uint8_t *buffer;
+
+    s = xenstore_read(HVM_XS_ACPI_PT_ADDRESS, NULL);
+    if ( s == NULL )
+        return 0;    
+
+    acpi_pt_addr = (uint8_t*)(uint32_t)strtoll(s, NULL, 0);
+    if ( acpi_pt_addr == NULL )
+        return 0;
+
+    s = xenstore_read(HVM_XS_ACPI_PT_LENGTH, NULL);
+    if ( s == NULL )
+        return 0;
+
+    acpi_pt_length = (uint32_t)strtoll(s, NULL, 0);
+
+    for ( nr_added = 0; nr_added < nr_max; nr_added++ )
+    {        
+        if ( (acpi_pt_length - total) < sizeof(struct acpi_header) )
+            break;
+
+        header = (struct acpi_header*)acpi_pt_addr;
+
+        buffer = mem_alloc(header->length, 16);
+        if ( buffer == NULL )
+            break;
+        memcpy(buffer, header, header->length);
+
+        table_ptrs[nr_tables++] = (unsigned long)buffer;
+        total += header->length;
+        acpi_pt_addr += header->length;
+    }
+
+    return nr_added;
+}
+
 static int construct_secondary_tables(unsigned long *table_ptrs,
                                       struct acpi_info *info)
 {
@@ -219,11 +268,13 @@ static int construct_secondary_tables(unsigned long *table_ptrs,
         table_ptrs[nr_tables++] = (unsigned long)madt;
     }
 
-    /* HPET. Always included in DSDT, so always include it here too. */
-    /* (And it's unconditionally required by Windows SVVP tests.) */
-    hpet = construct_hpet();
-    if (!hpet) return -1;
-    table_ptrs[nr_tables++] = (unsigned long)hpet;
+    /* HPET. */
+    if ( hpet_exists(ACPI_HPET_ADDRESS) )
+    {
+        hpet = construct_hpet();
+        if (!hpet) return -1;
+        table_ptrs[nr_tables++] = (unsigned long)hpet;
+    }
 
     /* WAET. */
     waet = construct_waet();
@@ -293,28 +344,52 @@ static int construct_secondary_tables(unsigned long *table_ptrs,
         }
     }
 
+    /* Load any additional tables passed through. */
+    nr_tables += construct_passthrough_tables(table_ptrs, nr_tables);
+
     table_ptrs[nr_tables] = 0;
     return nr_tables;
 }
 
-unsigned long new_vm_gid(void)
+/**
+ * Allocate and initialize Windows Generation ID
+ * If value is not present in the XenStore or if all zeroes
+ * the device will be not active
+ *
+ * Return 0 if memory failure, != 0 if success
+ */
+static int new_vm_gid(struct acpi_info *acpi_info)
 {
-    uint64_t gid;
-    unsigned char *buf;
-    char addr[11];
+    uint64_t vm_gid[2], *buf;
+    char addr[12];
+    const char * s;
+    char *end;
 
-    buf = mem_alloc(8, 8);
-    if (!buf) return 0;
+    acpi_info->vm_gid_addr = 0;
 
+    /* read ID and check for 0 */
+    s = xenstore_read("platform/generation-id", "0:0");
+    vm_gid[0] = strtoll(s, &end, 0);
+    vm_gid[1] = 0;
+    if ( end && end[0] == ':' )
+        vm_gid[1] = strtoll(end+1, NULL, 0);
+    if ( !vm_gid[0] && !vm_gid[1] )
+        return 1;
+
+    /* copy to allocate BIOS memory */
+    buf = (uint64_t *) mem_alloc(sizeof(vm_gid), 8);
+    if ( !buf )
+        return 0;
+    memcpy(buf, vm_gid, sizeof(vm_gid));
+
+    /* set into ACPI table and XenStore the address */
+    acpi_info->vm_gid_addr = virt_to_phys(buf);
     if ( snprintf(addr, sizeof(addr), "0x%lx", virt_to_phys(buf))
          >= sizeof(addr) )
         return 0;
     xenstore_write("hvmloader/generation-id-address", addr);
 
-    gid = strtoll(xenstore_read("platform/generation-id", "0"), NULL, 0);
-    *(uint64_t *)buf = gid;
-
-    return virt_to_phys(buf);    
+    return 1;
 }
 
 void acpi_build_tables(struct acpi_config *config, unsigned int physical)
@@ -327,9 +402,8 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
     struct acpi_10_fadt *fadt_10;
     struct acpi_20_facs *facs;
     unsigned char       *dsdt;
-    unsigned long        secondary_tables[16];
+    unsigned long        secondary_tables[ACPI_MAX_SECONDARY_TABLES];
     int                  nr_secondaries, i;
-    unsigned long        vm_gid_addr;
 
     /* Allocate and initialise the acpi info area. */
     mem_hole_populate_ram(ACPI_INFO_PHYSICAL_ADDRESS >> PAGE_SHIFT, 1);
@@ -442,8 +516,8 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
                  offsetof(struct acpi_20_rsdp, extended_checksum),
                  sizeof(struct acpi_20_rsdp));
 
-    vm_gid_addr = new_vm_gid();
-    if (!vm_gid_addr) goto oom;
+    if ( !new_vm_gid(acpi_info) )
+        goto oom;
 
     acpi_info->com1_present = uart_exists(0x3f8);
     acpi_info->com2_present = uart_exists(0x2f8);
@@ -451,7 +525,6 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
     acpi_info->hpet_present = hpet_exists(ACPI_HPET_ADDRESS);
     acpi_info->pci_min = pci_mem_start;
     acpi_info->pci_len = pci_mem_end - pci_mem_start;
-    acpi_info->vm_gid_addr = vm_gid_addr;
 
     return;
 
@@ -463,7 +536,7 @@ oom:
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

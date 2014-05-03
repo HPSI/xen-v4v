@@ -26,23 +26,24 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
+#include <errno.h>
 #include <inttypes.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/poll.h>
-#include <xc_private.h>
-#include <xg_save_restore.h>
 
+#include <xenctrl.h>
 #include <xen/mem_event.h>
 
-//#if 0
-#undef DPRINTF
 #define DPRINTF(a, b...) fprintf(stderr, a, ## b)
-//#endif
+#define ERROR(a, b...) fprintf(stderr, a "\n", ## b)
+#define PERROR(a, b...) fprintf(stderr, a ": %s\n", ## b, strerror(errno))
 
 /* Spinlock and mem event definitions */
 
@@ -104,17 +105,9 @@ typedef struct mem_event {
     spinlock_t ring_lock;
 } mem_event_t;
 
-typedef struct xc_platform_info {
-    unsigned long max_mfn;
-    unsigned long hvirt_start;
-    unsigned int  pt_levels;
-    unsigned int  guest_width;
-} xc_platform_info_t;
-
 typedef struct xenaccess {
     xc_interface *xc_handle;
 
-    xc_platform_info_t *platform_info;
     xc_domaininfo_t    *domain_info;
 
     mem_event_t mem_event;
@@ -178,7 +171,7 @@ int xenaccess_teardown(xc_interface *xch, xenaccess_t *xenaccess)
 
     /* Tear down domain xenaccess in Xen */
     if ( xenaccess->mem_event.ring_page )
-        munmap(xenaccess->mem_event.ring_page, PAGE_SIZE);
+        munmap(xenaccess->mem_event.ring_page, XC_PAGE_SIZE);
 
     if ( mem_access_enable )
     {
@@ -219,10 +212,7 @@ int xenaccess_teardown(xc_interface *xch, xenaccess_t *xenaccess)
     }
     xenaccess->xc_handle = NULL;
 
-    if ( xenaccess->platform_info )
-        free(xenaccess->platform_info);
-    if ( xenaccess->domain_info )
-        free(xenaccess->domain_info);
+    free(xenaccess->domain_info);
     free(xenaccess);
 
     return 0;
@@ -330,31 +320,12 @@ xenaccess_t *xenaccess_init(xc_interface **xch_r, domid_t domain_id)
     SHARED_RING_INIT((mem_event_sring_t *)xenaccess->mem_event.ring_page);
     BACK_RING_INIT(&xenaccess->mem_event.back_ring,
                    (mem_event_sring_t *)xenaccess->mem_event.ring_page,
-                   PAGE_SIZE);
+                   XC_PAGE_SIZE);
 
     /* Now that the ring is set, remove it from the guest's physmap */
     if ( xc_domain_decrease_reservation_exact(xch, 
                     xenaccess->mem_event.domain_id, 1, 0, &ring_pfn) )
         PERROR("Failed to remove ring from guest physmap");
-
-    /* Get platform info */
-    xenaccess->platform_info = malloc(sizeof(xc_platform_info_t));
-    if ( xenaccess->platform_info == NULL )
-    {
-        ERROR("Error allocating memory for platform info");
-        goto err;
-    }
-
-    rc = get_platform_info(xenaccess->xc_handle, domain_id,
-                           &xenaccess->platform_info->max_mfn,
-                           &xenaccess->platform_info->hvirt_start,
-                           &xenaccess->platform_info->pt_levels,
-                           &xenaccess->platform_info->guest_width);
-    if ( rc != 1 )
-    {
-        ERROR("Error getting platform info");
-        goto err;
-    }
 
     /* Get domaininfo */
     xenaccess->domain_info = malloc(sizeof(xc_domaininfo_t));
@@ -439,8 +410,7 @@ static int xenaccess_resume_page(xenaccess_t *paging, mem_event_response_t *rsp)
         goto out;
 
     /* Tell Xen page is ready */
-    ret = xc_mem_access_resume(paging->xc_handle, paging->mem_event.domain_id,
-                               rsp->gfn);
+    ret = xc_mem_access_resume(paging->xc_handle, paging->mem_event.domain_id);
     ret = xc_evtchn_notify(paging->mem_event.xce_handle,
                            paging->mem_event.port);
 
@@ -469,8 +439,8 @@ int main(int argc, char *argv[])
     int rc = -1;
     int rc1;
     xc_interface *xch;
-    hvmmem_access_t default_access = HVMMEM_access_rwx;
-    hvmmem_access_t after_first_access = HVMMEM_access_rwx;
+    xenmem_access_t default_access = XENMEM_access_rwx;
+    xenmem_access_t after_first_access = XENMEM_access_rwx;
     int required = 0;
     int int3 = 0;
     int shutting_down = 0;
@@ -504,13 +474,13 @@ int main(int argc, char *argv[])
 
     if ( !strcmp(argv[0], "write") )
     {
-        default_access = HVMMEM_access_rx;
-        after_first_access = HVMMEM_access_rwx;
+        default_access = XENMEM_access_rx;
+        after_first_access = XENMEM_access_rwx;
     }
     else if ( !strcmp(argv[0], "exec") )
     {
-        default_access = HVMMEM_access_rw;
-        after_first_access = HVMMEM_access_rwx;
+        default_access = XENMEM_access_rw;
+        after_first_access = XENMEM_access_rwx;
     }
     else if ( !strcmp(argv[0], "int3") )
     {
@@ -549,15 +519,15 @@ int main(int argc, char *argv[])
     }
 
     /* Set the default access type and convert all pages to it */
-    rc = xc_hvm_set_mem_access(xch, domain_id, default_access, ~0ull, 0);
+    rc = xc_set_mem_access(xch, domain_id, default_access, ~0ull, 0);
     if ( rc < 0 )
     {
         ERROR("Error %d setting default mem access type\n", rc);
         goto exit;
     }
 
-    rc = xc_hvm_set_mem_access(xch, domain_id, default_access, 0,
-                               xenaccess->domain_info->max_pages);
+    rc = xc_set_mem_access(xch, domain_id, default_access, 0,
+                           xenaccess->domain_info->max_pages);
     if ( rc < 0 )
     {
         ERROR("Error %d setting all memory to access type %d\n", rc,
@@ -583,8 +553,9 @@ int main(int argc, char *argv[])
             DPRINTF("xenaccess shutting down on signal %d\n", interrupted);
 
             /* Unregister for every event */
-            rc = xc_hvm_set_mem_access(xch, domain_id, HVMMEM_access_rwx, ~0ull, 0);
-            rc = xc_hvm_set_mem_access(xch, domain_id, HVMMEM_access_rwx, 0, xenaccess->domain_info->max_pages);
+            rc = xc_set_mem_access(xch, domain_id, XENMEM_access_rwx, ~0ull, 0);
+            rc = xc_set_mem_access(xch, domain_id, XENMEM_access_rwx, 0,
+                                   xenaccess->domain_info->max_pages);
             rc = xc_set_hvm_param(xch, domain_id, HVM_PARAM_MEMORY_EVENT_INT3, HVMPME_mode_disabled);
 
             shutting_down = 1;
@@ -604,7 +575,7 @@ int main(int argc, char *argv[])
 
         while ( RING_HAS_UNCONSUMED_REQUESTS(&xenaccess->mem_event.back_ring) )
         {
-            hvmmem_access_t access;
+            xenmem_access_t access;
 
             rc = get_request(&xenaccess->mem_event, &req);
             if ( rc != 0 )
@@ -620,7 +591,7 @@ int main(int argc, char *argv[])
 
             switch (req.reason) {
             case MEM_EVENT_REASON_VIOLATION:
-                rc = xc_hvm_get_mem_access(xch, domain_id, req.gfn, &access);
+                rc = xc_get_mem_access(xch, domain_id, req.gfn, &access);
                 if (rc < 0)
                 {
                     ERROR("Error %d getting mem_access event\n", rc);
@@ -640,8 +611,8 @@ int main(int argc, char *argv[])
 
                 if ( default_access != after_first_access )
                 {
-                    rc = xc_hvm_set_mem_access(xch, domain_id,
-                                               after_first_access, req.gfn, 1);
+                    rc = xc_set_mem_access(xch, domain_id, after_first_access,
+                                           req.gfn, 1);
                     if (rc < 0)
                     {
                         ERROR("Error %d setting gfn to access_type %d\n", rc,
@@ -708,7 +679,7 @@ exit:
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

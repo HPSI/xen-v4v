@@ -69,15 +69,14 @@ int nestedsvm_vmcb_map(struct vcpu *v, uint64_t vmcbaddr)
     struct nestedvcpu *nv = &vcpu_nestedhvm(v);
 
     if (nv->nv_vvmcx != NULL && nv->nv_vvmcxaddr != vmcbaddr) {
-        ASSERT(nv->nv_vvmcx != NULL);
         ASSERT(nv->nv_vvmcxaddr != VMCX_EADDR);
-        hvm_unmap_guest_frame(nv->nv_vvmcx);
+        hvm_unmap_guest_frame(nv->nv_vvmcx, 1);
         nv->nv_vvmcx = NULL;
         nv->nv_vvmcxaddr = VMCX_EADDR;
     }
 
     if (nv->nv_vvmcx == NULL) {
-        nv->nv_vvmcx = hvm_map_guest_frame_rw(vmcbaddr >> PAGE_SHIFT);
+        nv->nv_vvmcx = hvm_map_guest_frame_rw(vmcbaddr >> PAGE_SHIFT, 1);
         if (nv->nv_vvmcx == NULL)
             return 0;
         nv->nv_vvmcxaddr = vmcbaddr;
@@ -141,6 +140,8 @@ void nsvm_vcpu_destroy(struct vcpu *v)
                            get_order_from_bytes(MSRPM_SIZE));
         svm->ns_merged_msrpm = NULL;
     }
+    hvm_unmap_guest_frame(nv->nv_vvmcx, 1);
+    nv->nv_vvmcx = NULL;
     if (nv->nv_n2vmcx) {
         free_vmcb(nv->nv_n2vmcx);
         nv->nv_n2vmcx = NULL;
@@ -341,7 +342,7 @@ static int nsvm_vmrun_permissionmap(struct vcpu *v, bool_t viopm)
     unsigned int i;
     enum hvm_copy_result ret;
     unsigned long *ns_viomap;
-    bool_t ioport_80, ioport_ed;
+    bool_t ioport_80 = 1, ioport_ed = 1;
 
     ns_msrpm_ptr = (unsigned long *)svm->ns_cached_msrpm;
 
@@ -358,11 +359,13 @@ static int nsvm_vmrun_permissionmap(struct vcpu *v, bool_t viopm)
     svm->ns_oiomap_pa = svm->ns_iomap_pa;
     svm->ns_iomap_pa = ns_vmcb->_iopm_base_pa;
 
-    ns_viomap = hvm_map_guest_frame_ro(svm->ns_iomap_pa >> PAGE_SHIFT);
-    ASSERT(ns_viomap != NULL);
-    ioport_80 = test_bit(0x80, ns_viomap);
-    ioport_ed = test_bit(0xed, ns_viomap);
-    hvm_unmap_guest_frame(ns_viomap);
+    ns_viomap = hvm_map_guest_frame_ro(svm->ns_iomap_pa >> PAGE_SHIFT, 0);
+    if ( ns_viomap )
+    {
+        ioport_80 = test_bit(0x80, ns_viomap);
+        ioport_ed = test_bit(0xed, ns_viomap);
+        hvm_unmap_guest_frame(ns_viomap, 0);
+    }
 
     svm->ns_iomap = nestedhvm_vcpu_iomap_get(ioport_80, ioport_ed);
 
@@ -846,7 +849,6 @@ nsvm_vmcb_guest_intercepts_msr(unsigned long *msr_bitmap,
         /* MSR not in the permission map: Let the guest handle it. */
         return NESTEDHVM_VMEXIT_INJECT;
 
-    BUG_ON(msr_bit == NULL);
     msr &= 0x1fff;
 
     if (write)
@@ -865,40 +867,45 @@ nsvm_vmcb_guest_intercepts_msr(unsigned long *msr_bitmap,
 static int
 nsvm_vmcb_guest_intercepts_ioio(paddr_t iopm_pa, uint64_t exitinfo1)
 {
-    unsigned long iopm_gfn = iopm_pa >> PAGE_SHIFT;
-    unsigned long *io_bitmap = NULL;
+    unsigned long gfn = iopm_pa >> PAGE_SHIFT;
+    unsigned long *io_bitmap;
     ioio_info_t ioinfo;
     uint16_t port;
+    unsigned int size;
     bool_t enabled;
-    unsigned long gfn = 0; /* gcc ... */
 
     ioinfo.bytes = exitinfo1;
     port = ioinfo.fields.port;
+    size = ioinfo.fields.sz32 ? 4 : ioinfo.fields.sz16 ? 2 : 1;
 
-    switch (port) {
-    case 0 ... 32767: /* first 4KB page */
-        gfn = iopm_gfn;
+    switch ( port )
+    {
+    case 0 ... 8 * PAGE_SIZE - 1: /* first 4KB page */
         break;
-    case 32768 ... 65535: /* second 4KB page */
-        port -= 32768;
-        gfn = iopm_gfn + 1;
+    case 8 * PAGE_SIZE ... 2 * 8 * PAGE_SIZE - 1: /* second 4KB page */
+        port -= 8 * PAGE_SIZE;
+        ++gfn;
         break;
     default:
         BUG();
         break;
     }
 
-    io_bitmap = hvm_map_guest_frame_ro(gfn);
-    if (io_bitmap == NULL) {
-        gdprintk(XENLOG_ERR,
-            "IOIO intercept: mapping of permission map failed\n");
-        return NESTEDHVM_VMEXIT_ERROR;
+    for ( io_bitmap = hvm_map_guest_frame_ro(gfn, 0); ; )
+    {
+        enabled = io_bitmap && test_bit(port, io_bitmap);
+        if ( !enabled || !--size )
+            break;
+        if ( unlikely(++port == 8 * PAGE_SIZE) )
+        {
+            hvm_unmap_guest_frame(io_bitmap, 0);
+            io_bitmap = hvm_map_guest_frame_ro(++gfn, 0);
+            port -= 8 * PAGE_SIZE;
+        }
     }
+    hvm_unmap_guest_frame(io_bitmap, 0);
 
-    enabled = test_bit(port, io_bitmap);
-    hvm_unmap_guest_frame(io_bitmap);
-
-    if (!enabled)
+    if ( !enabled )
         return NESTEDHVM_VMEXIT_HOST;
 
     return NESTEDHVM_VMEXIT_INJECT;
@@ -965,8 +972,8 @@ nsvm_vmcb_guest_intercepts_exitcode(struct vcpu *v,
     switch (exitcode) {
     case VMEXIT_MSR:
         ASSERT(regs != NULL);
-        nestedsvm_vmcb_map(v, nv->nv_vvmcxaddr);
-        ASSERT(nv->nv_vvmcx != NULL);
+        if ( !nestedsvm_vmcb_map(v, nv->nv_vvmcxaddr) )
+            break;
         ns_vmcb = nv->nv_vvmcx;
         vmexits = nsvm_vmcb_guest_intercepts_msr(svm->ns_cached_msrpm,
             regs->ecx, ns_vmcb->exitinfo1 != 0);
@@ -974,8 +981,8 @@ nsvm_vmcb_guest_intercepts_exitcode(struct vcpu *v,
             return 0;
         break;
     case VMEXIT_IOIO:
-        nestedsvm_vmcb_map(v, nv->nv_vvmcxaddr);
-        ASSERT(nv->nv_vvmcx != NULL);
+        if ( !nestedsvm_vmcb_map(v, nv->nv_vvmcxaddr) )
+            break;
         ns_vmcb = nv->nv_vvmcx;
         vmexits = nsvm_vmcb_guest_intercepts_ioio(ns_vmcb->_iopm_base_pa,
             ns_vmcb->exitinfo1);
@@ -1169,6 +1176,36 @@ bool_t
 nsvm_vmcb_hap_enabled(struct vcpu *v)
 {
     return vcpu_nestedsvm(v).ns_hap_enabled;
+}
+
+/* This function uses L2_gpa to walk the P2M page table in L1. If the
+ * walk is successful, the translated value is returned in
+ * L1_gpa. The result value tells what to do next.
+ */
+int
+nsvm_hap_walk_L1_p2m(struct vcpu *v, paddr_t L2_gpa, paddr_t *L1_gpa,
+                     unsigned int *page_order, uint8_t *p2m_acc,
+                     bool_t access_r, bool_t access_w, bool_t access_x)
+{
+    uint32_t pfec;
+    unsigned long nested_cr3, gfn;
+
+    nested_cr3 = nhvm_vcpu_p2m_base(v);
+
+    pfec = PFEC_user_mode | PFEC_page_present;
+    if ( access_w )
+        pfec |= PFEC_write_access;
+    if ( access_x )
+        pfec |= PFEC_insn_fetch;
+
+    /* Walk the guest-supplied NPT table, just as if it were a pagetable */
+    gfn = paging_ga_to_gfn_cr3(v, nested_cr3, L2_gpa, &pfec, page_order);
+
+    if ( gfn == INVALID_GFN )
+        return NESTEDHVM_PAGEFAULT_INJECT;
+
+    *L1_gpa = (gfn << PAGE_SHIFT) + (L2_gpa & ~PAGE_MASK);
+    return NESTEDHVM_PAGEFAULT_DONE;
 }
 
 enum hvm_intblk nsvm_intr_blocked(struct vcpu *v)

@@ -9,6 +9,7 @@
 #include <xen/percpu.h>
 #include <xen/errno.h>
 #include <asm/asm_defns.h>
+#include <asm/cpufeature.h>
 
 #define rdmsr(msr,val1,val2) \
      __asm__ __volatile__("rdmsr" \
@@ -20,7 +21,7 @@
 			    : "=a" (a__), "=d" (b__) \
 			    : "c" (msr)); \
        val = a__ | ((u64)b__<<32); \
-} while(0);
+} while(0)
 
 #define wrmsr(msr,val1,val2) \
      __asm__ __volatile__("wrmsr" \
@@ -77,9 +78,9 @@ static inline int wrmsr_safe(unsigned int msr, uint64_t val)
      __asm__ __volatile__("rdtsc" : "=a" (low) : : "edx")
 
 #define rdtscll(val) do { \
-     unsigned int a,d; \
-     asm volatile("rdtsc" : "=a" (a), "=d" (d)); \
-     (val) = ((unsigned long)a) | (((unsigned long)d)<<32); \
+     unsigned int _eax, _edx; \
+     asm volatile("rdtsc" : "=a" (_eax), "=d" (_edx)); \
+     (val) = ((unsigned long)_eax) | (((unsigned long)_edx)<<32); \
 } while(0)
 
 #define __write_tsc(val) wrmsrl(MSR_IA32_TSC, val)
@@ -97,6 +98,79 @@ static inline int wrmsr_safe(unsigned int msr, uint64_t val)
 			  : "=a" (low), "=d" (high) \
 			  : "c" (counter))
 
+static inline unsigned long __rdfsbase(void)
+{
+    unsigned long base;
+
+#ifdef HAVE_GAS_FSGSBASE
+    asm volatile ( "rdfsbase %0" : "=r" (base) );
+#else
+    asm volatile ( ".byte 0xf3, 0x48, 0x0f, 0xae, 0xc0" : "=a" (base) );
+#endif
+
+    return base;
+}
+
+static inline unsigned long __rdgsbase(void)
+{
+    unsigned long base;
+
+#ifdef HAVE_GAS_FSGSBASE
+    asm volatile ( "rdgsbase %0" : "=r" (base) );
+#else
+    asm volatile ( ".byte 0xf3, 0x48, 0x0f, 0xae, 0xc8" : "=a" (base) );
+#endif
+
+    return base;
+}
+
+static inline unsigned long rdfsbase(void)
+{
+    unsigned long base;
+
+    if ( cpu_has_fsgsbase )
+        return __rdfsbase();
+
+    rdmsrl(MSR_FS_BASE, base);
+
+    return base;
+}
+
+static inline unsigned long rdgsbase(void)
+{
+    unsigned long base;
+
+    if ( cpu_has_fsgsbase )
+        return __rdgsbase();
+
+    rdmsrl(MSR_GS_BASE, base);
+
+    return base;
+}
+
+static inline void wrfsbase(unsigned long base)
+{
+    if ( cpu_has_fsgsbase )
+#ifdef HAVE_GAS_FSGSBASE
+        asm volatile ( "wrfsbase %0" :: "r" (base) );
+#else
+        asm volatile ( ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd0" :: "a" (base) );
+#endif
+    else
+        wrmsrl(MSR_FS_BASE, base);
+}
+
+static inline void wrgsbase(unsigned long base)
+{
+    if ( cpu_has_fsgsbase )
+#ifdef HAVE_GAS_FSGSBASE
+        asm volatile ( "wrgsbase %0" :: "r" (base) );
+#else
+        asm volatile ( ".byte 0xf3, 0x48, 0x0f, 0xae, 0xd8" :: "a" (base) );
+#endif
+    else
+        wrmsrl(MSR_GS_BASE, base);
+}
 
 DECLARE_PER_CPU(u64, efer);
 u64 read_efer(void);

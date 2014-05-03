@@ -28,6 +28,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stdbool.h>
 
 struct xentoollog_logger_stdiostream {
     xentoollog_logger vtable;
@@ -35,6 +36,7 @@ struct xentoollog_logger_stdiostream {
     xentoollog_level min_level;
     unsigned flags;
     int progress_erase_len, progress_last_percent;
+    bool progress_use_cr;
 };
 
 static void progress_erase(xentoollog_logger_stdiostream *lg) {
@@ -81,6 +83,17 @@ static void stdiostream_vmessage(xentoollog_logger *logger_in,
     fflush(lg->f);
 }
 
+static void stdiostream_message(struct xentoollog_logger *logger_in,
+                                xentoollog_level level,
+                                const char *context,
+                                const char *format, ...)
+{
+    va_list al;
+    va_start(al,format);
+    stdiostream_vmessage(logger_in, level, -1, context, format, al);
+    va_end(al);
+}
+
 static void stdiostream_progress(struct xentoollog_logger *logger_in,
                                  const char *context,
                                  const char *doing_what, int percent,
@@ -89,7 +102,7 @@ static void stdiostream_progress(struct xentoollog_logger *logger_in,
     int newpel, extra_erase;
     xentoollog_level this_level;
 
-    if (!(lg->flags & XTL_STDIOSTREAM_HIDE_PROGRESS))
+    if (lg->flags & XTL_STDIOSTREAM_HIDE_PROGRESS)
         return;
 
     if (percent < lg->progress_last_percent) {
@@ -105,10 +118,17 @@ static void stdiostream_progress(struct xentoollog_logger *logger_in,
     if (this_level < lg->min_level)
         return;
 
+    lg->progress_last_percent = percent;
+
+    if (!lg->progress_use_cr) {
+        stdiostream_message(logger_in, this_level, context,
+                            "%s: %lu/%lu  %3d%%",
+                            doing_what, done, total, percent);
+        return;
+    }
+
     if (lg->progress_erase_len)
         putc('\r', lg->f);
-
-    lg->progress_last_percent = percent;
 
     newpel = fprintf(lg->f, "%s%s" "%s: %lu/%lu  %3d%%%s",
                      context?context:"", context?": ":"",
@@ -149,9 +169,22 @@ xentoollog_logger_stdiostream *xtl_createlogger_stdiostream
     newlogger.min_level = min_level;
     newlogger.flags = flags;
 
+    switch (flags & (XTL_STDIOSTREAM_PROGRESS_USE_CR |
+                     XTL_STDIOSTREAM_PROGRESS_NO_CR)) {
+    case XTL_STDIOSTREAM_PROGRESS_USE_CR: newlogger.progress_use_cr = 1; break;
+    case XTL_STDIOSTREAM_PROGRESS_NO_CR:  newlogger.progress_use_cr = 0; break;
+    case 0:
+        newlogger.progress_use_cr = isatty(fileno(newlogger.f)) > 0;
+        break;
+    default:
+        errno = EINVAL;
+        return 0;
+    }
+
     if (newlogger.flags & XTL_STDIOSTREAM_SHOW_DATE) tzset();
 
     newlogger.progress_erase_len = 0;
+    newlogger.progress_last_percent = 0;
 
     return XTL_NEW_LOGGER(stdiostream, newlogger);
 }

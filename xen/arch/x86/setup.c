@@ -25,10 +25,12 @@
 #include <xen/dmi.h>
 #include <xen/pfn.h>
 #include <xen/nodemask.h>
+#include <xen/tmem_xen.h> /* for opt_tmem only */
+#include <xen/watchdog.h>
 #include <public/version.h>
 #include <compat/platform.h>
 #include <compat/xen.h>
-#include <asm/bitops.h>
+#include <xen/bitops.h>
 #include <asm/smp.h>
 #include <asm/processor.h>
 #include <asm/mpspec.h>
@@ -69,10 +71,6 @@ static void parse_acpi_param(char *s);
 custom_param("acpi", parse_acpi_param);
 
 /* **** Linux config option: propagated to domain0. */
-/* acpi_skip_timer_override: Skip IRQ0 overrides. */
-boolean_param("acpi_skip_timer_override", acpi_skip_timer_override);
-
-/* **** Linux config option: propagated to domain0. */
 /* noapic: Disable IOAPIC setup. */
 boolean_param("noapic", skip_ioapic_setup);
 
@@ -80,6 +78,11 @@ boolean_param("noapic", skip_ioapic_setup);
 /* xen_cpuidle: xen control cstate. */
 s8 __read_mostly xen_cpuidle = -1;
 boolean_param("cpuidle", xen_cpuidle);
+
+#ifndef NDEBUG
+unsigned long __initdata highmem_start;
+size_param("highmem-start", highmem_start);
+#endif
 
 cpumask_t __read_mostly cpu_present_map;
 
@@ -93,7 +96,8 @@ char __attribute__ ((__section__(".bss.stack_aligned"))) cpu0_stack[STACK_SIZE];
 
 struct cpuinfo_x86 __read_mostly boot_cpu_data = { 0, 0, 0, 0, -1 };
 
-unsigned long __read_mostly mmu_cr4_features = X86_CR4_PSE | X86_CR4_PGE | X86_CR4_PAE;
+unsigned long __read_mostly mmu_cr4_features =
+    X86_CR4_PSE | X86_CR4_PGE | X86_CR4_PAE;
 
 bool_t __initdata acpi_disabled;
 bool_t __initdata acpi_force;
@@ -178,7 +182,6 @@ static void __init init_idle_domain(void)
     scheduler_init();
     set_current(idle_vcpu[0]);
     this_cpu(curr_vcpu) = current;
-    setup_idle_pagetable();
 }
 
 void __devinit srat_detect_node(int cpu)
@@ -371,15 +374,18 @@ static uint64_t __init consider_modules(
     return e;
 }
 
-static void __init setup_max_pdx(void)
+static void __init setup_max_pdx(unsigned long top_page)
 {
-    max_pdx = pfn_to_pdx(max_page - 1) + 1;
+    max_pdx = pfn_to_pdx(top_page - 1) + 1;
 
     if ( max_pdx > (DIRECTMAP_SIZE >> PAGE_SHIFT) )
         max_pdx = DIRECTMAP_SIZE >> PAGE_SHIFT;
 
-    if ( max_pdx > FRAMETABLE_SIZE / sizeof(*frame_table) )
-        max_pdx = FRAMETABLE_SIZE / sizeof(*frame_table);
+    if ( max_pdx > FRAMETABLE_NR )
+        max_pdx = FRAMETABLE_NR;
+
+    if ( max_pdx >= PAGE_LIST_NULL )
+        max_pdx = PAGE_LIST_NULL - 1;
 
     max_page = pdx_to_pfn(max_pdx - 1) + 1;
 }
@@ -531,16 +537,17 @@ static char * __init cmdline_cook(char *p, char *loader_name)
     return p;
 }
 
-void __init __start_xen(unsigned long mbi_p)
+void __init noreturn __start_xen(unsigned long mbi_p)
 {
     char *memmap_type = NULL;
     char *cmdline, *kextra, *loader;
     unsigned int initrdidx;
     multiboot_info_t *mbi = __va(mbi_p);
     module_t *mod = (module_t *)__va(mbi->mods_addr);
-    unsigned long nr_pages, modules_headroom, *module_map;
+    unsigned long nr_pages, raw_max_page, modules_headroom, *module_map;
     int i, j, e820_warn = 0, bytes = 0;
     bool_t acpi_boot_table_init_done = 0;
+    struct domain *dom0;
     struct ns16550_defaults ns16550 = {
         .data_bits = 8,
         .parity    = 'n',
@@ -742,7 +749,7 @@ void __init __start_xen(unsigned long mbi_p)
     }
 
     /* Sanitise the raw E820 map to produce a final clean version. */
-    max_page = init_e820(memmap_type, e820_raw, &e820_raw_nr);
+    max_page = raw_max_page = init_e820(memmap_type, e820_raw, &e820_raw_nr);
 
     /* Create a temporary copy of the E820 map. */
     memcpy(&boot_e820, &e820, sizeof(e820));
@@ -783,6 +790,14 @@ void __init __start_xen(unsigned long mbi_p)
     modules_headroom = bzimage_headroom(bootstrap_map(mod), mod->mod_end);
     bootstrap_map(NULL);
 
+#ifndef highmem_start
+    /* Don't allow split below 4Gb. */
+    if ( highmem_start < GB(4) )
+        highmem_start = 0;
+    else /* align to L3 entry boundary */
+        highmem_start &= ~((1UL << L3_PAGETABLE_SHIFT) - 1);
+#endif
+
     for ( i = boot_e820.nr_map-1; i >= 0; i-- )
     {
         uint64_t s, e, mask = (1UL << L2_PAGETABLE_SHIFT) - 1;
@@ -803,7 +818,10 @@ void __init __start_xen(unsigned long mbi_p)
                              (end - s) >> PAGE_SHIFT, PAGE_HYPERVISOR);
         }
 
-        e = min_t(uint64_t, e, 1ULL << (PAGE_SHIFT + 32));
+        if ( e > min(HYPERVISOR_VIRT_END - DIRECTMAP_VIRT_START,
+                     1UL << (PAGE_SHIFT + 32)) )
+            e = min(HYPERVISOR_VIRT_END - DIRECTMAP_VIRT_START,
+                    1UL << (PAGE_SHIFT + 32));
 #define reloc_size ((__pa(&_end) + mask) & ~mask)
         /* Is the region suitable for relocating Xen? */
         if ( !xen_phys_start && e <= limit )
@@ -820,8 +838,8 @@ void __init __start_xen(unsigned long mbi_p)
             l4_pgentry_t *pl4e;
             l3_pgentry_t *pl3e;
             l2_pgentry_t *pl2e;
+            uint64_t load_start;
             int i, j, k;
-            void *dst;
 
             /* Select relocation address. */
             e = end - reloc_size;
@@ -834,11 +852,9 @@ void __init __start_xen(unsigned long mbi_p)
              * with a barrier(). After this we must *not* modify static/global
              * data until after we have switched to the relocated pagetables!
              */
+            load_start = (unsigned long)_start - XEN_VIRT_START;
             barrier();
-            dst = move_memory(e, 0, (unsigned long)&_end - XEN_VIRT_START, 1);
-
-            /* Poison low 1MB to detect stray pointers to physical 0-1MB. */
-            memset(dst, 0x55, 1U << 20);
+            move_memory(e + load_start, load_start, _end - _start, 1);
 
             /* Walk initial pagetables, relocating page directory entries. */
             pl4e = __va(__pa(idle_pg_table));
@@ -911,6 +927,9 @@ void __init __start_xen(unsigned long mbi_p)
             /* Don't overlap with other modules. */
             end = consider_modules(s, e, size, mod, mbi->mods_count, j);
 
+            if ( highmem_start && end > highmem_start )
+                continue;
+
             if ( s < end &&
                  (headroom ||
                   ((end - size) >> PAGE_SHIFT) > mod[j].mod_start) )
@@ -951,7 +970,9 @@ void __init __start_xen(unsigned long mbi_p)
     /* Late kexec reservation (dynamic start address). */
     kexec_reserve_area(&boot_e820);
 
-    setup_max_pdx();
+    setup_max_pdx(raw_max_page);
+    if ( highmem_start )
+        xenheap_max_mfn(PFN_DOWN(highmem_start));
 
     /*
      * Walk every RAM region and map it in its entirety (on x86/64, at least)
@@ -975,7 +996,7 @@ void __init __start_xen(unsigned long mbi_p)
         {
             acpi_boot_table_init_done = 1;
             srat_parse_regions(s);
-            setup_max_pdx();
+            setup_max_pdx(raw_max_page);
         }
 
         if ( pfn_to_pdx((e - 1) >> PAGE_SHIFT) >= max_pdx )
@@ -989,9 +1010,17 @@ void __init __start_xen(unsigned long mbi_p)
                     ASSERT(j);
                 }
                 map_e = boot_e820.map[j].addr + boot_e820.map[j].size;
-                if ( (map_e >> PAGE_SHIFT) < max_page )
+                for ( j = 0; j < mbi->mods_count; ++j )
                 {
-                    max_page = map_e >> PAGE_SHIFT;
+                    uint64_t end = pfn_to_paddr(mod[j].mod_start) +
+                                   mod[j].mod_end;
+
+                    if ( map_e < end )
+                        map_e = end;
+                }
+                if ( PFN_UP(map_e) < max_page )
+                {
+                    max_page = PFN_UP(map_e);
                     max_pdx = pfn_to_pdx(max_page - 1) + 1;
                 }
                 printk(XENLOG_WARNING "Ignoring inaccessible memory range"
@@ -1031,9 +1060,23 @@ void __init __start_xen(unsigned long mbi_p)
         /* Create new mappings /before/ passing memory to the allocator. */
         if ( map_e < e )
         {
-            map_pages_to_xen((unsigned long)__va(map_e), map_e >> PAGE_SHIFT,
-                             (e - map_e) >> PAGE_SHIFT, PAGE_HYPERVISOR);
-            init_boot_pages(map_e, e);
+            uint64_t limit = __pa(HYPERVISOR_VIRT_END - 1) + 1;
+            uint64_t end = min(e, limit);
+
+            if ( map_e < end )
+            {
+                map_pages_to_xen((unsigned long)__va(map_e), PFN_DOWN(map_e),
+                                 PFN_DOWN(end - map_e), PAGE_HYPERVISOR);
+                init_boot_pages(map_e, end);
+                map_e = end;
+            }
+        }
+        if ( map_e < e )
+        {
+            /* This range must not be passed to the boot allocator and
+             * must also not be mapped with _PAGE_GLOBAL. */
+            map_pages_to_xen((unsigned long)__va(map_e), PFN_DOWN(map_e),
+                             PFN_DOWN(e - map_e), __PAGE_HYPERVISOR);
         }
         if ( s < map_s )
         {
@@ -1051,9 +1094,18 @@ void __init __start_xen(unsigned long mbi_p)
                          mod[i].mod_start,
                          PFN_UP(mod[i].mod_end), PAGE_HYPERVISOR);
     }
-    map_pages_to_xen((unsigned long)__va(kexec_crash_area.start),
-                     kexec_crash_area.start >> PAGE_SHIFT,
-                     PFN_UP(kexec_crash_area.size), PAGE_HYPERVISOR);
+
+    if ( kexec_crash_area.size )
+    {
+        unsigned long s = PFN_DOWN(kexec_crash_area.start);
+        unsigned long e = min(s + PFN_UP(kexec_crash_area.size),
+                              PFN_UP(__pa(HYPERVISOR_VIRT_END - 1)));
+
+        if ( e > s ) 
+            map_pages_to_xen((unsigned long)__va(kexec_crash_area.start),
+                             s, e - s, PAGE_HYPERVISOR);
+    }
+
     xen_virt_end = ((unsigned long)_end + (1UL << L2_PAGETABLE_SHIFT) - 1) &
                    ~((1UL << L2_PAGETABLE_SHIFT) - 1);
     destroy_xen_mappings(xen_virt_end, XEN_VIRT_START + BOOTSTRAP_MAP_BASE);
@@ -1099,11 +1151,44 @@ void __init __start_xen(unsigned long mbi_p)
 
     acpi_numa_init();
 
-    numa_initmem_init(0, max_page);
+    numa_initmem_init(0, raw_max_page);
 
     end_boot_allocator();
     system_state = SYS_STATE_boot;
 
+    if ( max_page - 1 > virt_to_mfn(HYPERVISOR_VIRT_END - 1) )
+    {
+        unsigned long limit = virt_to_mfn(HYPERVISOR_VIRT_END - 1);
+        uint64_t mask = PAGE_SIZE - 1;
+
+        if ( !highmem_start )
+            xenheap_max_mfn(limit);
+
+        /* Pass the remaining memory to the allocator. */
+        for ( i = 0; i < boot_e820.nr_map; i++ )
+        {
+            uint64_t s, e;
+
+            if ( boot_e820.map[i].type != E820_RAM )
+                continue;
+            s = (boot_e820.map[i].addr + mask) & ~mask;
+            e = (boot_e820.map[i].addr + boot_e820.map[i].size) & ~mask;
+            if ( PFN_DOWN(e) <= limit )
+                continue;
+            if ( PFN_DOWN(s) <= limit )
+                s = pfn_to_paddr(limit + 1);
+            init_domheap_pages(s, e);
+        }
+
+        if ( opt_tmem )
+        {
+           printk(XENLOG_WARNING
+                  "TMEM physical RAM limit exceeded, disabling TMEM\n");
+           opt_tmem = 0;
+        }
+    }
+
+    vm_init();
     vesa_init();
 
     softirq_init();
@@ -1150,6 +1235,9 @@ void __init __start_xen(unsigned long mbi_p)
     /* Low mappings were only needed for some BIOS table parsing. */
     zap_low_mappings();
 
+    mmio_ro_ranges = rangeset_new(NULL, "r/o mmio ranges",
+                                  RANGESETF_prettyprint_hex);
+
     init_apic_mappings();
 
     normalise_cpu_order();
@@ -1164,7 +1252,7 @@ void __init __start_xen(unsigned long mbi_p)
     bitmap_fill(module_map, mbi->mods_count);
     __clear_bit(0, module_map); /* Dom0 kernel is always first */
 
-    xsm_init(module_map, mbi, bootstrap_map);
+    xsm_multiboot_init(module_map, mbi, bootstrap_map);
 
     microcode_grab_module(module_map, mbi, bootstrap_map);
 
@@ -1191,6 +1279,9 @@ void __init __start_xen(unsigned long mbi_p)
         setup_clear_cpu_cap(X86_FEATURE_SMEP);
     if ( cpu_has_smep )
         set_in_cr4(X86_CR4_SMEP);
+
+    if ( cpu_has_fsgsbase )
+        set_in_cr4(X86_CR4_FSGSBASE);
 
     local_irq_enable();
 
@@ -1245,12 +1336,12 @@ void __init __start_xen(unsigned long mbi_p)
         watchdog_setup();
 
     if ( !tboot_protect_mem_regions() )
-        panic("Could not protect TXT memory regions\n");
+        panic("Could not protect TXT memory regions");
 
     /* Create initial domain 0. */
     dom0 = domain_create(0, DOMCRF_s3_integrity, 0);
-    if ( IS_ERR(dom0) || (alloc_dom0_vcpu0() == NULL) )
-        panic("Error creating domain 0\n");
+    if ( IS_ERR(dom0) || (alloc_dom0_vcpu0(dom0) == NULL) )
+        panic("Error creating domain 0");
 
     dom0->is_privileged = 1;
     dom0->target = NULL;
@@ -1271,9 +1362,6 @@ void __init __start_xen(unsigned long mbi_p)
         /* Append any extra parameters. */
         if ( skip_ioapic_setup && !strstr(dom0_cmdline, "noapic") )
             safe_strcat(dom0_cmdline, " noapic");
-        if ( acpi_skip_timer_override &&
-             !strstr(dom0_cmdline, "acpi_skip_timer_override") )
-            safe_strcat(dom0_cmdline, " acpi_skip_timer_override");
         if ( (strlen(acpi_param) == 0) && acpi_disabled )
         {
             printk("ACPI is disabled, notifying Domain 0 (acpi=off)\n");
@@ -1305,12 +1393,14 @@ void __init __start_xen(unsigned long mbi_p)
                         (initrdidx > 0) && (initrdidx < mbi->mods_count)
                         ? mod + initrdidx : NULL,
                         bootstrap_map, cmdline) != 0)
-        panic("Could not set up DOM0 guest OS\n");
+        panic("Could not set up DOM0 guest OS");
 
     /* Scrub RAM that is still free and so may go to an unprivileged domain. */
     scrub_heap_pages();
 
     init_trace_bufs();
+
+    init_constructors();
 
     console_endboot();
 
@@ -1349,7 +1439,7 @@ void arch_get_xen_caps(xen_capabilities_info_t *info)
     }
 }
 
-int __init xen_in_range(unsigned long mfn)
+int __hwdom_init xen_in_range(unsigned long mfn)
 {
     paddr_t start, end;
     int i;
@@ -1357,7 +1447,7 @@ int __init xen_in_range(unsigned long mfn)
     enum { region_s3, region_text, region_bss, nr_regions };
     static struct {
         paddr_t s, e;
-    } xen_regions[nr_regions] __initdata;
+    } xen_regions[nr_regions] __hwdom_initdata;
 
     /* initialize first time */
     if ( !xen_regions[0].s )
@@ -1385,7 +1475,7 @@ int __init xen_in_range(unsigned long mfn)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

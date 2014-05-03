@@ -29,6 +29,7 @@
 #include <xen/perfc.h>
 #include <xen/domain_page.h>
 #include <xen/iocap.h>
+#include <xsm/xsm.h>
 #include <asm/page.h>
 #include <asm/current.h>
 #include <asm/shadow.h>
@@ -591,6 +592,8 @@ _sh_propagate(struct vcpu *v,
     {
         unsigned int type;
 
+        ASSERT(!(sflags & (_PAGE_PAT | _PAGE_PCD | _PAGE_PWT)));
+
         /* compute the PAT index for shadow page entry when VT-d is enabled
          * and device assigned. 
          * 1) direct MMIO: compute the PAT index with gMTRR=UC and gPAT.
@@ -598,18 +601,18 @@ _sh_propagate(struct vcpu *v,
          * 3) if disables snoop control, compute the PAT index with
          *    gMTRR and gPAT.
          */
-        if ( hvm_get_mem_pinned_cacheattr(d, gfn_x(target_gfn), &type) )
+        if ( hvm_get_mem_pinned_cacheattr(d, gfn_x(target_gfn), 0, &type) )
             sflags |= pat_type_2_pte_flags(type);
         else if ( d->arch.hvm_domain.is_in_uc_mode )
             sflags |= pat_type_2_pte_flags(PAT_TYPE_UNCACHABLE);
         else
-            if ( iomem_access_permitted(d, mfn_x(target_mfn), mfn_x(target_mfn) + 1) )
+            if ( iomem_access_permitted(d, mfn_x(target_mfn), mfn_x(target_mfn)) )
             {
                 if ( p2mt == p2m_mmio_direct )
                     sflags |= get_pat_flags(v,
                             gflags,
                             gfn_to_paddr(target_gfn),
-                            ((paddr_t)mfn_x(target_mfn)) << PAGE_SHIFT,
+                            pfn_to_paddr(mfn_x(target_mfn)),
                             MTRR_TYPE_UNCACHABLE); 
                 else if ( iommu_snoop )
                     sflags |= pat_type_2_pte_flags(PAT_TYPE_WRBACK);
@@ -617,7 +620,7 @@ _sh_propagate(struct vcpu *v,
                     sflags |= get_pat_flags(v,
                             gflags,
                             gfn_to_paddr(target_gfn),
-                            ((paddr_t)mfn_x(target_mfn)) << PAGE_SHIFT,
+                            pfn_to_paddr(mfn_x(target_mfn)),
                             NO_HARDCODE_MEM_TYPE);
             }
     }
@@ -691,27 +694,13 @@ _sh_propagate(struct vcpu *v,
                        && (ft == ft_demand_write))
 #endif /* OOS */
                   ) )
-    {
-        if ( shadow_mode_trap_reads(d) )
-        {
-            // if we are trapping both reads & writes, then mark this page
-            // as not present...
-            //
-            sflags &= ~_PAGE_PRESENT;
-        }
-        else
-        {
-            // otherwise, just prevent any writes...
-            //
-            sflags &= ~_PAGE_RW;
-        }
-    }
+        sflags &= ~_PAGE_RW;
 
     // PV guests in 64-bit mode use two different page tables for user vs
     // supervisor permissions, making the guest's _PAGE_USER bit irrelevant.
     // It is always shadowed as present...
     if ( (GUEST_PAGING_LEVELS == 4) && !is_pv_32on64_domain(d) 
-         && !is_hvm_domain(d) )
+         && is_pv_domain(d) )
     {
         sflags |= _PAGE_USER;
     }
@@ -815,7 +804,6 @@ shadow_write_entries(void *d, void *s, int entries, mfn_t mfn)
     {
         perfc_incr(shadow_linear_map_failed);
         map = sh_map_domain_page(mfn);
-        ASSERT(map != NULL);
         dst = map + ((unsigned long)dst & (PAGE_SIZE - 1));
     }
 
@@ -849,14 +837,16 @@ shadow_get_page_from_l1e(shadow_l1e_t sl1e, struct domain *d, p2m_type_t type)
          !shadow_mode_translate(d) &&
          mfn_valid(mfn = shadow_l1e_get_mfn(sl1e)) &&
          (owner = page_get_owner(mfn_to_page(mfn))) &&
-         (d != owner) &&
-         IS_PRIV_FOR(d, owner))
+         (d != owner) )
     {
-        res = get_page_from_l1e(sl1e, d, owner);
-        SHADOW_PRINTK("privileged domain %d installs map of mfn %05lx "
-                       "which is owned by domain %d: %s\n",
-                       d->domain_id, mfn_x(mfn), owner->domain_id,
-                       res >= 0 ? "success" : "failed");
+        res = xsm_priv_mapping(XSM_TARGET, d, owner);
+        if ( !res ) {
+            res = get_page_from_l1e(sl1e, d, owner);
+            SHADOW_PRINTK("privileged domain %d installs map of mfn %05lx "
+                           "which is owned by domain %d: %s\n",
+                           d->domain_id, mfn_x(mfn), owner->domain_id,
+                           res >= 0 ? "success" : "failed");
+        }
     }
 
     /* Okay, it might still be a grant mapping PTE.  Try it. */
@@ -1302,26 +1292,23 @@ do {                                                                    \
 
 #if GUEST_PAGING_LEVELS == 2
 
-/* 32-bit l2 on PAE/64: four pages, touch every second entry, and avoid Xen */
+/* 32-bit l2 on PAE/64: four pages, touch every second entry */
 #define SHADOW_FOREACH_L2E(_sl2mfn, _sl2e, _gl2p, _done, _dom, _code)     \
 do {                                                                      \
     int _i, _j, __done = 0;                                               \
-    int _xen = !shadow_mode_external(_dom);                               \
-    ASSERT(mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2_32_shadow);\
+    ASSERT(shadow_mode_external(_dom));                                   \
+    ASSERT(mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2_32_shadow);      \
     for ( _j = 0; _j < 4 && !__done; _j++ )                               \
     {                                                                     \
         shadow_l2e_t *_sp = sh_map_domain_page(_sl2mfn);                  \
         for ( _i = 0; _i < SHADOW_L2_PAGETABLE_ENTRIES; _i += 2 )         \
-            if ( (!(_xen))                                                \
-                 || ((_j * SHADOW_L2_PAGETABLE_ENTRIES) + _i)             \
-                 < (HYPERVISOR_VIRT_START >> SHADOW_L2_PAGETABLE_SHIFT) ) \
-            {                                                             \
-                (_sl2e) = _sp + _i;                                       \
-                if ( shadow_l2e_get_flags(*(_sl2e)) & _PAGE_PRESENT )     \
-                    {_code}                                               \
-                if ( (__done = (_done)) ) break;                          \
-                increment_ptr_to_guest_entry(_gl2p);                      \
-            }                                                             \
+        {                                                                 \
+            (_sl2e) = _sp + _i;                                           \
+            if ( shadow_l2e_get_flags(*(_sl2e)) & _PAGE_PRESENT )         \
+                {_code}                                                   \
+            if ( (__done = (_done)) ) break;                              \
+            increment_ptr_to_guest_entry(_gl2p);                          \
+        }                                                                 \
         sh_unmap_domain_page(_sp);                                        \
         if ( _j < 3 ) _sl2mfn = sh_next_page(_sl2mfn);                    \
     }                                                                     \
@@ -1329,26 +1316,22 @@ do {                                                                      \
 
 #elif GUEST_PAGING_LEVELS == 3
 
-/* PAE: if it's an l2h, don't touch Xen mappings */
+/* PAE: touch all entries */
 #define SHADOW_FOREACH_L2E(_sl2mfn, _sl2e, _gl2p, _done, _dom, _code)      \
 do {                                                                       \
     int _i;                                                                \
-    int _xen = !shadow_mode_external(_dom);                                \
     shadow_l2e_t *_sp = sh_map_domain_page((_sl2mfn));                     \
-    ASSERT(mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2_pae_shadow \
-           || mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2h_pae_shadow);\
+    ASSERT(shadow_mode_external(_dom));                                    \
+    ASSERT(mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2_pae_shadow        \
+           || mfn_to_page(_sl2mfn)->u.sh.type == SH_type_l2h_pae_shadow);  \
     for ( _i = 0; _i < SHADOW_L2_PAGETABLE_ENTRIES; _i++ )                 \
-        if ( (!(_xen))                                                     \
-             || mfn_to_page(_sl2mfn)->u.sh.type != SH_type_l2h_pae_shadow\
-             || ((_i + (3 * SHADOW_L2_PAGETABLE_ENTRIES))                  \
-                 < (HYPERVISOR_VIRT_START >> SHADOW_L2_PAGETABLE_SHIFT)) ) \
-        {                                                                  \
-            (_sl2e) = _sp + _i;                                            \
-            if ( shadow_l2e_get_flags(*(_sl2e)) & _PAGE_PRESENT )          \
-                {_code}                                                    \
-            if ( _done ) break;                                            \
-            increment_ptr_to_guest_entry(_gl2p);                           \
-        }                                                                  \
+    {                                                                      \
+        (_sl2e) = _sp + _i;                                                \
+        if ( shadow_l2e_get_flags(*(_sl2e)) & _PAGE_PRESENT )              \
+            {_code}                                                        \
+        if ( _done ) break;                                                \
+        increment_ptr_to_guest_entry(_gl2p);                               \
+    }                                                                      \
     sh_unmap_domain_page(_sp);                                             \
 } while (0)
 
@@ -1437,19 +1420,22 @@ void sh_install_xen_entries_in_l4(struct vcpu *v, mfn_t gl4mfn, mfn_t sl4mfn)
 {
     struct domain *d = v->domain;
     shadow_l4e_t *sl4e;
+    unsigned int slots;
 
     sl4e = sh_map_domain_page(sl4mfn);
-    ASSERT(sl4e != NULL);
-    ASSERT(sizeof (l4_pgentry_t) == sizeof (shadow_l4e_t));
+    BUILD_BUG_ON(sizeof (l4_pgentry_t) != sizeof (shadow_l4e_t));
     
     /* Copy the common Xen mappings from the idle domain */
+    slots = (shadow_mode_external(d)
+             ? ROOT_PAGETABLE_XEN_SLOTS
+             : ROOT_PAGETABLE_PV_XEN_SLOTS);
     memcpy(&sl4e[ROOT_PAGETABLE_FIRST_XEN_SLOT],
            &idle_pg_table[ROOT_PAGETABLE_FIRST_XEN_SLOT],
-           ROOT_PAGETABLE_XEN_SLOTS * sizeof(l4_pgentry_t));
+           slots * sizeof(l4_pgentry_t));
 
     /* Install the per-domain mappings for this domain */
     sl4e[shadow_l4_table_offset(PERDOMAIN_VIRT_START)] =
-        shadow_l4e_from_mfn(page_to_mfn(virt_to_page(d->arch.mm_perdomain_l3)),
+        shadow_l4e_from_mfn(page_to_mfn(d->arch.perdomain_l3_pg),
                             __PAGE_HYPERVISOR);
 
     /* Shadow linear mapping for 4-level shadows.  N.B. for 3-level
@@ -1490,8 +1476,7 @@ static void sh_install_xen_entries_in_l2h(struct vcpu *v, mfn_t sl2hmfn)
         return;
 
     sl2e = sh_map_domain_page(sl2hmfn);
-    ASSERT(sl2e != NULL);
-    ASSERT(sizeof (l2_pgentry_t) == sizeof (shadow_l2e_t));
+    BUILD_BUG_ON(sizeof (l2_pgentry_t) != sizeof (shadow_l2e_t));
 
     /* Copy the common Xen mappings from the idle domain */
     memcpy(
@@ -2712,13 +2697,13 @@ static inline void trace_shadow_fixup(guest_l1e_t gl1e,
 {
     if ( tb_init_done )
     {
-        struct {
+        struct __packed {
             /* for PAE, guest_l1e may be 64 while guest_va may be 32;
                so put it first for alignment sake. */
             guest_l1e_t gl1e;
             guest_va_t va;
             u32 flags;
-        } __attribute__((packed)) d;
+        } d;
         u32 event;
 
         event = TRC_SHADOW_FIXUP | ((GUEST_PAGING_LEVELS-2)<<8);
@@ -2736,13 +2721,13 @@ static inline void trace_not_shadow_fault(guest_l1e_t gl1e,
 {
     if ( tb_init_done )
     {
-        struct {
+        struct __packed {
             /* for PAE, guest_l1e may be 64 while guest_va may be 32;
                so put it first for alignment sake. */
             guest_l1e_t gl1e;
             guest_va_t va;
             u32 flags;
-        } __attribute__((packed)) d;
+        } d;
         u32 event;
 
         event = TRC_SHADOW_NOT_SHADOW | ((GUEST_PAGING_LEVELS-2)<<8);
@@ -2761,7 +2746,7 @@ static inline void trace_shadow_emulate_other(u32 event,
 {
     if ( tb_init_done )
     {
-        struct {
+        struct __packed {
             /* for PAE, guest_l1e may be 64 while guest_va may be 32;
                so put it first for alignment sake. */
 #if GUEST_PAGING_LEVELS == 2
@@ -2770,7 +2755,7 @@ static inline void trace_shadow_emulate_other(u32 event,
             u64 gfn;
 #endif
             guest_va_t va;
-        } __attribute__((packed)) d;
+        } d;
 
         event |= ((GUEST_PAGING_LEVELS-2)<<8);
 
@@ -2791,13 +2776,13 @@ static inline void trace_shadow_emulate(guest_l1e_t gl1e, unsigned long va)
 {
     if ( tb_init_done )
     {
-        struct {
+        struct __packed {
             /* for PAE, guest_l1e may be 64 while guest_va may be 32;
                so put it first for alignment sake. */
             guest_l1e_t gl1e, write_val;
             guest_va_t va;
             unsigned flags:29, emulation_count:3;
-        } __attribute__((packed)) d;
+        } d;
         u32 event;
 
         event = TRC_SHADOW_EMULATE | ((GUEST_PAGING_LEVELS-2)<<8);
@@ -3181,18 +3166,10 @@ static int sh_page_fault(struct vcpu *v,
          && !(mfn_is_out_of_sync(gmfn)
               && !(regs->error_code & PFEC_user_mode))
 #endif
-         )
+         && (ft == ft_demand_write) )
     {
-        if ( ft == ft_demand_write )
-        {
-            perfc_incr(shadow_fault_emulate_write);
-            goto emulate;
-        }
-        else if ( shadow_mode_trap_reads(d) && ft == ft_demand_read )
-        {
-            perfc_incr(shadow_fault_emulate_read);
-            goto emulate;
-        }
+        perfc_incr(shadow_fault_emulate_write);
+        goto emulate;
     }
 
     /* Need to hand off device-model MMIO to the device model */
@@ -3505,7 +3482,7 @@ sh_invlpg(struct vcpu *v, unsigned long va)
             perfc_incr(shadow_invlpg_fault);
             return 0;
         }
-        if ( (!shadow_l3e_get_flags(sl3e) & _PAGE_PRESENT) )
+        if ( !(shadow_l3e_get_flags(sl3e) & _PAGE_PRESENT) )
             return 0;
     }
 #else /* SHADOW_PAGING_LEVELS == 3 */
@@ -3922,7 +3899,7 @@ sh_update_cr3(struct vcpu *v, int do_locking)
 #endif
 
     /* Don't do anything on an uninitialised vcpu */
-    if ( !is_hvm_domain(d) && !v->is_initialised )
+    if ( is_pv_domain(d) && !v->is_initialised )
     {
         ASSERT(v->arch.cr3 == 0);
         return;
@@ -4478,8 +4455,12 @@ static void sh_pagetable_dying(struct vcpu *v, paddr_t gpa)
         unsigned long gfn;
         mfn_t smfn, gmfn;
 
-        if ( fast_path )
-            smfn = _mfn(pagetable_get_pfn(v->arch.shadow_table[i]));
+        if ( fast_path ) {
+            if ( pagetable_is_null(v->arch.shadow_table[i]) )
+                smfn = _mfn(INVALID_MFN);
+            else
+                smfn = _mfn(pagetable_get_pfn(v->arch.shadow_table[i]));
+        }
         else
         {
             /* retrieving the l2s */
@@ -4560,6 +4541,7 @@ static mfn_t emulate_gva_to_mfn(struct vcpu *v,
                                 struct sh_emulate_ctxt *sh_ctxt)
 {
     unsigned long gfn;
+    struct page_info *page;
     mfn_t mfn;
     p2m_type_t p2mt;
     uint32_t pfec = PFEC_page_present | PFEC_write_access;
@@ -4577,22 +4559,31 @@ static mfn_t emulate_gva_to_mfn(struct vcpu *v,
 
     /* Translate the GFN to an MFN */
     ASSERT(!paging_locked_by_me(v->domain));
-    mfn = get_gfn(v->domain, _gfn(gfn), &p2mt);
-        
+
+    page = get_page_from_gfn(v->domain, gfn, &p2mt, P2M_ALLOC);
+
+    /* Sanity checking */
+    if ( page == NULL )
+    {
+        return _mfn(BAD_GFN_TO_MFN);
+    }
     if ( p2m_is_readonly(p2mt) )
     {
-        put_gfn(v->domain, gfn);
+        put_page(page);
         return _mfn(READONLY_GFN);
     }
     if ( !p2m_is_ram(p2mt) )
     {
-        put_gfn(v->domain, gfn);
+        put_page(page);
         return _mfn(BAD_GFN_TO_MFN);
     }
-
+    mfn = page_to_mfn(page);
     ASSERT(mfn_valid(mfn));
+
     v->arch.paging.last_write_was_pt = !!sh_mfn_is_a_page_table(mfn);
-    put_gfn(v->domain, gfn);
+    /* Note shadow cannot page out or unshare this mfn, so the map won't
+     * disappear. Otherwise, caller must hold onto page until done. */
+    put_page(page);
     return mfn;
 }
 
@@ -4607,7 +4598,6 @@ static void *emulate_map_dest(struct vcpu *v,
                               u32 bytes,
                               struct sh_emulate_ctxt *sh_ctxt)
 {
-    unsigned long offset;
     void *map = NULL;
 
     sh_ctxt->mfn1 = emulate_gva_to_mfn(v, vaddr, sh_ctxt);
@@ -4639,6 +4629,8 @@ static void *emulate_map_dest(struct vcpu *v,
     }
     else 
     {
+        unsigned long mfns[2];
+
         /* Cross-page emulated writes are only supported for HVM guests; 
          * PV guests ought to know better */
         if ( !is_hvm_vcpu(v) )
@@ -4656,17 +4648,11 @@ static void *emulate_map_dest(struct vcpu *v,
         /* Cross-page writes mean probably not a pagetable */
         sh_remove_shadows(v, sh_ctxt->mfn2, 0, 0 /* Slow, can fail */ );
         
-        /* Hack: we map the pages into the vcpu's LDT space, since we
-         * know that we're not going to need the LDT for HVM guests, 
-         * and only HVM guests are allowed unaligned writes. */
-        ASSERT(is_hvm_vcpu(v));
-        map = (void *)LDT_VIRT_START(v);
-        offset = l1_linear_offset((unsigned long) map);
-        l1e_write(&__linear_l1_table[offset],
-                  l1e_from_pfn(mfn_x(sh_ctxt->mfn1), __PAGE_HYPERVISOR));
-        l1e_write(&__linear_l1_table[offset + 1],
-                  l1e_from_pfn(mfn_x(sh_ctxt->mfn2), __PAGE_HYPERVISOR));
-        flush_tlb_local();
+        mfns[0] = mfn_x(sh_ctxt->mfn1);
+        mfns[1] = mfn_x(sh_ctxt->mfn2);
+        map = vmap(mfns, 2);
+        if ( !map )
+            return MAPPING_UNHANDLEABLE;
         map += (vaddr & ~PAGE_MASK);
     }
 
@@ -4744,14 +4730,8 @@ static void emulate_unmap_dest(struct vcpu *v,
 
     if ( unlikely(mfn_valid(sh_ctxt->mfn2)) )
     {
-        unsigned long offset;
         paging_mark_dirty(v->domain, mfn_x(sh_ctxt->mfn2));
-        /* Undo the hacky two-frame contiguous map. */
-        ASSERT(((unsigned long) addr & PAGE_MASK) == LDT_VIRT_START(v));
-        offset = l1_linear_offset((unsigned long) addr);
-        l1e_write(&__linear_l1_table[offset], l1e_empty());
-        l1e_write(&__linear_l1_table[offset + 1], l1e_empty());
-        flush_tlb_all();
+        vunmap((void *)((unsigned long)addr & PAGE_MASK));
     }
     else 
         sh_unmap_domain_page(addr);
@@ -5176,7 +5156,7 @@ const struct paging_mode sh_paging_mode = {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End: 

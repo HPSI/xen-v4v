@@ -12,18 +12,19 @@
 #include <xen/sched.h>
 #include <asm/byteorder.h>
 #include <asm/setup.h>
+#include <xen/libfdt/libfdt.h>
 
 #include "kernel.h"
 
-/* Store kernel in first 8M of flash */
-#define KERNEL_FLASH_ADDRESS 0x00000000UL
-#define KERNEL_FLASH_SIZE    0x00800000UL
+#define ZIMAGE32_MAGIC_OFFSET 0x24
+#define ZIMAGE32_START_OFFSET 0x28
+#define ZIMAGE32_END_OFFSET   0x2c
+#define ZIMAGE32_HEADER_LEN   0x30
 
-#define ZIMAGE_MAGIC_OFFSET 0x24
-#define ZIMAGE_START_OFFSET 0x28
-#define ZIMAGE_END_OFFSET   0x2c
+#define ZIMAGE32_MAGIC 0x016f2818
 
-#define ZIMAGE_MAGIC 0x016f2818
+#define ZIMAGE64_MAGIC_V0 0x14000008
+#define ZIMAGE64_MAGIC_V1 0x644d5241 /* "ARM\x64" */
 
 struct minimal_dtb_header {
     uint32_t magic;
@@ -39,7 +40,7 @@ struct minimal_dtb_header {
  * @paddr: source physical address
  * @len: length to copy
  */
-void copy_from_paddr(void *dst, paddr_t paddr, unsigned long len, int attrindx)
+void copy_from_paddr(void *dst, paddr_t paddr, unsigned long len)
 {
     void *src = (void *)FIXMAP_ADDR(FIXMAP_MISC);
 
@@ -51,8 +52,9 @@ void copy_from_paddr(void *dst, paddr_t paddr, unsigned long len, int attrindx)
         s = paddr & (PAGE_SIZE-1);
         l = min(PAGE_SIZE - s, len);
 
-        set_fixmap(FIXMAP_MISC, p, attrindx);
+        set_fixmap(FIXMAP_MISC, p, BUFFERABLE);
         memcpy(dst, src + s, l);
+        clean_xen_dcache_va_range(dst, l);
 
         paddr += l;
         dst += l;
@@ -62,123 +64,336 @@ void copy_from_paddr(void *dst, paddr_t paddr, unsigned long len, int attrindx)
     clear_fixmap(FIXMAP_MISC);
 }
 
-static void kernel_zimage_load(struct kernel_info *info)
+static void place_modules(struct kernel_info *info,
+                          paddr_t kernbase, paddr_t kernend)
 {
-    paddr_t load_addr = info->zimage.load_addr;
-    paddr_t len = info->zimage.len;
-    paddr_t flash = KERNEL_FLASH_ADDRESS;
-    void *src = (void *)FIXMAP_ADDR(FIXMAP_MISC);
-    unsigned long offs;
+    /* Align DTB and initrd size to 2Mb. Linux only requires 4 byte alignment */
+    const paddr_t initrd_len =
+        ROUNDUP(early_info.modules.module[MOD_INITRD].size, MB(2));
+    const paddr_t dtb_len = ROUNDUP(fdt_totalsize(info->fdt), MB(2));
+    const paddr_t modsize = initrd_len + dtb_len;
 
-    printk("Loading %"PRIpaddr" byte zImage from flash %"PRIpaddr" to %"PRIpaddr"-%"PRIpaddr": [",
-           len, flash, load_addr, load_addr + len);
-    for ( offs = 0; offs < len; offs += PAGE_SIZE )
+    /* Convenient */
+    const paddr_t rambase = info->mem.bank[0].start;
+    const paddr_t ramsize = info->mem.bank[0].size;
+    const paddr_t ramend = rambase + ramsize;
+    const paddr_t kernsize = ROUNDUP(kernend, MB(2)) - kernbase;
+    const paddr_t ram128mb = rambase + MB(128);
+
+    paddr_t modbase;
+
+    if ( modsize + kernsize > ramsize )
+        panic("Not enough memory in the first bank for the kernel+dtb+initrd");
+
+    /*
+     * DTB must be loaded such that it does not conflict with the
+     * kernel decompressor. For 32-bit Linux Documentation/arm/Booting
+     * recommends just after the 128MB boundary while for 64-bit Linux
+     * the recommendation in Documentation/arm64/booting.txt is below
+     * 512MB.
+     *
+     * If the bootloader provides an initrd, it will be loaded just
+     * after the DTB.
+     *
+     * We try to place dtb+initrd at 128MB or if we have less RAM
+     * as high as possible. If there is no space then fallback to
+     * just before the kernel.
+     *
+     * If changing this then consider
+     * tools/libxc/xc_dom_arm.c:arch_setup_meminit as well.
+     */
+    if ( ramend >= ram128mb + modsize && kernend < ram128mb )
+        modbase = ram128mb;
+    else if ( ramend - modsize > ROUNDUP(kernend, MB(2)) )
+        modbase = ramend - modsize;
+    else if ( kernbase - rambase > modsize )
+        modbase = kernbase - modsize;
+    else
     {
-        paddr_t ma = gvirt_to_maddr(load_addr + offs);
-        void *dst = map_domain_page(ma>>PAGE_SHIFT);
-
-        if ( ( offs % (1<<20) ) == 0 )
-            printk(".");
-
-        set_fixmap(FIXMAP_MISC, (flash+offs) >> PAGE_SHIFT, DEV_SHARED);
-        memcpy(dst, src, PAGE_SIZE);
-        clear_fixmap(FIXMAP_MISC);
-
-        unmap_domain_page(dst);
+        panic("Unable to find suitable location for dtb+initrd");
+        return;
     }
-    printk("]\n");
+
+    info->dtb_paddr = modbase;
+    info->initrd_paddr = info->dtb_paddr + dtb_len;
 }
 
-/**
- * Check the image is a zImage and return the load address and length
- */
-static int kernel_try_zimage_prepare(struct kernel_info *info)
+static paddr_t kernel_zimage_place(struct kernel_info *info)
 {
-    uint32_t *zimage = (void *)FIXMAP_ADDR(FIXMAP_MISC);
+    paddr_t load_addr;
+
+#ifdef CONFIG_ARM_64
+    if ( info->type == DOMAIN_64BIT )
+        return info->mem.bank[0].start + info->zimage.text_offset;
+#endif
+
+    /*
+     * If start is zero, the zImage is position independent, in this
+     * case Documentation/arm/Booting recommends loading below 128MiB
+     * and above 32MiB. Load it as high as possible within these
+     * constraints, while also avoiding the DTB.
+     */
+    if ( info->zimage.start == 0 )
+    {
+        paddr_t load_end;
+
+        load_end = info->mem.bank[0].start + info->mem.bank[0].size;
+        load_end = MIN(info->mem.bank[0].start + MB(128), load_end);
+
+        load_addr = load_end - info->zimage.len;
+        /* Align to 2MB */
+        load_addr &= ~((2 << 20) - 1);
+    }
+    else
+        load_addr = info->zimage.start;
+
+    return load_addr;
+}
+
+static void kernel_zimage_load(struct kernel_info *info)
+{
+    paddr_t load_addr = kernel_zimage_place(info);
+    paddr_t paddr = info->zimage.kernel_addr;
+    paddr_t len = info->zimage.len;
+    unsigned long offs;
+
+    info->entry = load_addr;
+
+    place_modules(info, load_addr, load_addr + len);
+
+    printk("Loading zImage from %"PRIpaddr" to %"PRIpaddr"-%"PRIpaddr"\n",
+           paddr, load_addr, load_addr + len);
+    for ( offs = 0; offs < len; )
+    {
+        int rc;
+        paddr_t s, l, ma;
+        void *dst;
+
+        s = offs & ~PAGE_MASK;
+        l = min(PAGE_SIZE - s, len);
+
+        rc = gvirt_to_maddr(load_addr + offs, &ma);
+        if ( rc )
+        {
+            panic("Unable to map translate guest address");
+            return;
+        }
+
+        dst = map_domain_page(ma>>PAGE_SHIFT);
+
+        copy_from_paddr(dst + s, paddr + offs, l);
+
+        unmap_domain_page(dst);
+        offs += l;
+    }
+}
+
+#ifdef CONFIG_ARM_64
+/*
+ * Check if the image is a 64-bit Image.
+ */
+static int kernel_zimage64_probe(struct kernel_info *info,
+                                 paddr_t addr, paddr_t size)
+{
+    /* linux/Documentation/arm64/booting.txt */
+    struct {
+        uint32_t magic0;
+        uint32_t res0;
+        uint64_t text_offset;  /* Image load offset */
+        uint64_t res1;
+        uint64_t res2;
+        /* zImage V1 only from here */
+        uint64_t res3;
+        uint64_t res4;
+        uint64_t res5;
+        uint32_t magic1;
+        uint32_t res6;
+    } zimage;
+    uint64_t start, end;
+
+    if ( size < sizeof(zimage) )
+        return -EINVAL;
+
+    copy_from_paddr(&zimage, addr, sizeof(zimage));
+
+    if ( zimage.magic0 != ZIMAGE64_MAGIC_V0 &&
+         zimage.magic1 != ZIMAGE64_MAGIC_V1 )
+        return -EINVAL;
+
+    /* Currently there is no length in the header, so just use the size */
+    start = 0;
+    end = size;
+
+    /*
+     * Given the above this check is a bit pointless, but leave it
+     * here in case someone adds a length field in the future.
+     */
+    if ( (end - start) > size )
+        return -EINVAL;
+
+    info->zimage.kernel_addr = addr;
+    info->zimage.len = end - start;
+    info->zimage.text_offset = zimage.text_offset;
+
+    info->load = kernel_zimage_load;
+
+    info->type = DOMAIN_64BIT;
+
+    return 0;
+}
+#endif
+
+/*
+ * Check if the image is a 32-bit zImage and setup kernel_info
+ */
+static int kernel_zimage32_probe(struct kernel_info *info,
+                                 paddr_t addr, paddr_t size)
+{
+    uint32_t zimage[ZIMAGE32_HEADER_LEN/4];
     uint32_t start, end;
     struct minimal_dtb_header dtb_hdr;
 
-    set_fixmap(FIXMAP_MISC, KERNEL_FLASH_ADDRESS >> PAGE_SHIFT, DEV_SHARED);
-
-    if (zimage[ZIMAGE_MAGIC_OFFSET/4] != ZIMAGE_MAGIC)
+    if ( size < ZIMAGE32_HEADER_LEN )
         return -EINVAL;
 
-    start = zimage[ZIMAGE_START_OFFSET/4];
-    end = zimage[ZIMAGE_END_OFFSET/4];
+    copy_from_paddr(zimage, addr, sizeof(zimage));
 
-    clear_fixmap(FIXMAP_MISC);
+    if (zimage[ZIMAGE32_MAGIC_OFFSET/4] != ZIMAGE32_MAGIC)
+        return -EINVAL;
+
+    start = zimage[ZIMAGE32_START_OFFSET/4];
+    end = zimage[ZIMAGE32_END_OFFSET/4];
+
+    if ( (end - start) > size )
+        return -EINVAL;
 
     /*
      * Check for an appended DTB.
      */
-    copy_from_paddr(&dtb_hdr, KERNEL_FLASH_ADDRESS + end - start, sizeof(dtb_hdr), DEV_SHARED);
-    if (be32_to_cpu(dtb_hdr.magic) == DTB_MAGIC) {
-        end += be32_to_cpu(dtb_hdr.total_size);
+    if ( addr + end - start + sizeof(dtb_hdr) <= size )
+    {
+        copy_from_paddr(&dtb_hdr, addr + end - start, sizeof(dtb_hdr));
+        if (be32_to_cpu(dtb_hdr.magic) == DTB_MAGIC) {
+            end += be32_to_cpu(dtb_hdr.total_size);
+
+            if ( end > addr + size )
+                return -EINVAL;
+        }
     }
 
-    /*
-     * If start is zero, the zImage is position independent -- load it
-     * at 32k from start of RAM.
-     */
-    if (start == 0)
-        info->zimage.load_addr = info->mem.bank[0].start + 0x8000;
-    else
-        info->zimage.load_addr = start;
+    info->zimage.kernel_addr = addr;
+
+    info->zimage.start = start;
     info->zimage.len = end - start;
 
-    info->entry = info->zimage.load_addr;
     info->load = kernel_zimage_load;
+
+#ifdef CONFIG_ARM_64
+    info->type = DOMAIN_32BIT;
+#endif
 
     return 0;
 }
 
 static void kernel_elf_load(struct kernel_info *info)
 {
-    printk("Loading ELF image into guest memory\n");
-    info->elf.elf.dest = (void*)(unsigned long)info->elf.parms.virt_kstart;
-    elf_load_binary(&info->elf.elf);
-
-    printk("Free temporary kernel buffer\n");
-    free_xenheap_pages(info->kernel_img, info->kernel_order);
-}
-
-static int kernel_try_elf_prepare(struct kernel_info *info)
-{
-    int rc;
-
-    info->kernel_order = get_order_from_bytes(KERNEL_FLASH_SIZE);
-    info->kernel_img = alloc_xenheap_pages(info->kernel_order, 0);
-    if ( info->kernel_img == NULL )
-        panic("Cannot allocate temporary buffer for kernel.\n");
-
-    copy_from_paddr(info->kernel_img, KERNEL_FLASH_ADDRESS, KERNEL_FLASH_SIZE, DEV_SHARED);
-
-    if ( (rc = elf_init(&info->elf.elf, info->kernel_img, KERNEL_FLASH_SIZE )) != 0 )
-        return rc;
-#ifdef VERBOSE
-    elf_set_verbose(&info->elf.elf);
-#endif
-    elf_parse_binary(&info->elf.elf);
-    if ( (rc = elf_xen_parse(&info->elf.elf, &info->elf.parms)) != 0 )
-        return rc;
-
     /*
      * TODO: can the ELF header be used to find the physical address
      * to load the image to?  Instead of assuming virt == phys.
      */
     info->entry = info->elf.parms.virt_entry;
-    info->load = kernel_elf_load;
 
-    return 0;
+    place_modules(info,
+                  info->elf.parms.virt_kstart,
+                  info->elf.parms.virt_kend);
+
+    printk("Loading ELF image into guest memory\n");
+    info->elf.elf.dest_base = (void*)(unsigned long)info->elf.parms.virt_kstart;
+    info->elf.elf.dest_size =
+         info->elf.parms.virt_kend - info->elf.parms.virt_kstart;
+
+    elf_load_binary(&info->elf.elf);
+
+    printk("Free temporary kernel buffer\n");
+    free_xenheap_pages(info->elf.kernel_img, info->elf.kernel_order);
 }
 
-int kernel_prepare(struct kernel_info *info)
+static int kernel_elf_probe(struct kernel_info *info,
+                            paddr_t addr, paddr_t size)
 {
     int rc;
 
-    rc = kernel_try_zimage_prepare(info);
+    memset(&info->elf.elf, 0, sizeof(info->elf.elf));
+
+    info->elf.kernel_order = get_order_from_bytes(size);
+    info->elf.kernel_img = alloc_xenheap_pages(info->elf.kernel_order, 0);
+    if ( info->elf.kernel_img == NULL )
+        panic("Cannot allocate temporary buffer for kernel");
+
+    copy_from_paddr(info->elf.kernel_img, addr, size);
+
+    if ( (rc = elf_init(&info->elf.elf, info->elf.kernel_img, size )) != 0 )
+        goto err;
+#ifdef VERBOSE
+    elf_set_verbose(&info->elf.elf);
+#endif
+    elf_parse_binary(&info->elf.elf);
+    if ( (rc = elf_xen_parse(&info->elf.elf, &info->elf.parms)) != 0 )
+        goto err;
+
+#ifdef CONFIG_ARM_64
+    if ( elf_32bit(&info->elf.elf) )
+        info->type = DOMAIN_32BIT;
+    else if ( elf_64bit(&info->elf.elf) )
+        info->type = DOMAIN_64BIT;
+    else
+    {
+        printk("Unknown ELF class\n");
+        rc = -EINVAL;
+        goto err;
+    }
+#endif
+
+    info->load = kernel_elf_load;
+
+    if ( elf_check_broken(&info->elf.elf) )
+        printk("Xen: warning: ELF kernel broken: %s\n",
+               elf_check_broken(&info->elf.elf));
+
+    return 0;
+err:
+    if ( elf_check_broken(&info->elf.elf) )
+        printk("Xen: ELF kernel broken: %s\n",
+               elf_check_broken(&info->elf.elf));
+
+    free_xenheap_pages(info->elf.kernel_img, info->elf.kernel_order);
+    return rc;
+}
+
+int kernel_probe(struct kernel_info *info)
+{
+    int rc;
+
+    paddr_t start, size;
+
+    start = early_info.modules.module[MOD_KERNEL].start;
+    size = early_info.modules.module[MOD_KERNEL].size;
+
+    if ( !size )
+    {
+        printk(XENLOG_ERR "Missing kernel boot module?\n");
+        return -ENOENT;
+    }
+
+    printk("Loading kernel from boot module %d\n", MOD_KERNEL);
+
+#ifdef CONFIG_ARM_64
+    rc = kernel_zimage64_probe(info, start, size);
     if (rc < 0)
-        rc = kernel_try_elf_prepare(info);
+#endif
+        rc = kernel_zimage32_probe(info, start, size);
+    if (rc < 0)
+        rc = kernel_elf_probe(info, start, size);
 
     return rc;
 }
@@ -191,7 +406,7 @@ void kernel_load(struct kernel_info *info)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

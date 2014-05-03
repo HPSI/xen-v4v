@@ -19,7 +19,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/select.h>
+#include <poll.h>
 #ifndef NO_SOCKETS
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -55,6 +55,12 @@
 #include "hashtable.h"
 
 extern xc_evtchn *xce_handle; /* in xenstored_domain.c */
+static int xce_pollfd_idx = -1;
+static struct pollfd *fds;
+static unsigned int current_array_size;
+static unsigned int nr_fds;
+
+#define ROUNDUP(_x, _w) (((unsigned long)(_x)+(1UL<<(_w))-1) & ~((1UL<<(_w))-1))
 
 static bool verbose = false;
 LIST_HEAD(connections);
@@ -62,6 +68,7 @@ static int tracefd = -1;
 static bool recovery = true;
 static bool remove_local = true;
 static int reopen_log_pipe[2];
+static int reopen_log_pipe0_pollfd_idx = -1;
 static char *tracefile = NULL;
 static TDB_CONTEXT *tdb_ctx = NULL;
 
@@ -199,7 +206,7 @@ void trace_destroy(const void *data, const char *type)
 /**
  * Signal handler for SIGHUP, which requests that the trace log is reopened
  * (in the main loop).  A single byte is written to reopen_log_pipe, to awaken
- * the select() in the main loop.
+ * the poll() in the main loop.
  */
 static void trigger_reopen_log(int signal __attribute__((unused)))
 {
@@ -279,15 +286,12 @@ static int destroy_conn(void *_conn)
 
 	/* Flush outgoing if possible, but don't block. */
 	if (!conn->domain) {
-		fd_set set;
-		struct timeval none;
-
-		FD_ZERO(&set);
-		FD_SET(conn->fd, &set);
-		none.tv_sec = none.tv_usec = 0;
+		struct pollfd pfd;
+		pfd.fd = conn->fd;
+		pfd.events = POLLOUT;
 
 		while (!list_empty(&conn->out_list)
-		       && select(conn->fd+1, NULL, &set, NULL, &none) == 1)
+		       && poll(&pfd, 1, 0) == 1)
 			if (!write_messages(conn))
 				break;
 		close(conn->fd);
@@ -299,53 +303,77 @@ static int destroy_conn(void *_conn)
 	return 0;
 }
 
-
-static void set_fd(int fd, fd_set *set, int *max)
+/* This function returns index inside the array if succeed, -1 if fail */
+static int set_fd(int fd, short events)
 {
-	if (fd < 0)
-		return;
-	FD_SET(fd, set);
-	if (fd > *max)
-		*max = fd;
+	int ret;
+	if (current_array_size < nr_fds + 1) {
+		struct pollfd *new_fds = NULL;
+		unsigned long newsize;
+
+		/* Round up to 2^8 boundary, in practice this just
+		 * make newsize larger than current_array_size.
+		 */
+		newsize = ROUNDUP(nr_fds + 1, 8);
+
+		new_fds = realloc(fds, sizeof(struct pollfd)*newsize);
+		if (!new_fds)
+			goto fail;
+		fds = new_fds;
+
+		memset(&fds[0] + current_array_size, 0,
+		       sizeof(struct pollfd ) * (newsize-current_array_size));
+		current_array_size = newsize;
+	}
+
+	fds[nr_fds].fd = fd;
+	fds[nr_fds].events = events;
+	ret = nr_fds;
+	nr_fds++;
+
+	return ret;
+fail:
+	syslog(LOG_ERR, "realloc failed, ignoring fd %d\n", fd);
+	return -1;
 }
 
-
-static int initialize_set(fd_set *inset, fd_set *outset, int sock, int ro_sock,
-			  struct timeval **ptimeout)
+static void initialize_fds(int sock, int *p_sock_pollfd_idx,
+			   int ro_sock, int *p_ro_sock_pollfd_idx,
+			   int *ptimeout)
 {
-	static struct timeval zero_timeout = { 0 };
 	struct connection *conn;
-	int max = -1;
 
-	*ptimeout = NULL;
+	if (fds)
+		memset(fds, 0, sizeof(struct pollfd) * current_array_size);
+	nr_fds = 0;
 
-	FD_ZERO(inset);
-	FD_ZERO(outset);
+	*ptimeout = -1;
 
 	if (sock != -1)
-		set_fd(sock, inset, &max);
+		*p_sock_pollfd_idx = set_fd(sock, POLLIN|POLLPRI);
 	if (ro_sock != -1)
-		set_fd(ro_sock, inset, &max);
+		*p_ro_sock_pollfd_idx = set_fd(ro_sock, POLLIN|POLLPRI);
 	if (reopen_log_pipe[0] != -1)
-		set_fd(reopen_log_pipe[0], inset, &max);
+		reopen_log_pipe0_pollfd_idx =
+			set_fd(reopen_log_pipe[0], POLLIN|POLLPRI);
 
 	if (xce_handle != NULL)
-		set_fd(xc_evtchn_fd(xce_handle), inset, &max);
+		xce_pollfd_idx = set_fd(xc_evtchn_fd(xce_handle),
+					POLLIN|POLLPRI);
 
 	list_for_each_entry(conn, &connections, list) {
 		if (conn->domain) {
 			if (domain_can_read(conn) ||
 			    (domain_can_write(conn) &&
 			     !list_empty(&conn->out_list)))
-				*ptimeout = &zero_timeout;
+				*ptimeout = 0;
 		} else {
-			set_fd(conn->fd, inset, &max);
+			short events = POLLIN|POLLPRI;
 			if (!list_empty(&conn->out_list))
-				FD_SET(conn->fd, outset);
+				events |= POLLOUT;
+			conn->pollfd_idx = set_fd(conn->fd, events);
 		}
 	}
-
-	return max;
 }
 
 /* Is child a subnode of parent, or equal? */
@@ -495,8 +523,10 @@ static enum xs_perm_type ask_parents(struct connection *conn, const char *name)
 	} while (!streq(name, "/"));
 
 	/* No permission at root?  We're in trouble. */
-	if (!node)
+	if (!node) {
 		corrupt(conn, "No permissions file at root");
+		return XS_PERM_NONE;
+	}
 
 	return perm_for_conn(conn, node->perms, node->num_perms);
 }
@@ -598,6 +628,11 @@ void send_reply(struct connection *conn, enum xsd_sockmsg_type type,
 		const void *data, unsigned int len)
 {
 	struct buffered_data *bdata;
+
+	if ( len > XENSTORE_PAYLOAD_MAX ) {
+		send_error(conn, E2BIG);
+		return;
+	}
 
 	/* Message is a child of the connection context for auto-cleanup. */
 	bdata = new_buffer(conn);
@@ -1330,6 +1365,7 @@ struct connection *new_connection(connwritefn_t *write, connreadfn_t *read)
 		return NULL;
 
 	new->fd = -1;
+	new->pollfd_idx = -1;
 	new->write = write;
 	new->read = read;
 	new->can_write = true;
@@ -1682,6 +1718,9 @@ static void init_sockets(int **psock, int **pro_sock)
 {
 	struct sockaddr_un addr;
 	int *sock, *ro_sock;
+	const char *soc_str = xs_daemon_socket();
+	const char *soc_str_ro = xs_daemon_socket_ro();
+
 	/* Create sockets for them to listen to. */
 	*psock = sock = talloc(talloc_autofree_context(), int);
 	*sock = socket(PF_UNIX, SOCK_STREAM, 0);
@@ -1695,19 +1734,25 @@ static void init_sockets(int **psock, int **pro_sock)
 	talloc_set_destructor(ro_sock, destroy_fd);
 
 	/* FIXME: Be more sophisticated, don't mug running daemon. */
-	unlink(xs_daemon_socket());
-	unlink(xs_daemon_socket_ro());
+	unlink(soc_str);
+	unlink(soc_str_ro);
 
 	addr.sun_family = AF_UNIX;
-	strcpy(addr.sun_path, xs_daemon_socket());
+
+	if(strlen(soc_str) >= sizeof(addr.sun_path))
+		barf_perror("socket string '%s' too long", soc_str);
+	strcpy(addr.sun_path, soc_str);
 	if (bind(*sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-		barf_perror("Could not bind socket to %s", xs_daemon_socket());
-	strcpy(addr.sun_path, xs_daemon_socket_ro());
+		barf_perror("Could not bind socket to %s", soc_str);
+
+	if(strlen(soc_str_ro) >= sizeof(addr.sun_path))
+		barf_perror("socket string '%s' too long", soc_str_ro);
+	strcpy(addr.sun_path, soc_str_ro);
 	if (bind(*ro_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
-		barf_perror("Could not bind socket to %s",
-			    xs_daemon_socket_ro());
-	if (chmod(xs_daemon_socket(), 0600) != 0
-	    || chmod(xs_daemon_socket_ro(), 0660) != 0)
+		barf_perror("Could not bind socket to %s", soc_str_ro);
+
+	if (chmod(soc_str, 0600) != 0
+	    || chmod(soc_str_ro, 0660) != 0)
 		barf_perror("Could not chmod sockets");
 
 	if (listen(*sock, 1) != 0
@@ -1750,6 +1795,7 @@ static struct option options[] = {
 	{ "entry-nb", 1, NULL, 'E' },
 	{ "pid-file", 1, NULL, 'F' },
 	{ "event", 1, NULL, 'e' },
+	{ "master-domid", 1, NULL, 'm' },
 	{ "help", 0, NULL, 'H' },
 	{ "no-fork", 0, NULL, 'N' },
 	{ "priv-domid", 1, NULL, 'p' },
@@ -1765,19 +1811,19 @@ static struct option options[] = {
 	{ NULL, 0, NULL, 0 } };
 
 extern void dump_conn(struct connection *conn); 
+int dom0_domid = 0;
 int dom0_event = 0;
 int priv_domid = 0;
 
 int main(int argc, char *argv[])
 {
-	int opt, *sock, *ro_sock, max;
-	fd_set inset, outset;
+	int opt, *sock, *ro_sock;
+	int sock_pollfd_idx = -1, ro_sock_pollfd_idx = -1;
 	bool dofork = true;
 	bool outputpid = false;
 	bool no_domain_init = false;
 	const char *pidfile = NULL;
-	int evtchn_fd = -1;
-	struct timeval *timeout;
+	int timeout;
 
 	while ((opt = getopt_long(argc, argv, "DE:F:HNPS:t:T:RLVW:", options,
 				  NULL)) != -1) {
@@ -1826,6 +1872,9 @@ int main(int argc, char *argv[])
 			break;
 		case 'e':
 			dom0_event = strtol(optarg, NULL, 10);
+			break;
+		case 'm':
+			dom0_domid = strtol(optarg, NULL, 10);
 			break;
 		case 'p':
 			priv_domid = strtol(optarg, NULL, 10);
@@ -1880,11 +1929,9 @@ int main(int argc, char *argv[])
 
 	signal(SIGHUP, trigger_reopen_log);
 
-	if (xce_handle != NULL)
-		evtchn_fd = xc_evtchn_fd(xce_handle);
-
 	/* Get ready to listen to the tools. */
-	max = initialize_set(&inset, &outset, *sock, *ro_sock, &timeout);
+	initialize_fds(*sock, &sock_pollfd_idx, *ro_sock, &ro_sock_pollfd_idx,
+		       &timeout);
 
 	/* Tell the kernel we're up and running. */
 	xenbus_notify_running();
@@ -1893,27 +1940,57 @@ int main(int argc, char *argv[])
 	for (;;) {
 		struct connection *conn, *next;
 
-		if (select(max+1, &inset, &outset, NULL, timeout) < 0) {
+		if (poll(fds, nr_fds, timeout) < 0) {
 			if (errno == EINTR)
 				continue;
-			barf_perror("Select failed");
+			barf_perror("Poll failed");
 		}
 
-		if (reopen_log_pipe[0] != -1 && FD_ISSET(reopen_log_pipe[0], &inset)) {
-			char c;
-			if (read(reopen_log_pipe[0], &c, 1) != 1)
-				barf_perror("read failed");
-			reopen_log();
+		if (reopen_log_pipe0_pollfd_idx != -1) {
+			if (fds[reopen_log_pipe0_pollfd_idx].revents
+			    & ~POLLIN) {
+				close(reopen_log_pipe[0]);
+				close(reopen_log_pipe[1]);
+				init_pipe(reopen_log_pipe);
+			} else if (fds[reopen_log_pipe0_pollfd_idx].revents
+				   & POLLIN) {
+				char c;
+				if (read(reopen_log_pipe[0], &c, 1) != 1)
+					barf_perror("read failed");
+				reopen_log();
+			}
+			reopen_log_pipe0_pollfd_idx = -1;
 		}
 
-		if (*sock != -1 && FD_ISSET(*sock, &inset))
-			accept_connection(*sock, true);
+		if (sock_pollfd_idx != -1) {
+			if (fds[sock_pollfd_idx].revents & ~POLLIN) {
+				barf_perror("sock poll failed");
+				break;
+			} else if (fds[sock_pollfd_idx].revents & POLLIN) {
+				accept_connection(*sock, true);
+				sock_pollfd_idx = -1;
+			}
+		}
 
-		if (*ro_sock != -1 && FD_ISSET(*ro_sock, &inset))
-			accept_connection(*ro_sock, false);
+		if (ro_sock_pollfd_idx != -1) {
+			if (fds[ro_sock_pollfd_idx].revents & ~POLLIN) {
+				barf_perror("ro sock poll failed");
+				break;
+			} else if (fds[ro_sock_pollfd_idx].revents & POLLIN) {
+				accept_connection(*ro_sock, false);
+				ro_sock_pollfd_idx = -1;
+			}
+		}
 
-		if (evtchn_fd != -1 && FD_ISSET(evtchn_fd, &inset))
-			handle_event();
+		if (xce_pollfd_idx != -1) {
+			if (fds[xce_pollfd_idx].revents & ~POLLIN) {
+				barf_perror("xce_handle poll failed");
+				break;
+			} else if (fds[xce_pollfd_idx].revents & POLLIN) {
+				handle_event();
+				xce_pollfd_idx = -1;
+			}
+		}
 
 		next = list_entry(connections.next, typeof(*conn), list);
 		if (&next->list != &connections)
@@ -1939,21 +2016,36 @@ int main(int argc, char *argv[])
 				if (talloc_free(conn) == 0)
 					continue;
 			} else {
-				if (FD_ISSET(conn->fd, &inset))
-					handle_input(conn);
+				if (conn->pollfd_idx != -1) {
+					if (fds[conn->pollfd_idx].revents
+					    & ~(POLLIN|POLLOUT))
+						talloc_free(conn);
+					else if (fds[conn->pollfd_idx].revents
+						 & POLLIN)
+						handle_input(conn);
+				}
 				if (talloc_free(conn) == 0)
 					continue;
 
 				talloc_increase_ref_count(conn);
-				if (FD_ISSET(conn->fd, &outset))
-					handle_output(conn);
+
+				if (conn->pollfd_idx != -1) {
+					if (fds[conn->pollfd_idx].revents
+					    & ~(POLLIN|POLLOUT))
+						talloc_free(conn);
+					else if (fds[conn->pollfd_idx].revents
+						 & POLLOUT)
+						handle_output(conn);
+				}
 				if (talloc_free(conn) == 0)
 					continue;
+
+				conn->pollfd_idx = -1;
 			}
 		}
 
-		max = initialize_set(&inset, &outset, *sock, *ro_sock,
-				     &timeout);
+		initialize_fds(*sock, &sock_pollfd_idx, *ro_sock,
+			       &ro_sock_pollfd_idx, &timeout);
 	}
 }
 

@@ -13,24 +13,12 @@
 #include <xen/lib.h>
 #include <xen/stdarg.h>
 #include <xen/string.h>
-#include <asm/early_printk.h>
+#include <xen/early_printk.h>
 
-#ifdef EARLY_UART_ADDRESS
+void early_putch(char c);
+void early_flush(void);
 
-static void __init early_putch(char c)
-{
-    volatile uint32_t *r;
-
-    r = (uint32_t *)((EARLY_UART_ADDRESS & 0x001fffff)
-                     + XEN_VIRT_START + (1 << 21));
-
-    /* XXX: assuming a PL011 UART. */
-    while(*(r + 0x6) & 0x8)
-        ;
-    *r = c;
-}
-
-static void __init early_puts(const char *s)
+void early_puts(const char *s)
 {
     while (*s != '\0') {
         if (*s == '\n')
@@ -38,35 +26,10 @@ static void __init early_puts(const char *s)
         early_putch(*s);
         s++;
     }
+
+    /*
+     * Wait the UART has finished to transfer all characters before
+     * to continue. This will avoid lost characters if Xen abort.
+     */
+    early_flush();
 }
-
-static void __init early_vprintk(const char *fmt, va_list args)
-{
-    char buf[80];
-
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    early_puts(buf);
-}
-
-void __init early_printk(const char *fmt, ...)
-{
-    va_list args;
-
-    va_start(args, fmt);
-    early_vprintk(fmt, args);
-    va_end(args);
-}
-
-void __attribute__((noreturn)) __init
-early_panic(const char *fmt, ...)
-{
-    va_list args;
-
-    va_start(args, fmt);
-    early_vprintk(fmt, args);
-    va_end(args);
-
-    while(1);
-}
-
-#endif /* #ifdef EARLY_UART_ADDRESS */

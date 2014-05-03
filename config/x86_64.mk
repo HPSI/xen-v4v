@@ -6,7 +6,8 @@ CONFIG_COMPAT := y
 CONFIG_HVM := y
 CONFIG_MIGRATE := y
 CONFIG_XCUTILS := y
-CONFIG_IOEMU ?= y
+
+CONFIG_XEN_INSTALL_SUFFIX := .gz
 
 CFLAGS += -m64
 
@@ -18,5 +19,9 @@ EFI_DIR ?= /usr/lib64/efi
 ifeq ($(XEN_OS),OpenBSD)
 LDFLAGS_DIRECT += -melf_x86_64_obsd
 else
+ifeq ($(XEN_OS),FreeBSD)
+LDFLAGS_DIRECT += -melf_x86_64_fbsd
+else
 LDFLAGS_DIRECT += -melf_x86_64
+endif
 endif

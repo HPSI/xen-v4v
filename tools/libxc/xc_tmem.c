@@ -70,11 +70,6 @@ int xc_tmem_control(xc_interface *xch,
     op.u.ctrl.oid[1] = 0;
     op.u.ctrl.oid[2] = 0;
 
-#ifdef VALGRIND
-    if (arg1 != 0)
-        memset(buf, 0, arg1);
-#endif
-
     if ( subop == TMEMC_LIST && arg1 != 0 )
     {
         if ( buf == NULL )
@@ -119,11 +114,6 @@ int xc_tmem_control_oid(xc_interface *xch,
     op.u.ctrl.oid[0] = oid.oid[0];
     op.u.ctrl.oid[1] = oid.oid[1];
     op.u.ctrl.oid[2] = oid.oid[2];
-
-#ifdef VALGRIND
-    if (arg1 != 0)
-        memset(buf, 0, arg1);
-#endif
 
     if ( subop == TMEMC_LIST && arg1 != 0 )
     {
@@ -521,7 +511,7 @@ int xc_tmem_restore_extra(xc_interface *xch, int dom, int io_fd)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

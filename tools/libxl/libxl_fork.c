@@ -46,11 +46,22 @@ static int atfork_registered;
 static LIBXL_LIST_HEAD(, libxl__carefd) carefds =
     LIBXL_LIST_HEAD_INITIALIZER(carefds);
 
-/* non-null iff installed, protected by no_forking */
-static libxl_ctx *sigchld_owner;
+/* Protected against concurrency by no_forking.  sigchld_users is
+ * protected against being interrupted by SIGCHLD (and thus read
+ * asynchronously by the signal handler) by sigchld_defer (see
+ * below). */
+static bool sigchld_installed; /* 0 means not */
+static pthread_mutex_t sigchld_defer_mutex = PTHREAD_MUTEX_INITIALIZER;
+static LIBXL_LIST_HEAD(, libxl_ctx) sigchld_users =
+    LIBXL_LIST_HEAD_INITIALIZER(sigchld_users);
 static struct sigaction sigchld_saved_action;
 
-static void sigchld_removehandler_core(void);
+static void sigchld_removehandler_core(void); /* idempotent */
+static void sigchld_user_remove(libxl_ctx *ctx); /* idempotent */
+static void sigchld_sethandler_raw(void (*handler)(int), struct sigaction *old);
+
+static void defer_sigchld(void);
+static void release_sigchld(void);
 
 static void atfork_lock(void)
 {
@@ -109,6 +120,19 @@ libxl__carefd *libxl__carefd_opened(libxl_ctx *ctx, int fd)
 
 void libxl_postfork_child_noexec(libxl_ctx *ctx)
 {
+    /*
+     * Anything running without the no_forking lock (atfork_lock)
+     * might be interrupted by fork.  But libxl functions other than
+     * this one are then forbidden to the child.
+     *
+     * Conversely, this function might interrupt any other libxl
+     * operation (even though that other operation has the libxl ctx
+     * lock).  We don't take the lock ourselves, since we are running
+     * in the child and if the lock is held the thread that took it no
+     * longer exists.  To prevent us being interrupted by another call
+     * to ourselves (whether in another thread or by virtue of another
+     * fork) we take the atfork lock ourselves.
+     */
     libxl__carefd *cf, *cf_tmp;
     int r;
 
@@ -126,8 +150,33 @@ void libxl_postfork_child_noexec(libxl_ctx *ctx)
     }
     LIBXL_LIST_INIT(&carefds);
 
-    if (sigchld_owner)
+    if (sigchld_installed) {
+        /* We are in theory not at risk of concurrent execution of the
+         * SIGCHLD handler, because the application should call
+         * libxl_postfork_child_noexec before the child forks again.
+         * (If the SIGCHLD was in flight in the parent at the time of
+         * the fork, the thread it was delivered on exists only in the
+         * parent so is not our concern.)
+         *
+         * But in case the application violated this rule (and did so
+         * while multithreaded in the child), we use our deferral
+         * machinery.  The result is that the SIGCHLD may then be lost
+         * (i.e. signaled to the now-defunct libxl ctx(s)).  But at
+         * least we won't execute undefined behaviour (by examining
+         * the list in the signal handler concurrently with clearing
+         * it here), and since we won't actually reap the new children
+         * things will in fact go OK if the application doesn't try to
+         * use SIGCHLD, but instead just waits for the child(ren). */
+        defer_sigchld();
+
+        LIBXL_LIST_INIT(&sigchld_users);
+        /* After this the ->sigchld_user_registered entries in the
+         * now-obsolete contexts may be lies.  But that's OK because
+         * no-one will look at them. */
+
+        release_sigchld();
         sigchld_removehandler_core();
+    }
 
     atfork_unlock();
 }
@@ -135,9 +184,9 @@ void libxl_postfork_child_noexec(libxl_ctx *ctx)
 int libxl__carefd_close(libxl__carefd *cf)
 {
     if (!cf) return 0;
+    atfork_lock();
     int r = cf->fd < 0 ? 0 : close(cf->fd);
     int esave = errno;
-    atfork_lock();
     LIBXL_LIST_REMOVE(cf, entry);
     atfork_unlock();
     free(cf);
@@ -152,98 +201,262 @@ int libxl__carefd_fd(const libxl__carefd *cf)
 }
 
 /*
- * Actual child process handling
+ * Low-level functions for child process handling, including
+ * the main SIGCHLD handler.
  */
+
+/* Like waitpid(,,WNOHANG) but handles all errors except ECHILD. */
+static pid_t checked_waitpid(libxl__egc *egc, pid_t want, int *status)
+{
+    for (;;) {
+        pid_t got = waitpid(want, status, WNOHANG);
+        if (got != -1)
+            return got;
+        if (errno == ECHILD)
+            return got;
+        if (errno == EINTR)
+            continue;
+        LIBXL__EVENT_DISASTER(egc, "waitpid() failed", errno, 0);
+        return 0;
+    }
+}
+
+static void sigchld_selfpipe_handler(libxl__egc *egc, libxl__ev_fd *ev,
+                                     int fd, short events, short revents);
 
 static void sigchld_handler(int signo)
 {
-    int e = libxl__self_pipe_wakeup(sigchld_owner->sigchld_selfpipe[1]);
-    assert(!e); /* errors are probably EBADF, very bad */
+    /* This function has to be reentrant!  Luckily it is. */
+
+    libxl_ctx *notify;
+    int esave = errno;
+
+    int r = pthread_mutex_lock(&sigchld_defer_mutex);
+    assert(!r);
+
+    LIBXL_LIST_FOREACH(notify, &sigchld_users, sigchld_users_entry) {
+        int e = libxl__self_pipe_wakeup(notify->sigchld_selfpipe[1]);
+        assert(!e); /* errors are probably EBADF, very bad */
+    }
+
+    r = pthread_mutex_unlock(&sigchld_defer_mutex);
+    assert(!r);
+
+    errno = esave;
 }
 
-static void sigchld_removehandler_core(void)
+static void sigchld_sethandler_raw(void (*handler)(int), struct sigaction *old)
+{
+    struct sigaction ours;
+    int r;
+
+    memset(&ours,0,sizeof(ours));
+    ours.sa_handler = handler;
+    sigemptyset(&ours.sa_mask);
+    ours.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    r = sigaction(SIGCHLD, &ours, old);
+    assert(!r);
+}
+
+/*
+ * SIGCHLD deferral
+ *
+ * sigchld_defer and sigchld_release are a bit like using sigprocmask
+ * to block the signal only they work for the whole process.  Sadly
+ * this has to be done by setting a special handler that records the
+ * "pendingness" of the signal here in the program.  How tedious.
+ *
+ * A property of this approach is that the signal handler itself
+ * must be reentrant (see the comment in release_sigchld).
+ *
+ * Callers have the atfork_lock so there is no risk of concurrency
+ * within these functions, aside from the risk of being interrupted by
+ * the signal.  We use sigchld_defer_mutex to guard against the
+ * possibility of the real signal handler being still running on
+ * another thread.
+ */
+
+static volatile sig_atomic_t sigchld_occurred_while_deferred;
+
+static void sigchld_handler_when_deferred(int signo)
+{
+    sigchld_occurred_while_deferred = 1;
+}
+
+static void defer_sigchld(void)
+{
+    assert(sigchld_installed);
+
+    sigchld_sethandler_raw(sigchld_handler_when_deferred, 0);
+
+    /* Now _this thread_ cannot any longer be interrupted by the
+     * signal, so we can take the mutex without risk of deadlock.  If
+     * another thread is in the signal handler, either it or we will
+     * block and wait for the other. */
+
+    int r = pthread_mutex_lock(&sigchld_defer_mutex);
+    assert(!r);
+}
+
+static void release_sigchld(void)
+{
+    assert(sigchld_installed);
+
+    int r = pthread_mutex_unlock(&sigchld_defer_mutex);
+    assert(!r);
+
+    sigchld_sethandler_raw(sigchld_handler, 0);
+    if (sigchld_occurred_while_deferred) {
+        sigchld_occurred_while_deferred = 0;
+        /* We might get another SIGCHLD here, in which case
+         * sigchld_handler will be interrupted and re-entered.
+         * This is OK. */
+        sigchld_handler(SIGCHLD);
+    }
+}
+
+/*
+ * Meat of the child process handling.
+ */
+
+static void sigchld_removehandler_core(void) /* idempotent */
 {
     struct sigaction was;
     int r;
     
+    if (!sigchld_installed)
+        return;
+
     r = sigaction(SIGCHLD, &sigchld_saved_action, &was);
     assert(!r);
     assert(!(was.sa_flags & SA_SIGINFO));
     assert(was.sa_handler == sigchld_handler);
-    sigchld_owner = 0;
+
+    sigchld_installed = 0;
 }
 
-void libxl__sigchld_removehandler(libxl_ctx *ctx) /* non-reentrant */
+static void sigchld_installhandler_core(void) /* idempotent */
 {
+    if (sigchld_installed)
+        return;
+
+    sigchld_installed = 1;
+
+    sigchld_sethandler_raw(sigchld_handler, &sigchld_saved_action);
+
+    assert(((void)"application must negotiate with libxl about SIGCHLD",
+            !(sigchld_saved_action.sa_flags & SA_SIGINFO) &&
+            (sigchld_saved_action.sa_handler == SIG_DFL ||
+             sigchld_saved_action.sa_handler == SIG_IGN)));
+}
+
+static void sigchld_user_remove(libxl_ctx *ctx) /* idempotent */
+{
+    if (!ctx->sigchld_user_registered)
+        return;
+
     atfork_lock();
-    if (sigchld_owner == ctx)
+    defer_sigchld();
+
+    LIBXL_LIST_REMOVE(ctx, sigchld_users_entry);
+
+    release_sigchld();
+
+    if (LIBXL_LIST_EMPTY(&sigchld_users))
         sigchld_removehandler_core();
+
     atfork_unlock();
+
+    ctx->sigchld_user_registered = 0;
 }
 
-int libxl__sigchld_installhandler(libxl_ctx *ctx) /* non-reentrant */
+void libxl__sigchld_notneeded(libxl__gc *gc) /* non-reentrant, idempotent */
 {
-    int r, rc;
+    int rc;
 
-    if (ctx->sigchld_selfpipe[0] < 0) {
-        r = pipe(ctx->sigchld_selfpipe);
-        if (r) {
-            ctx->sigchld_selfpipe[0] = -1;
-            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR,
-                             "failed to create sigchld pipe");
-            rc = ERROR_FAIL;
-            goto out;
-        }
+    sigchld_user_remove(CTX);
+
+    if (libxl__ev_fd_isregistered(&CTX->sigchld_selfpipe_efd)) {
+        rc = libxl__ev_fd_modify(gc, &CTX->sigchld_selfpipe_efd, 0);
+        if (rc)
+            libxl__ev_fd_deregister(gc, &CTX->sigchld_selfpipe_efd);
     }
+}
 
-    atfork_lock();
-    if (sigchld_owner != ctx) {
-        struct sigaction ours;
+int libxl__sigchld_needed(libxl__gc *gc) /* non-reentrant, idempotent */
+{
+    int rc;
 
-        assert(!sigchld_owner);
-        sigchld_owner = ctx;
-
-        memset(&ours,0,sizeof(ours));
-        ours.sa_handler = sigchld_handler;
-        sigemptyset(&ours.sa_mask);
-        ours.sa_flags = SA_NOCLDSTOP | SA_RESTART;
-        r = sigaction(SIGCHLD, &ours, &sigchld_saved_action);
-        assert(!r);
-
-        assert(((void)"application must negotiate with libxl about SIGCHLD",
-                !(sigchld_saved_action.sa_flags & SA_SIGINFO) &&
-                (sigchld_saved_action.sa_handler == SIG_DFL ||
-                 sigchld_saved_action.sa_handler == SIG_IGN)));
+    if (CTX->sigchld_selfpipe[0] < 0) {
+        rc = libxl__pipe_nonblock(CTX, CTX->sigchld_selfpipe);
+        if (rc) goto out;
     }
-    atfork_unlock();
+    if (!libxl__ev_fd_isregistered(&CTX->sigchld_selfpipe_efd)) {
+        rc = libxl__ev_fd_register(gc, &CTX->sigchld_selfpipe_efd,
+                                   sigchld_selfpipe_handler,
+                                   CTX->sigchld_selfpipe[0], POLLIN);
+        if (rc) goto out;
+    } else {
+        rc = libxl__ev_fd_modify(gc, &CTX->sigchld_selfpipe_efd, POLLIN);
+        if (rc) goto out;
+    }
+    if (!CTX->sigchld_user_registered) {
+        atfork_lock();
+
+        sigchld_installhandler_core();
+
+        defer_sigchld();
+
+        LIBXL_LIST_INSERT_HEAD(&sigchld_users, CTX, sigchld_users_entry);
+
+        release_sigchld();
+        atfork_unlock();
+
+        CTX->sigchld_user_registered = 1;
+    }
 
     rc = 0;
  out:
     return rc;
 }
 
-static int chldmode_ours(libxl_ctx *ctx)
+static bool chldmode_ours(libxl_ctx *ctx, bool creating)
 {
-    return ctx->childproc_hooks->chldowner == libxl_sigchld_owner_libxl;
+    switch (ctx->childproc_hooks->chldowner) {
+    case libxl_sigchld_owner_libxl:
+        return creating || !LIBXL_LIST_EMPTY(&ctx->children);
+    case libxl_sigchld_owner_mainloop:
+        return 0;
+    case libxl_sigchld_owner_libxl_always:
+    case libxl_sigchld_owner_libxl_always_selective_reap:
+        return 1;
+    }
+    abort();
 }
 
-int libxl__fork_selfpipe_active(libxl_ctx *ctx)
+static void perhaps_sigchld_notneeded(libxl__gc *gc)
 {
-    /* Returns the fd to read, or -1 */
-    if (!chldmode_ours(ctx))
-        return -1;
-
-    if (LIBXL_LIST_EMPTY(&ctx->children))
-        return -1;
-
-    return ctx->sigchld_selfpipe[0];
+    if (!chldmode_ours(CTX, 0))
+        libxl__sigchld_notneeded(gc);
 }
 
-static void perhaps_removehandler(libxl_ctx *ctx)
+static int perhaps_sigchld_needed(libxl__gc *gc, bool creating)
 {
-    if (LIBXL_LIST_EMPTY(&ctx->children) &&
-        ctx->childproc_hooks->chldowner != libxl_sigchld_owner_libxl_always)
-        libxl__sigchld_removehandler(ctx);
+    int rc;
+
+    if (chldmode_ours(CTX, creating)) {
+        rc = libxl__sigchld_needed(gc);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
+static void childproc_reaped_ours(libxl__egc *egc, libxl__ev_child *ch,
+                                 int status)
+{
+    LIBXL_LIST_REMOVE(ch, entry);
+    ch->pid = -1;
+    ch->callback(egc, ch, ch->pid, status);
 }
 
 static int childproc_reaped(libxl__egc *egc, pid_t pid, int status)
@@ -259,11 +472,9 @@ static int childproc_reaped(libxl__egc *egc, pid_t pid, int status)
     return ERROR_UNKNOWN_CHILD;
 
  found:
-    LIBXL_LIST_REMOVE(ch, entry);
-    ch->pid = -1;
-    ch->callback(egc, ch, pid, status);
+    childproc_reaped_ours(egc, ch, status);
 
-    perhaps_removehandler(CTX);
+    perhaps_sigchld_notneeded(gc);
 
     return 0;
 }
@@ -272,30 +483,94 @@ int libxl_childproc_reaped(libxl_ctx *ctx, pid_t pid, int status)
 {
     EGC_INIT(ctx);
     CTX_LOCK;
+    assert(CTX->childproc_hooks->chldowner
+           == libxl_sigchld_owner_mainloop);
     int rc = childproc_reaped(egc, pid, status);
     CTX_UNLOCK;
     EGC_FREE;
     return rc;
 }
 
-void libxl__fork_selfpipe_woken(libxl__egc *egc)
+static void childproc_checkall(libxl__egc *egc)
+{
+    EGC_GC;
+    libxl__ev_child *ch;
+
+    for (;;) {
+        int status;
+        pid_t got;
+
+        LIBXL_LIST_FOREACH(ch, &CTX->children, entry) {
+            got = checked_waitpid(egc, ch->pid, &status);
+            if (got)
+                goto found;
+        }
+        /* not found */
+        return;
+
+    found:
+        if (got == -1) {
+            LIBXL__EVENT_DISASTER
+                (egc, "waitpid() gave ECHILD but we have a child",
+                 ECHILD, 0);
+            /* it must have finished but we don't know its status */
+            status = 255<<8; /* no wait.h macro for this! */
+            assert(WIFEXITED(status));
+            assert(WEXITSTATUS(status)==255);
+            assert(!WIFSIGNALED(status));
+            assert(!WIFSTOPPED(status));
+        }
+        childproc_reaped_ours(egc, ch, status);
+        /* we need to restart the loop, as children may have been edited */
+    }
+}
+
+void libxl_childproc_sigchld_occurred(libxl_ctx *ctx)
+{
+    EGC_INIT(ctx);
+    CTX_LOCK;
+    assert(CTX->childproc_hooks->chldowner
+           == libxl_sigchld_owner_mainloop);
+    childproc_checkall(egc);
+    CTX_UNLOCK;
+    EGC_FREE;
+}
+
+static void sigchld_selfpipe_handler(libxl__egc *egc, libxl__ev_fd *ev,
+                                     int fd, short events, short revents)
 {
     /* May make callbacks into the application for child processes.
-     * ctx must be locked EXACTLY ONCE */
+     * So, this function may unlock and relock the CTX.  This is OK
+     * because event callback functions are always called with the CTX
+     * locked exactly once, and from code which copes with reentrancy.
+     * (See also the comment in afterpoll_internal.) */
     EGC_GC;
 
-    while (chldmode_ours(CTX) /* in case the app changes the mode */) {
+    int selfpipe = CTX->sigchld_selfpipe[0];
+
+    if (revents & ~POLLIN) {
+        LOG(ERROR, "unexpected poll event 0x%x on SIGCHLD self pipe", revents);
+        LIBXL__EVENT_DISASTER(egc,
+                              "unexpected poll event on SIGCHLD self pipe",
+                              0, 0);
+    }
+    assert(revents & POLLIN);
+
+    int e = libxl__self_pipe_eatall(selfpipe);
+    if (e) LIBXL__EVENT_DISASTER(egc, "read sigchld pipe", e, 0);
+
+    if (CTX->childproc_hooks->chldowner
+        == libxl_sigchld_owner_libxl_always_selective_reap) {
+        childproc_checkall(egc);
+        return;
+    }
+
+    while (chldmode_ours(CTX, 0) /* in case the app changes the mode */) {
         int status;
-        pid_t pid = waitpid(-1, &status, WNOHANG);
+        pid_t pid = checked_waitpid(egc, -1, &status);
 
-        if (pid == 0) return;
-
-        if (pid == -1) {
-            if (errno == ECHILD) return;
-            if (errno == EINTR) continue;
-            LIBXL__EVENT_DISASTER(egc, "waitpid() failed", errno, 0);
+        if (pid == 0 || pid == -1 /* ECHILD */)
             return;
-        }
 
         int rc = childproc_reaped(egc, pid, status);
 
@@ -330,10 +605,7 @@ pid_t libxl__ev_child_fork(libxl__gc *gc, libxl__ev_child *ch,
     CTX_LOCK;
     int rc;
 
-    if (chldmode_ours(CTX)) {
-        rc = libxl__sigchld_installhandler(CTX);
-        if (rc) goto out;
-    }
+    perhaps_sigchld_needed(gc, 1);
 
     pid_t pid =
         CTX->childproc_hooks->fork_replacement
@@ -361,7 +633,7 @@ pid_t libxl__ev_child_fork(libxl__gc *gc, libxl__ev_child *ch,
     rc = pid;
 
  out:
-    perhaps_removehandler(CTX);
+    perhaps_sigchld_notneeded(gc);
     CTX_UNLOCK;
     return rc;
 }
@@ -380,17 +652,8 @@ void libxl_childproc_setmode(libxl_ctx *ctx, const libxl_childproc_hooks *hooks,
     ctx->childproc_hooks = hooks;
     ctx->childproc_user = user;
 
-    switch (ctx->childproc_hooks->chldowner) {
-    case libxl_sigchld_owner_mainloop:
-    case libxl_sigchld_owner_libxl:
-        libxl__sigchld_removehandler(ctx);
-        break;
-    case libxl_sigchld_owner_libxl_always:
-        libxl__sigchld_installhandler(ctx);
-        break;
-    default:
-        abort();
-    }
+    perhaps_sigchld_notneeded(gc);
+    perhaps_sigchld_needed(gc, 0); /* idempotent, ok to ignore errors for now */
 
     CTX_UNLOCK;
     GC_FREE;

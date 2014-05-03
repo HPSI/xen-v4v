@@ -34,11 +34,20 @@ struct libxl__yajl_ctx {
 };
 
 #ifdef DEBUG_ANSWER
-#  define DEBUG_GEN_ALLOC(ctx) \
-    if ((ctx)->g == NULL) { \
-        yajl_gen_config conf = { 1, "  " }; \
+#if YAJL_VERSION < 20000
+#  define DEBUG_GEN_ALLOC(ctx)                  \
+    if ((ctx)->g == NULL) {                     \
+        yajl_gen_config conf = { 1, "  " };     \
         (ctx)->g = yajl_gen_alloc(&conf, NULL); \
     }
+#else  /* YAJL2 */
+#  define DEBUG_GEN_ALLOC(ctx)                                    \
+    if ((ctx)->g == NULL) {                                       \
+        (ctx)->g = yajl_gen_alloc(NULL);                          \
+        yajl_gen_config((ctx)->g, yajl_gen_beautify, 1);          \
+        yajl_gen_config((ctx)->g, yajl_gen_indent_string, "  ");  \
+    }
+#endif
 #  define DEBUG_GEN_FREE(ctx) \
     if ((ctx)->g) yajl_gen_free((ctx)->g)
 #  define DEBUG_GEN(ctx, type)              yajl_gen_##type(ctx->g)
@@ -48,7 +57,7 @@ struct libxl__yajl_ctx {
 #  define DEBUG_GEN_REPORT(yajl_ctx) \
     do { \
         const unsigned char *buf = NULL; \
-        unsigned int len = 0; \
+        size_t len = 0; \
         yajl_gen_get_buf((yajl_ctx)->g, &buf, &len); \
         LIBXL__LOG(libxl__gc_owner((yajl_ctx)->gc), \
                    LIBXL__LOG_DEBUG, "response:\n%s", buf); \
@@ -285,7 +294,6 @@ void libxl__json_object_free(libxl__gc *gc, libxl__json_object *obj)
     }
     case JSON_ARRAY: {
         libxl__json_object *node = NULL;
-        break;
 
         for (idx = 0; idx < obj->u.array->count; idx++) {
             if (flexarray_get(obj->u.array, idx, (void**)&node) != 0)
@@ -486,7 +494,7 @@ static int json_callback_number(void *opaque, const char *s, libxl_yajl_length l
     if (is_decimal(s, len)) {
         double d = strtod(s, NULL);
 
-        if ((d == HUGE_VAL || d == HUGE_VAL) && errno == ERANGE) {
+        if ((d == HUGE_VALF || d == HUGE_VALL) && errno == ERANGE) {
             goto error;
         }
 
@@ -784,158 +792,6 @@ out:
     }
 
     return ret;
-}
-
-yajl_gen_status libxl_domain_config_gen_json(yajl_gen hand,
-                                             libxl_domain_config *p)
-{
-    yajl_gen_status s;
-    int i;
-
-    s = yajl_gen_map_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"c_info",
-                        sizeof("c_info")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_domain_create_info_gen_json(hand, &p->c_info);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"b_info",
-                        sizeof("b_info")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_domain_build_info_gen_json(hand, &p->b_info);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"disks",
-                        sizeof("disks")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = yajl_gen_array_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    for (i = 0; i < p->num_disks; i++) {
-        s = libxl_device_disk_gen_json(hand, &p->disks[i]);
-        if (s != yajl_gen_status_ok)
-            goto out;
-    }
-    s = yajl_gen_array_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"nics",
-                        sizeof("nics")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = yajl_gen_array_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    for (i = 0; i < p->num_nics; i++) {
-        s = libxl_device_nic_gen_json(hand, &p->nics[i]);
-        if (s != yajl_gen_status_ok)
-            goto out;
-    }
-    s = yajl_gen_array_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"pcidevs",
-                        sizeof("pcidevs")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = yajl_gen_array_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    for (i = 0; i < p->num_pcidevs; i++) {
-        s = libxl_device_pci_gen_json(hand, &p->pcidevs[i]);
-        if (s != yajl_gen_status_ok)
-            goto out;
-    }
-    s = yajl_gen_array_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"vfbs",
-                        sizeof("vfbs")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = yajl_gen_array_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    for (i = 0; i < p->num_vfbs; i++) {
-        s = libxl_device_vfb_gen_json(hand, &p->vfbs[i]);
-        if (s != yajl_gen_status_ok)
-            goto out;
-    }
-    s = yajl_gen_array_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"vkbs",
-                        sizeof("vkbs")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = yajl_gen_array_open(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    for (i = 0; i < p->num_vkbs; i++) {
-        s = libxl_device_vkb_gen_json(hand, &p->vkbs[i]);
-        if (s != yajl_gen_status_ok)
-            goto out;
-    }
-    s = yajl_gen_array_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"on_poweroff",
-                        sizeof("on_poweroff")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_action_on_shutdown_gen_json(hand, &p->on_poweroff);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"on_reboot",
-                        sizeof("on_reboot")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_action_on_shutdown_gen_json(hand, &p->on_reboot);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"on_watchdog",
-                        sizeof("on_watchdog")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_action_on_shutdown_gen_json(hand, &p->on_watchdog);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_string(hand, (const unsigned char *)"on_crash",
-                        sizeof("on_crash")-1);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    s = libxl_action_on_shutdown_gen_json(hand, &p->on_crash);
-    if (s != yajl_gen_status_ok)
-        goto out;
-
-    s = yajl_gen_map_close(hand);
-    if (s != yajl_gen_status_ok)
-        goto out;
-    out:
-    return s;
-}
-
-char *libxl_domain_config_to_json(libxl_ctx *ctx, libxl_domain_config *p)
-{
-    return libxl__object_to_json(ctx, "libxl_domain_config",
-                        (libxl__gen_json_callback)&libxl_domain_config_gen_json,
-                        (void *)p);
 }
 
 /*

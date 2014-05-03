@@ -24,11 +24,12 @@
 #include "io.h"
 #include <xenstore.h>
 #include <xen/io/console.h>
+#include <xen/grant_table.h>
 
 #include <stdlib.h>
 #include <errno.h>
 #include <string.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <termios.h>
@@ -66,9 +67,14 @@ extern int discard_overflowed_data;
 static int log_time_hv_needts = 1;
 static int log_time_guest_needts = 1;
 static int log_hv_fd = -1;
-static evtchn_port_or_error_t log_hv_evtchn = -1;
-static xc_interface *xch; /* why does xenconsoled have two xc handles ? */
-static xc_evtchn *xce_handle = NULL;
+
+static xc_gnttab *xcg_handle = NULL;
+
+static struct pollfd  *fds;
+static unsigned int current_array_size;
+static unsigned int nr_fds;
+
+#define ROUNDUP(_x,_w) (((unsigned long)(_x)+(1UL<<(_w))-1) & ~((1UL<<(_w))-1))
 
 struct buffer {
 	char *data;
@@ -81,6 +87,7 @@ struct buffer {
 struct domain {
 	int domid;
 	int master_fd;
+	int master_pollfd_idx;
 	int slave_fd;
 	int log_fd;
 	bool is_dead;
@@ -92,6 +99,7 @@ struct domain {
 	evtchn_port_or_error_t local_port;
 	evtchn_port_or_error_t remote_port;
 	xc_evtchn *xce_handle;
+	int xce_pollfd_idx;
 	struct xencons_interface *interface;
 	int event_count;
 	long long next_period;
@@ -270,6 +278,7 @@ static int create_hv_log(void)
 			dolog(LOG_ERR, "Failed to log opening timestamp "
 				       "in %s: %d (%s)", logfile, errno,
 				       strerror(errno));
+			close(fd);
 			return -1;
 		}
 	}
@@ -315,6 +324,7 @@ static int create_domain_log(struct domain *dom)
 			dolog(LOG_ERR, "Failed to log opening timestamp "
 				       "in %s: %d (%s)", logfile, errno,
 				       strerror(errno));
+			close(fd);
 			return -1;
 		}
 	}
@@ -501,6 +511,18 @@ static int xs_gather(struct xs_handle *xs, const char *dir, ...)
 	va_end(ap);
 	return ret;
 }
+
+static void domain_unmap_interface(struct domain *dom)
+{
+	if (dom->interface == NULL)
+		return;
+	if (xcg_handle && dom->ring_ref == -1)
+		xc_gnttab_munmap(xcg_handle, dom->interface, 1);
+	else
+		munmap(dom->interface, getpagesize());
+	dom->interface = NULL;
+	dom->ring_ref = -1;
+}
  
 static int domain_create_ring(struct domain *dom)
 {
@@ -522,9 +544,19 @@ static int domain_create_ring(struct domain *dom)
 	}
 	free(type);
 
-	if (ring_ref != dom->ring_ref) {
-		if (dom->interface != NULL)
-			munmap(dom->interface, getpagesize());
+	/* If using ring_ref and it has changed, remap */
+	if (ring_ref != dom->ring_ref && dom->ring_ref != -1)
+		domain_unmap_interface(dom);
+
+	if (!dom->interface && xcg_handle) {
+		/* Prefer using grant table */
+		dom->interface = xc_gnttab_map_grant_ref(xcg_handle,
+			dom->domid, GNTTAB_RESERVED_CONSOLE,
+			PROT_READ|PROT_WRITE);
+		dom->ring_ref = -1;
+	}
+	if (!dom->interface) {
+		/* Fall back to xc_map_foreign_range */
 		dom->interface = xc_map_foreign_range(
 			xc, dom->domid, getpagesize(),
 			PROT_READ|PROT_WRITE,
@@ -621,7 +653,7 @@ static struct domain *create_domain(int domid)
 		return NULL;
 	}
 
-	dom = (struct domain *)malloc(sizeof(struct domain));
+	dom = calloc(1, sizeof *dom);
 	if (dom == NULL) {
 		dolog(LOG_ERR, "Out of memory %s:%s():L%d",
 		      __FILE__, __FUNCTION__, __LINE__);
@@ -639,24 +671,16 @@ static struct domain *create_domain(int domid)
 	strcat(dom->conspath, "/console");
 
 	dom->master_fd = -1;
+	dom->master_pollfd_idx = -1;
 	dom->slave_fd = -1;
 	dom->log_fd = -1;
+	dom->xce_pollfd_idx = -1;
 
-	dom->is_dead = false;
-	dom->buffer.data = 0;
-	dom->buffer.consumed = 0;
-	dom->buffer.size = 0;
-	dom->buffer.capacity = 0;
-	dom->buffer.max_capacity = 0;
-	dom->event_count = 0;
 	dom->next_period = ((long long)ts.tv_sec * 1000) + (ts.tv_nsec / 1000000) + RATE_LIMIT_PERIOD;
-	dom->next = NULL;
 
 	dom->ring_ref = -1;
 	dom->local_port = -1;
 	dom->remote_port = -1;
-	dom->interface = NULL;
-	dom->xce_handle = NULL;
 
 	if (!watch_domain(dom, true))
 		goto out;
@@ -720,9 +744,7 @@ static void shutdown_domain(struct domain *d)
 {
 	d->is_dead = true;
 	watch_domain(d, false);
-	if (d->interface != NULL)
-		munmap(d->interface, getpagesize());
-	d->interface = NULL;
+	domain_unmap_interface(d);
 	if (d->xce_handle != NULL)
 		xc_evtchn_close(d->xce_handle);
 	d->xce_handle = NULL;
@@ -730,7 +752,7 @@ static void shutdown_domain(struct domain *d)
 
 static unsigned enum_pass = 0;
 
-void enum_domains(void)
+static void enum_domains(void)
 {
 	int domid = 1;
 	xc_dominfo_t dominfo;
@@ -769,6 +791,17 @@ static int ring_free_bytes(struct domain *dom)
 	return (sizeof(intf->in) - space);
 }
 
+static void domain_handle_broken_tty(struct domain *dom, int recreate)
+{
+	domain_close_tty(dom);
+
+	if (recreate) {
+		domain_create_tty(dom);
+	} else {
+		shutdown_domain(dom);
+	}
+}
+
 static void handle_tty_read(struct domain *dom)
 {
 	ssize_t len = 0;
@@ -794,13 +827,7 @@ static void handle_tty_read(struct domain *dom)
 	 * keep the slave open for the duration.
 	 */
 	if (len < 0) {
-		domain_close_tty(dom);
-
-		if (domain_is_valid(dom->domid)) {
-			domain_create_tty(dom);
-		} else {
-			shutdown_domain(dom);
-		}
+		domain_handle_broken_tty(dom, domain_is_valid(dom->domid));
 	} else if (domain_is_valid(dom->domid)) {
 		prod = intf->in_prod;
 		for (i = 0; i < len; i++) {
@@ -828,14 +855,7 @@ static void handle_tty_write(struct domain *dom)
  	if (len < 1) {
 		dolog(LOG_DEBUG, "Write failed on domain %d: %zd, %d\n",
 		      dom->domid, len, errno);
-
-		domain_close_tty(dom);
-
-		if (domain_is_valid(dom->domid)) {
-			domain_create_tty(dom);
-		} else {
-			shutdown_domain(dom);
-		}
+		domain_handle_broken_tty(dom, domain_is_valid(dom->domid));
 	} else {
 		buffer_advance(&dom->buffer, len);
 	}
@@ -883,7 +903,7 @@ static void handle_xs(void)
 	free(vec);
 }
 
-static void handle_hv_logs(void)
+static void handle_hv_logs(xc_evtchn *xce_handle)
 {
 	char buffer[1024*16];
 	char *bufptr = buffer;
@@ -894,7 +914,7 @@ static void handle_hv_logs(void)
 	if ((port = xc_evtchn_pending(xce_handle)) == -1)
 		return;
 
-	if (xc_readconsolering(xch, bufptr, &size, 0, 1, &index) == 0 && size > 0) {
+	if (xc_readconsolering(xc, bufptr, &size, 0, 1, &index) == 0 && size > 0) {
 		int logret;
 		if (log_time_hv)
 			logret = write_with_timestamp(log_hv_fd, buffer, size,
@@ -928,18 +948,56 @@ static void handle_log_reload(void)
 	}
 }
 
+/* Returns index inside fds array if succees, -1 if fail */
+static int set_fds(int fd, short events)
+{
+	int ret;
+	if (current_array_size < nr_fds + 1) {
+		struct pollfd  *new_fds = NULL;
+		unsigned long newsize;
+
+		/* Round up to 2^8 boundary, in practice this just
+		 * make newsize larger than current_array_size.
+		 */
+		newsize = ROUNDUP(nr_fds + 1, 8);
+
+		new_fds = realloc(fds, sizeof(struct pollfd)*newsize);
+		if (!new_fds)
+			goto fail;
+		fds = new_fds;
+
+		memset(&fds[0] + current_array_size, 0,
+		       sizeof(struct pollfd) * (newsize-current_array_size));
+		current_array_size = newsize;
+	}
+
+	fds[nr_fds].fd = fd;
+	fds[nr_fds].events = events;
+	ret = nr_fds;
+	nr_fds++;
+
+	return ret;
+fail:
+	dolog(LOG_ERR, "realloc failed, ignoring fd %d\n", fd);
+	return -1;
+}
+
+static void reset_fds(void)
+{
+	nr_fds = 0;
+	if (fds)
+		memset(fds, 0, sizeof(struct pollfd) * current_array_size);
+}
+
 void handle_io(void)
 {
-	fd_set readfds, writefds;
 	int ret;
+	evtchn_port_or_error_t log_hv_evtchn = -1;
+	int xce_pollfd_idx = -1;
+	int xs_pollfd_idx = -1;
+	xc_evtchn *xce_handle = NULL;
 
 	if (log_hv) {
-		xch = xc_interface_open(0,0,0);
-		if (!xch) {
-			dolog(LOG_ERR, "Failed to open xc handle: %d (%s)",
-			      errno, strerror(errno));
-			goto out;
-		}
 		xce_handle = xc_evtchn_open(NULL, 0);
 		if (xce_handle == NULL) {
 			dolog(LOG_ERR, "Failed to open xce handle: %d (%s)",
@@ -957,23 +1015,27 @@ void handle_io(void)
 		}
 	}
 
+	xcg_handle = xc_gnttab_open(NULL, 0);
+	if (xcg_handle == NULL) {
+		dolog(LOG_DEBUG, "Failed to open xcg handle: %d (%s)",
+		      errno, strerror(errno));
+	}
+
+	enum_domains();
+
 	for (;;) {
 		struct domain *d, *n;
-		int max_fd = -1;
-		struct timeval timeout;
+		int poll_timeout; /* timeout in milliseconds */
 		struct timespec ts;
 		long long now, next_timeout = 0;
 
-		FD_ZERO(&readfds);
-		FD_ZERO(&writefds);
+		reset_fds();
 
-		FD_SET(xs_fileno(xs), &readfds);
-		max_fd = MAX(xs_fileno(xs), max_fd);
+		xs_pollfd_idx = set_fds(xs_fileno(xs), POLLIN|POLLPRI);
 
-		if (log_hv) {
-			FD_SET(xc_evtchn_fd(xce_handle), &readfds);
-			max_fd = MAX(xc_evtchn_fd(xce_handle), max_fd);
-		}
+		if (log_hv)
+			xce_pollfd_idx = set_fds(xc_evtchn_fd(xce_handle),
+						 POLLIN|POLLPRI);
 
 		if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
 			return;
@@ -982,10 +1044,12 @@ void handle_io(void)
 		/* Re-calculate any event counter allowances & unblock
 		   domains with new allowance */
 		for (d = dom_head; d; d = d->next) {
-			/* Add 5ms of fuzz since select() often returns
-			   a couple of ms sooner than requested. Without
-			   the fuzz we typically do an extra spin in select()
-			   with a 1/2 ms timeout every other iteration */
+			/* CS 16257:955ee4fa1345 introduces a 5ms fuzz
+			 * for select(), it is not clear poll() has
+			 * similar behavior (returning a couple of ms
+			 * sooner than requested) as well. Just leave
+			 * the fuzz here. Remove it with a separate
+			 * patch if necessary */
 			if ((now+5) > d->next_period) {
 				d->next_period = now + RATE_LIMIT_PERIOD;
 				if (d->event_count >= RATE_LIMIT_ALLOWANCE) {
@@ -1006,75 +1070,107 @@ void handle_io(void)
 				    !d->buffer.max_capacity ||
 				    d->buffer.size < d->buffer.max_capacity) {
 					int evtchn_fd = xc_evtchn_fd(d->xce_handle);
-					FD_SET(evtchn_fd, &readfds);
-					max_fd = MAX(evtchn_fd, max_fd);
+					d->xce_pollfd_idx = set_fds(evtchn_fd,
+								    POLLIN|POLLPRI);
 				}
 			}
 
 			if (d->master_fd != -1) {
+				short events = 0;
 				if (!d->is_dead && ring_free_bytes(d))
-					FD_SET(d->master_fd, &readfds);
+					events |= POLLIN;
 
 				if (!buffer_empty(&d->buffer))
-					FD_SET(d->master_fd, &writefds);
-				max_fd = MAX(d->master_fd, max_fd);
+					events |= POLLOUT;
+
+				if (events)
+					d->master_pollfd_idx =
+						set_fds(d->master_fd,
+							events|POLLPRI);
 			}
 		}
 
 		/* If any domain has been rate limited, we need to work
-		   out what timeout to supply to select */
+		   out what timeout to supply to poll */
 		if (next_timeout) {
 			long long duration = (next_timeout - now);
 			if (duration <= 0) /* sanity check */
 				duration = 1;
-			timeout.tv_sec = duration / 1000;
-			timeout.tv_usec = ((duration - (timeout.tv_sec * 1000))
-					   * 1000);
+			poll_timeout = (int)duration;
 		}
 
-		ret = select(max_fd + 1, &readfds, &writefds, 0,
-			     next_timeout ? &timeout : NULL);
+		ret = poll(fds, nr_fds, next_timeout ? poll_timeout : -1);
 
 		if (log_reload) {
 			handle_log_reload();
 			log_reload = 0;
 		}
 
-		/* Abort if select failed, except for EINTR cases
+		/* Abort if poll failed, except for EINTR cases
 		   which indicate a possible log reload */
 		if (ret == -1) {
 			if (errno == EINTR)
 				continue;
-			dolog(LOG_ERR, "Failure in select: %d (%s)",
+			dolog(LOG_ERR, "Failure in poll: %d (%s)",
 			      errno, strerror(errno));
 			break;
 		}
 
-		if (log_hv && FD_ISSET(xc_evtchn_fd(xce_handle), &readfds))
-			handle_hv_logs();
+		if (log_hv && xce_pollfd_idx != -1) {
+			if (fds[xce_pollfd_idx].revents & ~(POLLIN|POLLOUT|POLLPRI)) {
+				dolog(LOG_ERR,
+				      "Failure in poll xce_handle: %d (%s)",
+				      errno, strerror(errno));
+				break;
+			} else if (fds[xce_pollfd_idx].revents & POLLIN)
+				handle_hv_logs(xce_handle);
+
+			xce_pollfd_idx = -1;
+		}
 
 		if (ret <= 0)
 			continue;
 
-		if (FD_ISSET(xs_fileno(xs), &readfds))
-			handle_xs();
+		if (xs_pollfd_idx != -1) {
+			if (fds[xs_pollfd_idx].revents & ~(POLLIN|POLLOUT|POLLPRI)) {
+				dolog(LOG_ERR,
+				      "Failure in poll xs_handle: %d (%s)",
+				      errno, strerror(errno));
+				break;
+			} else if (fds[xs_pollfd_idx].revents & POLLIN)
+				handle_xs();
+
+			xs_pollfd_idx = -1;
+		}
 
 		for (d = dom_head; d; d = n) {
 			n = d->next;
 			if (d->event_count < RATE_LIMIT_ALLOWANCE) {
 				if (d->xce_handle != NULL &&
-				    FD_ISSET(xc_evtchn_fd(d->xce_handle),
-					     &readfds))
-					handle_ring_read(d);
+				    d->xce_pollfd_idx != -1 &&
+				    !(fds[d->xce_pollfd_idx].revents &
+				      ~(POLLIN|POLLOUT|POLLPRI)) &&
+				      (fds[d->xce_pollfd_idx].revents &
+				       POLLIN))
+				    handle_ring_read(d);
 			}
 
-			if (d->master_fd != -1 && FD_ISSET(d->master_fd,
-							   &readfds))
-				handle_tty_read(d);
+			if (d->master_fd != -1 && d->master_pollfd_idx != -1) {
+				if (fds[d->master_pollfd_idx].revents &
+				    ~(POLLIN|POLLOUT|POLLPRI))
+					domain_handle_broken_tty(d,
+						   domain_is_valid(d->domid));
+				else {
+					if (fds[d->master_pollfd_idx].revents &
+					    POLLIN)
+						handle_tty_read(d);
+					if (fds[d->master_pollfd_idx].revents &
+					    POLLOUT)
+						handle_tty_write(d);
+				}
+			}
 
-			if (d->master_fd != -1 && FD_ISSET(d->master_fd,
-							   &writefds))
-				handle_tty_write(d);
+			d->xce_pollfd_idx = d->master_pollfd_idx = -1;
 
 			if (d->last_seen != enum_pass)
 				shutdown_domain(d);
@@ -1084,18 +1180,21 @@ void handle_io(void)
 		}
 	}
 
+	free(fds);
+	current_array_size = 0;
+
  out:
 	if (log_hv_fd != -1) {
 		close(log_hv_fd);
 		log_hv_fd = -1;
 	}
-	if (xch) {
-		xc_interface_close(xch);
-		xch = 0;
-	}
 	if (xce_handle != NULL) {
 		xc_evtchn_close(xce_handle);
 		xce_handle = NULL;
+	}
+	if (xcg_handle != NULL) {
+		xc_gnttab_close(xcg_handle);
+		xcg_handle = NULL;
 	}
 	log_hv_evtchn = -1;
 }

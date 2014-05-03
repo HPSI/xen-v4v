@@ -18,7 +18,6 @@
  */
 
 #include "xc_private.h"
-#include <errno.h>
 
 int xc_gnttab_op(xc_interface *xch, int cmd, void * op, int op_size, int count)
 {
@@ -124,8 +123,7 @@ static void *_gnttab_map_table(xc_interface *xch, int domid, int *gnt_num)
 err:
     if ( frame_list )
         xc_hypercall_buffer_free(xch, frame_list);
-    if ( pfn_list )
-        free(pfn_list);
+    free(pfn_list);
 
     return gnt;
 }
@@ -233,7 +231,7 @@ int xc_gntshr_munmap(xc_gntshr *xcg, void *start_address, uint32_t count)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

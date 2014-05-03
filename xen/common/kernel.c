@@ -81,9 +81,15 @@ void __init cmdline_parse(const char *cmdline)
         /* Search for value part of a key=value option. */
         optval = strchr(opt, '=');
         if ( optval != NULL )
+        {
             *optval++ = '\0'; /* nul-terminate the option value */
+            q = strpbrk(opt, "([{<");
+        }
         else
+        {
             optval = q;       /* default option value is empty string */
+            q = NULL;
+        }
 
         /* Boolean parameters can be inverted with 'no-' prefix. */
         bool_assert = !!strncmp("no-", optkey, 3);
@@ -93,7 +99,17 @@ void __init cmdline_parse(const char *cmdline)
         for ( param = &__setup_start; param < &__setup_end; param++ )
         {
             if ( strcmp(param->name, optkey) )
+            {
+                if ( param->type == OPT_CUSTOM && q &&
+                     strlen(param->name) == q + 1 - opt &&
+                     !strncmp(param->name, opt, q + 1 - opt) )
+                {
+                    optval[-1] = '=';
+                    ((void (*)(const char *))param->var)(q);
+                    optval[-1] = '\0';
+                }
                 continue;
+            }
 
             switch ( param->type )
             {
@@ -180,19 +196,20 @@ void add_taint(unsigned flag)
     tainted |= flag;
 }
 
-extern initcall_t __initcall_start, __presmp_initcall_end, __initcall_end;
+extern const initcall_t __initcall_start[], __presmp_initcall_end[],
+    __initcall_end[];
 
 void __init do_presmp_initcalls(void)
 {
-    initcall_t *call;
-    for ( call = &__initcall_start; call < &__presmp_initcall_end; call++ )
+    const initcall_t *call;
+    for ( call = __initcall_start; call < __presmp_initcall_end; call++ )
         (*call)();
 }
 
 void __init do_initcalls(void)
 {
-    initcall_t *call;
-    for ( call = &__presmp_initcall_end; call < &__initcall_end; call++ )
+    const initcall_t *call;
+    for ( call = __presmp_initcall_end; call < __initcall_end; call++ )
         (*call)();
 }
 
@@ -286,17 +303,27 @@ DO(xen_version)(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
                     (1U << XENFEAT_auto_translated_physmap);
             if ( supervisor_mode_kernel )
                 fi.submap |= 1U << XENFEAT_supervisor_mode_kernel;
-            if ( current->domain == dom0 )
+            if ( is_hardware_domain(current->domain) )
                 fi.submap |= 1U << XENFEAT_dom0;
 #ifdef CONFIG_X86
-            if ( !is_hvm_vcpu(current) )
+            switch ( d->guest_type )
+            {
+            case guest_type_pv:
                 fi.submap |= (1U << XENFEAT_mmu_pt_update_preserve_ad) |
                              (1U << XENFEAT_highmem_assist) |
                              (1U << XENFEAT_gnttab_map_avail_bits);
-            else
+                break;
+            case guest_type_pvh:
+                fi.submap |= (1U << XENFEAT_hvm_safe_pvclock) |
+                             (1U << XENFEAT_supervisor_mode_kernel) |
+                             (1U << XENFEAT_hvm_callback_vector);
+                break;
+            case guest_type_hvm:
                 fi.submap |= (1U << XENFEAT_hvm_safe_pvclock) |
                              (1U << XENFEAT_hvm_callback_vector) |
                              (1U << XENFEAT_hvm_pirqs);
+                break;
+            }
 #endif
             break;
         default:
@@ -370,7 +397,7 @@ DO(ni_hypercall)(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

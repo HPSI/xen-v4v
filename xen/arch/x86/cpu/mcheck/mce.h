@@ -33,16 +33,14 @@ enum mcheck_type {
 	mcheck_unset = -1,
 	mcheck_none,
 	mcheck_amd_famXX,
-	mcheck_amd_k7,
 	mcheck_amd_k8,
 	mcheck_intel
 };
 
-/* Init functions */
-enum mcheck_type amd_k7_mcheck_init(struct cpuinfo_x86 *c);
-enum mcheck_type amd_k8_mcheck_init(struct cpuinfo_x86 *c);
-enum mcheck_type amd_f10_mcheck_init(struct cpuinfo_x86 *c);
+extern uint8_t cmci_apic_vector;
 
+/* Init functions */
+enum mcheck_type amd_mcheck_init(struct cpuinfo_x86 *c);
 enum mcheck_type intel_mcheck_init(struct cpuinfo_x86 *c, bool_t bsp);
 
 void intel_mcheck_timer(struct cpuinfo_x86 *c);
@@ -59,7 +57,7 @@ int mce_available(struct cpuinfo_x86 *c);
 unsigned int mce_firstbank(struct cpuinfo_x86 *c);
 /* Helper functions used for collecting error telemetry */
 struct mc_info *x86_mcinfo_getptr(void);
-void mc_panic(char *s);
+void noreturn mc_panic(char *s);
 void x86_mc_get_cpu_info(unsigned, uint32_t *, uint16_t *, uint16_t *,
 			 uint32_t *, uint32_t *, uint32_t *, uint32_t *);
 
@@ -79,7 +77,7 @@ extern void mce_recoverable_register(mce_recoverable_t);
 /* Read an MSR, checking for an interposed value first */
 extern struct intpose_ent *intpose_lookup(unsigned int, uint64_t,
     uint64_t *);
-extern void intpose_inval(unsigned int, uint64_t);
+extern bool_t intpose_inval(unsigned int, uint64_t);
 
 static inline uint64_t mca_rdmsr(unsigned int msr)
 {
@@ -91,9 +89,9 @@ static inline uint64_t mca_rdmsr(unsigned int msr)
 
 /* Write an MSR, invalidating any interposed value */
 #define mca_wrmsr(msr, val) do { \
-       intpose_inval(smp_processor_id(), msr); \
-       wrmsrl(msr, val); \
-} while (0)
+    if ( !intpose_inval(smp_processor_id(), msr) ) \
+        wrmsrl(msr, val); \
+} while ( 0 )
 
 
 /* Utility function to "logout" all architectural MCA telemetry from the MCA
@@ -104,7 +102,6 @@ static inline uint64_t mca_rdmsr(unsigned int msr)
  * of the MCA data observed in the logout operation. */
 
 enum mca_source {
-	MCA_MCE_HANDLER,
 	MCA_POLLER,
 	MCA_CMCI_HANDLER,
 	MCA_RESET,

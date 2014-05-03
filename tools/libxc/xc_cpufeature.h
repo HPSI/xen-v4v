@@ -125,6 +125,7 @@
 #define X86_FEATURE_NODEID_MSR  19 /* NodeId MSR */
 #define X86_FEATURE_TBM         21 /* trailing bit manipulations */
 #define X86_FEATURE_TOPOEXT     22 /* topology extensions CPUID leafs */
+#define X86_FEATURE_DBEXT       26 /* data breakpoint extension */
 
 /* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx) */
 #define X86_FEATURE_FSGSBASE     0 /* {RD,WR}{FS,GS}BASE instructions */
@@ -137,5 +138,8 @@
 #define X86_FEATURE_ERMS         9 /* Enhanced REP MOVSB/STOSB */
 #define X86_FEATURE_INVPCID     10 /* Invalidate Process Context ID */
 #define X86_FEATURE_RTM         11 /* Restricted Transactional Memory */
+#define X86_FEATURE_RDSEED      18 /* RDSEED instruction */
+#define X86_FEATURE_ADX         19 /* ADCX, ADOX instructions */
+
 
 #endif /* __LIBXC_CPUFEATURE_H */

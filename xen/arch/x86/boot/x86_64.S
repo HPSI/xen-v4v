@@ -29,7 +29,11 @@
 
         test    %ebx,%ebx
         jnz     start_secondary
+        jmp     start_bsp
 
+        .section .init.text, "ax", @progbits
+
+start_bsp:
         /* Initialise IDT with simple error defaults. */
         leaq    ignore_int(%rip),%rcx
         movl    %ecx,%eax
@@ -55,10 +59,6 @@
         ud2     /* Force a panic (invalid opcode). */
 
 /* This is the default interrupt handler. */
-int_msg:
-        .asciz "Unknown interrupt (cr2=%016lx)\n"
-hex_msg:
-        .asciz "    %016lx"
 ignore_int:
         SAVE_ALL
         movq    %cr2,%rsi
@@ -73,8 +73,15 @@ ignore_int:
         call    printk
         testq   $0xff8,%rbp
         jnz     0b
-1:      jmp     1b
+1:      hlt
+        jmp     1b
 
+        .section .init.rodata, "a", @progbits
+
+int_msg:
+        .asciz "Unknown interrupt (cr2=%016lx)\n"
+hex_msg:
+        .asciz "    %016lx"
 
 /*** DESCRIPTOR TABLES ***/
 
@@ -84,23 +91,21 @@ multiboot_ptr:
         .long   0
 
         .word   0
-        .globl  gdt_descr
-gdt_descr:
+GLOBAL(gdt_descr)
         .word   LAST_RESERVED_GDT_BYTE
         .quad   boot_cpu_gdt_table - FIRST_RESERVED_GDT_BYTE
 
         .word   0,0,0
-        .globl  idt_descr
-idt_descr:
+GLOBAL(idt_descr)
         .word   256*16-1
         .quad   idt_table
 
-ENTRY(stack_start)
+GLOBAL(stack_start)
         .quad   cpu0_stack
 
         .section .data.page_aligned, "aw", @progbits
         .align PAGE_SIZE, 0
-ENTRY(boot_cpu_gdt_table)
+GLOBAL(boot_cpu_gdt_table)
         .quad 0x0000000000000000     /* unused */
         .quad 0x00af9a000000ffff     /* 0xe008 ring 0 code, 64-bit mode   */
         .quad 0x00cf92000000ffff     /* 0xe010 ring 0 data                */
@@ -115,7 +120,7 @@ ENTRY(boot_cpu_gdt_table)
         .align PAGE_SIZE, 0
 /* NB. Even rings != 0 get access to the full 4Gb, as only the            */
 /*     (compatibility) machine->physical mapping table lives there.       */
-ENTRY(boot_cpu_compat_gdt_table)
+GLOBAL(boot_cpu_compat_gdt_table)
         .quad 0x0000000000000000     /* unused */
         .quad 0x00af9a000000ffff     /* 0xe008 ring 0 code, 64-bit mode   */
         .quad 0x00cf92000000ffff     /* 0xe010 ring 0 data                */
@@ -128,12 +133,10 @@ ENTRY(boot_cpu_compat_gdt_table)
         .quad 0x0000910000000000     /* per-CPU entry (limit == cpu)      */
         .align PAGE_SIZE, 0
 
-	.globl __page_tables_start, __page_tables_end
-__page_tables_start:
+GLOBAL(__page_tables_start)
 
 /* Mapping of first 16 megabytes of memory. */
-        .globl l2_identmap
-l2_identmap:
+GLOBAL(l2_identmap)
         .quad sym_phys(l1_identmap) + __PAGE_HYPERVISOR
         pfn = 0
         .rept 7
@@ -143,8 +146,7 @@ l2_identmap:
         .fill 4 * L2_PAGETABLE_ENTRIES - 8, 8, 0
         .size l2_identmap, . - l2_identmap
 
-        .globl l2_xenmap
-l2_xenmap:
+GLOBAL(l2_xenmap)
         idx = 0
         .rept 8
         .quad sym_phys(__image_base__) + (idx << L2_PAGETABLE_SHIFT) + (PAGE_HYPERVISOR | _PAGE_PSE)
@@ -165,8 +167,7 @@ l2_fixmap:
         .endr
         .size l2_fixmap, . - l2_fixmap
 
-        .globl l3_identmap
-l3_identmap:
+GLOBAL(l3_identmap)
         idx = 0
         .rept 4
         .quad sym_phys(l2_identmap) + (idx << PAGE_SHIFT) + __PAGE_HYPERVISOR
@@ -190,8 +191,7 @@ l3_xenmap:
         .size l3_xenmap, . - l3_xenmap
 
 /* Top-level master (and idle-domain) page directory. */
-        .globl idle_pg_table
-idle_pg_table:
+GLOBAL(idle_pg_table)
         .quad sym_phys(l3_bootmap) + __PAGE_HYPERVISOR
         idx = 1
         .rept L4_PAGETABLE_ENTRIES - 1
@@ -206,4 +206,4 @@ idle_pg_table:
         .endr
         .size idle_pg_table, . - idle_pg_table
 
-__page_tables_end:
+GLOBAL(__page_tables_end)

@@ -51,6 +51,18 @@ SECTIONS
   } :text = 0x9090
 
   .rodata : {
+       /* Bug frames table */
+       . = ALIGN(4);
+       __start_bug_frames = .;
+       *(.bug_frames.0)
+       __stop_bug_frames_0 = .;
+       *(.bug_frames.1)
+       __stop_bug_frames_1 = .;
+       *(.bug_frames.2)
+       __stop_bug_frames_2 = .;
+       *(.bug_frames.3)
+       __stop_bug_frames_3 = .;
+
        *(.rodata)
        *(.rodata.*)
   } :text
@@ -108,6 +120,11 @@ SECTIONS
        __trampoline_seg_start = .;
        *(.trampoline_seg)
        __trampoline_seg_stop = .;
+
+       . = ALIGN(8);
+       __ctors_start = .;
+       *(.ctors)
+       __ctors_end = .;
   } :text
   . = ALIGN(32);
   .init.setup : {
@@ -181,3 +198,5 @@ SECTIONS
   .stab.indexstr 0 : { *(.stab.indexstr) }
   .comment 0 : { *(.comment) }
 }
+
+ASSERT(kexec_reloc_size - kexec_reloc <= PAGE_SIZE, "kexec_reloc is too large")

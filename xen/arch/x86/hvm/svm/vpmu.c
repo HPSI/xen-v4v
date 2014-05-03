@@ -87,7 +87,7 @@ static const u32 AMD_F15H_CTRLS[] = {
 struct amd_vpmu_context {
     u64 counters[MAX_NUM_COUNTERS];
     u64 ctrls[MAX_NUM_COUNTERS];
-    u32 hw_lapic_lvtpc;
+    bool_t msr_bitmap_set;
 };
 
 static inline int get_pmu_reg_type(u32 addr)
@@ -138,62 +138,72 @@ static inline u32 get_fam15h_addr(u32 addr)
     return addr;
 }
 
-static int amd_vpmu_do_interrupt(struct cpu_user_regs *regs)
-{
-    struct vcpu *v = current;
-    struct vlapic *vlapic = vcpu_vlapic(v);
-    u32 vlapic_lvtpc;
-    unsigned char int_vec;
-
-    if ( !is_vlapic_lvtpc_enabled(vlapic) )
-        return 0;
-
-    vlapic_lvtpc = vlapic_get_reg(vlapic, APIC_LVTPC);
-    int_vec = vlapic_lvtpc & APIC_VECTOR_MASK;
-
-    if ( GET_APIC_DELIVERY_MODE(vlapic_lvtpc) == APIC_MODE_FIXED )
-        vlapic_set_irq(vcpu_vlapic(v), int_vec, 0);
-    else
-        v->nmi_pending = 1;
-
-    return 1;
-}
-
-static inline void context_restore(struct vcpu *v)
+static void amd_vpmu_set_msr_bitmap(struct vcpu *v)
 {
     unsigned int i;
     struct vpmu_struct *vpmu = vcpu_vpmu(v);
     struct amd_vpmu_context *ctxt = vpmu->context;
 
     for ( i = 0; i < num_counters; i++ )
-        wrmsrl(ctrls[i], ctxt->ctrls[i]);
+    {
+        svm_intercept_msr(v, counters[i], MSR_INTERCEPT_NONE);
+        svm_intercept_msr(v, ctrls[i], MSR_INTERCEPT_WRITE);
+    }
+
+    ctxt->msr_bitmap_set = 1;
+}
+
+static void amd_vpmu_unset_msr_bitmap(struct vcpu *v)
+{
+    unsigned int i;
+    struct vpmu_struct *vpmu = vcpu_vpmu(v);
+    struct amd_vpmu_context *ctxt = vpmu->context;
+
+    for ( i = 0; i < num_counters; i++ )
+    {
+        svm_intercept_msr(v, counters[i], MSR_INTERCEPT_RW);
+        svm_intercept_msr(v, ctrls[i], MSR_INTERCEPT_RW);
+    }
+
+    ctxt->msr_bitmap_set = 0;
+}
+
+static int amd_vpmu_do_interrupt(struct cpu_user_regs *regs)
+{
+    return 1;
+}
+
+static inline void context_load(struct vcpu *v)
+{
+    unsigned int i;
+    struct vpmu_struct *vpmu = vcpu_vpmu(v);
+    struct amd_vpmu_context *ctxt = vpmu->context;
 
     for ( i = 0; i < num_counters; i++ )
     {
         wrmsrl(counters[i], ctxt->counters[i]);
-
-        /* Force an interrupt to allow guest reset the counter,
-        if the value is positive */
-        if ( is_overflowed(ctxt->counters[i]) && (ctxt->counters[i] > 0) )
-        {
-            gdprintk(XENLOG_WARNING, "VPMU: Force a performance counter "
-                "overflow interrupt!\n");
-            amd_vpmu_do_interrupt(0);
-        }
+        wrmsrl(ctrls[i], ctxt->ctrls[i]);
     }
 }
 
-static void amd_vpmu_restore(struct vcpu *v)
+static void amd_vpmu_load(struct vcpu *v)
 {
     struct vpmu_struct *vpmu = vcpu_vpmu(v);
     struct amd_vpmu_context *ctxt = vpmu->context;
 
-    if ( !(vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) &&
-           vpmu_is_set(vpmu, VPMU_RUNNING)) )
-        return;
+    vpmu_reset(vpmu, VPMU_FROZEN);
 
-    context_restore(v);
-    apic_write(APIC_LVTPC, ctxt->hw_lapic_lvtpc);
+    if ( vpmu_is_set(vpmu, VPMU_CONTEXT_LOADED) )
+    {
+        unsigned int i;
+
+        for ( i = 0; i < num_counters; i++ )
+            wrmsrl(ctrls[i], ctxt->ctrls[i]);
+
+        return;
+    }
+
+    context_load(v);
 }
 
 static inline void context_save(struct vcpu *v)
@@ -202,25 +212,40 @@ static inline void context_save(struct vcpu *v)
     struct vpmu_struct *vpmu = vcpu_vpmu(v);
     struct amd_vpmu_context *ctxt = vpmu->context;
 
+    /* No need to save controls -- they are saved in amd_vpmu_do_wrmsr */
     for ( i = 0; i < num_counters; i++ )
         rdmsrl(counters[i], ctxt->counters[i]);
-
-    for ( i = 0; i < num_counters; i++ )
-        rdmsrl(ctrls[i], ctxt->ctrls[i]);
 }
 
-static void amd_vpmu_save(struct vcpu *v)
+static int amd_vpmu_save(struct vcpu *v)
 {
     struct vpmu_struct *vpmu = vcpu_vpmu(v);
     struct amd_vpmu_context *ctx = vpmu->context;
+    unsigned int i;
 
-    if ( !(vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) &&
-           vpmu_is_set(vpmu, VPMU_RUNNING)) )
-        return;
+    /*
+     * Stop the counters. If we came here via vpmu_save_force (i.e.
+     * when VPMU_CONTEXT_SAVE is set) counters are already stopped.
+     */
+    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_SAVE) )
+    {
+        vpmu_set(vpmu, VPMU_FROZEN);
+
+        for ( i = 0; i < num_counters; i++ )
+            wrmsrl(ctrls[i], 0);
+
+        return 0;
+    }
+
+    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_LOADED) )
+        return 0;
 
     context_save(v);
-    ctx->hw_lapic_lvtpc = apic_read(APIC_LVTPC);
-    apic_write(APIC_LVTPC,  ctx->hw_lapic_lvtpc | APIC_LVT_MASKED);
+
+    if ( !vpmu_is_set(vpmu, VPMU_RUNNING) && ctx->msr_bitmap_set )
+        amd_vpmu_unset_msr_bitmap(v);
+
+    return 1;
 }
 
 static void context_update(unsigned int msr, u64 msr_content)
@@ -237,14 +262,18 @@ static void context_update(unsigned int msr, u64 msr_content)
     }
 
     for ( i = 0; i < num_counters; i++ )
-        if ( msr == counters[i] )
+    {
+       if ( msr == ctrls[i] )
+       {
+           ctxt->ctrls[i] = msr_content;
+           return;
+       }
+        else if (msr == counters[i] )
+        {
             ctxt->counters[i] = msr_content;
-
-    for ( i = 0; i < num_counters; i++ )
-        if ( msr == ctrls[i] )
-            ctxt->ctrls[i] = msr_content;
-
-    ctxt->hw_lapic_lvtpc = apic_read(APIC_LVTPC);
+            return;
+        }
+    }
 }
 
 static int amd_vpmu_do_wrmsr(unsigned int msr, uint64_t msr_content)
@@ -267,6 +296,10 @@ static int amd_vpmu_do_wrmsr(unsigned int msr, uint64_t msr_content)
             return 1;
         vpmu_set(vpmu, VPMU_RUNNING);
         apic_write(APIC_LVTPC, PMU_APIC_VECTOR);
+        vpmu->hw_lapic_lvtpc = PMU_APIC_VECTOR;
+
+        if ( !((struct amd_vpmu_context *)vpmu->context)->msr_bitmap_set )
+            amd_vpmu_set_msr_bitmap(v);
     }
 
     /* stop saving & restore if guest stops first counter */
@@ -274,8 +307,19 @@ static int amd_vpmu_do_wrmsr(unsigned int msr, uint64_t msr_content)
         (is_pmu_enabled(msr_content) == 0) && vpmu_is_set(vpmu, VPMU_RUNNING) )
     {
         apic_write(APIC_LVTPC, PMU_APIC_VECTOR | APIC_LVT_MASKED);
+        vpmu->hw_lapic_lvtpc = PMU_APIC_VECTOR | APIC_LVT_MASKED;
         vpmu_reset(vpmu, VPMU_RUNNING);
+        if ( ((struct amd_vpmu_context *)vpmu->context)->msr_bitmap_set )
+            amd_vpmu_unset_msr_bitmap(v);
         release_pmu_ownship(PMU_OWNER_HVM);
+    }
+
+    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_LOADED)
+        || vpmu_is_set(vpmu, VPMU_FROZEN) )
+    {
+        context_load(v);
+        vpmu_set(vpmu, VPMU_CONTEXT_LOADED);
+        vpmu_reset(vpmu, VPMU_FROZEN);
     }
 
     /* Update vpmu context immediately */
@@ -288,7 +332,19 @@ static int amd_vpmu_do_wrmsr(unsigned int msr, uint64_t msr_content)
 
 static int amd_vpmu_do_rdmsr(unsigned int msr, uint64_t *msr_content)
 {
+    struct vcpu *v = current;
+    struct vpmu_struct *vpmu = vcpu_vpmu(v);
+
+    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_LOADED)
+        || vpmu_is_set(vpmu, VPMU_FROZEN) )
+    {
+        context_load(v);
+        vpmu_set(vpmu, VPMU_CONTEXT_LOADED);
+        vpmu_reset(vpmu, VPMU_FROZEN);
+    }
+
     rdmsrl(msr, *msr_content);
+
     return 1;
 }
 
@@ -314,6 +370,7 @@ static int amd_vpmu_initialise(struct vcpu *v)
 	 case 0x10:
 	 case 0x12:
 	 case 0x14:
+	 case 0x16:
 	 default:
 	     num_counters = F10H_NUM_COUNTERS;
 	     counters = AMD_F10H_COUNTERS;
@@ -344,6 +401,9 @@ static void amd_vpmu_destroy(struct vcpu *v)
     if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) )
         return;
 
+    if ( ((struct amd_vpmu_context *)vpmu->context)->msr_bitmap_set )
+        amd_vpmu_unset_msr_bitmap(v);
+
     xfree(vpmu->context);
     vpmu_reset(vpmu, VPMU_CONTEXT_ALLOCATED);
 
@@ -354,13 +414,53 @@ static void amd_vpmu_destroy(struct vcpu *v)
     }
 }
 
+/* VPMU part of the 'q' keyhandler */
+static void amd_vpmu_dump(const struct vcpu *v)
+{
+    const struct vpmu_struct *vpmu = vcpu_vpmu(v);
+    const struct amd_vpmu_context *ctxt = vpmu->context;
+    unsigned int i;
+
+    printk("    VPMU state: 0x%x ", vpmu->flags);
+    if ( !vpmu_is_set(vpmu, VPMU_CONTEXT_ALLOCATED) )
+    {
+         printk("\n");
+         return;
+    }
+
+    printk("(");
+    if ( vpmu_is_set(vpmu, VPMU_PASSIVE_DOMAIN_ALLOCATED) )
+        printk("PASSIVE_DOMAIN_ALLOCATED, ");
+    if ( vpmu_is_set(vpmu, VPMU_FROZEN) )
+        printk("FROZEN, ");
+    if ( vpmu_is_set(vpmu, VPMU_CONTEXT_SAVE) )
+        printk("SAVE, ");
+    if ( vpmu_is_set(vpmu, VPMU_RUNNING) )
+        printk("RUNNING, ");
+    if ( vpmu_is_set(vpmu, VPMU_CONTEXT_LOADED) )
+        printk("LOADED, ");
+    printk("ALLOCATED)\n");
+
+    for ( i = 0; i < num_counters; i++ )
+    {
+        uint64_t ctrl, cntr;
+
+        rdmsrl(ctrls[i], ctrl);
+        rdmsrl(counters[i], cntr);
+        printk("      %#x: %#lx (%#lx in HW)    %#x: %#lx (%#lx in HW)\n",
+               ctrls[i], ctxt->ctrls[i], ctrl,
+               counters[i], ctxt->counters[i], cntr);
+    }
+}
+
 struct arch_vpmu_ops amd_vpmu_ops = {
     .do_wrmsr = amd_vpmu_do_wrmsr,
     .do_rdmsr = amd_vpmu_do_rdmsr,
     .do_interrupt = amd_vpmu_do_interrupt,
     .arch_vpmu_destroy = amd_vpmu_destroy,
     .arch_vpmu_save = amd_vpmu_save,
-    .arch_vpmu_load = amd_vpmu_restore
+    .arch_vpmu_load = amd_vpmu_load,
+    .arch_vpmu_dump = amd_vpmu_dump
 };
 
 int svm_vpmu_initialise(struct vcpu *v, unsigned int vpmu_flags)
@@ -369,12 +469,17 @@ int svm_vpmu_initialise(struct vcpu *v, unsigned int vpmu_flags)
     uint8_t family = current_cpu_data.x86;
     int ret = 0;
 
+    /* vpmu enabled? */
+    if ( !vpmu_flags )
+        return 0;
+
     switch ( family )
     {
     case 0x10:
     case 0x12:
     case 0x14:
     case 0x15:
+    case 0x16:
         ret = amd_vpmu_initialise(v);
         if ( !ret )
             vpmu->arch_vpmu_ops = &amd_vpmu_ops;

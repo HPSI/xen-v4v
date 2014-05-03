@@ -36,7 +36,7 @@
  * iommu_inclusive_mapping: when set, all memory below 4GB is included in dom0
  * 1:1 iommu mappings except xen and unusable regions.
  */
-static bool_t __initdata iommu_inclusive_mapping = 1;
+static bool_t __hwdom_initdata iommu_inclusive_mapping = 1;
 boolean_param("iommu_inclusive_mapping", iommu_inclusive_mapping);
 
 void *map_vtd_domain_page(u64 maddr)
@@ -62,12 +62,6 @@ void cacheline_flush(char * addr)
 void flush_all_cache()
 {
     wbinvd();
-}
-
-void *__init map_to_nocache_virt(int nr_iommus, u64 maddr)
-{
-    set_fixmap_nocache(FIX_IOMMU_REGS_BASE_0 + nr_iommus, maddr);
-    return (void *)fix_to_virt(FIX_IOMMU_REGS_BASE_0 + nr_iommus);
 }
 
 static int _hvm_dpci_isairq_eoi(struct domain *d,
@@ -113,11 +107,11 @@ void hvm_dpci_isairq_eoi(struct domain *d, unsigned int isairq)
     spin_unlock(&d->event_lock);
 }
 
-void __init iommu_set_dom0_mapping(struct domain *d)
+void __hwdom_init iommu_set_hwdom_mapping(struct domain *d)
 {
     unsigned long i, j, tmp, top;
 
-    BUG_ON(d->domain_id != 0);
+    BUG_ON(!is_hardware_domain(d));
 
     top = max(max_pdx, pfn_to_pdx(0xffffffffUL >> PAGE_SHIFT) + 1);
 

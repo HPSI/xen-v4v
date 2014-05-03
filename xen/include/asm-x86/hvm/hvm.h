@@ -90,6 +90,9 @@ struct hvm_function_table {
     /* Support Hardware-Assisted Paging? */
     int hap_supported;
 
+    /* Necessary hardware support for PVH mode? */
+    int pvh_supported;
+
     /* Indicate HAP capabilities. */
     int hap_capabilities;
 
@@ -105,6 +108,10 @@ struct hvm_function_table {
     /* save and load hvm guest cpu context for save/restore */
     void (*save_cpu_ctxt)(struct vcpu *v, struct hvm_hw_cpu *ctxt);
     int (*load_cpu_ctxt)(struct vcpu *v, struct hvm_hw_cpu *ctxt);
+
+    unsigned int (*init_msr)(void);
+    void (*save_msr)(struct vcpu *, struct hvm_msr *);
+    int (*load_msr)(struct vcpu *, struct hvm_msr *);
 
     /* Examine specifics of the guest state. */
     unsigned int (*get_interrupt_shadow)(struct vcpu *v);
@@ -130,7 +137,7 @@ struct hvm_function_table {
     int  (*get_guest_pat)(struct vcpu *v, u64 *);
     int  (*set_guest_pat)(struct vcpu *v, u64);
 
-    void (*set_tsc_offset)(struct vcpu *v, u64 offset);
+    void (*set_tsc_offset)(struct vcpu *v, u64 offset, u64 at_tsc);
 
     void (*inject_trap)(struct hvm_trap *trap);
 
@@ -156,7 +163,7 @@ struct hvm_function_table {
     int (*msr_read_intercept)(unsigned int msr, uint64_t *msr_content);
     int (*msr_write_intercept)(unsigned int msr, uint64_t msr_content);
     void (*invlpg_intercept)(unsigned long vaddr);
-    void (*set_uc_mode)(struct vcpu *v);
+    void (*handle_cd)(struct vcpu *v, unsigned long value);
     void (*set_info_guest)(struct vcpu *v);
     void (*set_rdtsc_exiting)(struct vcpu *v, bool_t);
 
@@ -170,7 +177,7 @@ struct hvm_function_table {
                                 uint64_t exitcode);
     int (*nhvm_vcpu_vmexit_trap)(struct vcpu *v, struct hvm_trap *trap);
     uint64_t (*nhvm_vcpu_guestcr3)(struct vcpu *v);
-    uint64_t (*nhvm_vcpu_hostcr3)(struct vcpu *v);
+    uint64_t (*nhvm_vcpu_p2m_base)(struct vcpu *v);
     uint32_t (*nhvm_vcpu_asid)(struct vcpu *v);
     int (*nhvm_vmcx_guest_intercepts_trap)(struct vcpu *v, 
                                unsigned int trapnr, int errcode);
@@ -183,6 +190,16 @@ struct hvm_function_table {
     /* Virtual interrupt delivery */
     void (*update_eoi_exit_bitmap)(struct vcpu *v, u8 vector, u8 trig);
     int (*virtual_intr_delivery_enabled)(void);
+    void (*process_isr)(int isr, struct vcpu *v);
+    void (*deliver_posted_intr)(struct vcpu *v, u8 vector);
+    void (*sync_pir_to_irr)(struct vcpu *v);
+    void (*handle_eoi)(u8 vector);
+
+    /*Walk nested p2m  */
+    int (*nhvm_hap_walk_L1_p2m)(struct vcpu *v, paddr_t L2_gpa,
+                                paddr_t *L1_gpa, unsigned int *page_order,
+                                uint8_t *p2m_acc, bool_t access_r,
+                                bool_t access_w, bool_t access_x);
 };
 
 extern struct hvm_function_table hvm_funcs;
@@ -190,8 +207,8 @@ extern bool_t hvm_enabled;
 extern bool_t cpu_has_lmsl;
 extern s8 hvm_port80_allowed;
 
-extern struct hvm_function_table *start_svm(void);
-extern struct hvm_function_table *start_vmx(void);
+extern const struct hvm_function_table *start_svm(void);
+extern const struct hvm_function_table *start_vmx(void);
 
 int hvm_domain_initialise(struct domain *d);
 void hvm_domain_relinquish_resources(struct domain *d);
@@ -215,12 +232,15 @@ bool_t hvm_send_assist_req(struct vcpu *v);
 void hvm_get_guest_pat(struct vcpu *v, u64 *guest_pat);
 int hvm_set_guest_pat(struct vcpu *v, u64 guest_pat);
 
-void hvm_set_guest_tsc(struct vcpu *v, u64 guest_tsc);
-u64 hvm_get_guest_tsc(struct vcpu *v);
+void hvm_set_guest_tsc_fixed(struct vcpu *v, u64 guest_tsc, u64 at_tsc);
+#define hvm_set_guest_tsc(v, t) hvm_set_guest_tsc_fixed(v, t, 0)
+u64 hvm_get_guest_tsc_fixed(struct vcpu *v, u64 at_tsc);
+#define hvm_get_guest_tsc(v) hvm_get_guest_tsc_fixed(v, 0)
 
 void hvm_init_guest_time(struct domain *d);
 void hvm_set_guest_time(struct vcpu *v, u64 guest_time);
-u64 hvm_get_guest_time(struct vcpu *v);
+u64 hvm_get_guest_time_fixed(struct vcpu *v, u64 at_tsc);
+#define hvm_get_guest_time(v) hvm_get_guest_time_fixed(v, 0)
 
 int vmsi_deliver(
     struct domain *d, int vector,
@@ -334,6 +354,19 @@ static inline int hvm_event_pending(struct vcpu *v)
     return hvm_funcs.event_pending(v);
 }
 
+static inline bool_t hvm_vcpu_has_smep(void)
+{
+    unsigned int eax, ebx;
+
+    hvm_cpuid(0, &eax, NULL, NULL, NULL);
+
+    if (eax < 7)
+        return 0;
+
+    hvm_cpuid(7, NULL, &ebx, NULL, NULL);
+    return !!(ebx & cpufeat_mask(X86_FEATURE_SMEP));
+}
+
 /* These reserved bits in lower 32 remain 0 after any load of CR0 */
 #define HVM_CR0_GUEST_RESERVED_BITS             \
     (~((unsigned long)                          \
@@ -353,12 +386,12 @@ static inline int hvm_event_pending(struct vcpu *v)
         X86_CR4_DE  | X86_CR4_PSE | X86_CR4_PAE |       \
         X86_CR4_MCE | X86_CR4_PGE | X86_CR4_PCE |       \
         X86_CR4_OSFXSR | X86_CR4_OSXMMEXCPT |           \
-        (cpu_has_smep ? X86_CR4_SMEP : 0) |             \
+        (hvm_vcpu_has_smep() ? X86_CR4_SMEP : 0) |      \
         (cpu_has_fsgsbase ? X86_CR4_FSGSBASE : 0) |     \
         ((nestedhvm_enabled((_v)->domain) && cpu_has_vmx)\
                       ? X86_CR4_VMXE : 0)  |             \
         (cpu_has_pcid ? X86_CR4_PCIDE : 0) |             \
-        (xsave_enabled(_v) ? X86_CR4_OSXSAVE : 0))))
+        (cpu_has_xsave ? X86_CR4_OSXSAVE : 0))))
 
 /* These exceptions must always be intercepted. */
 #define HVM_TRAP_MASK ((1U << TRAP_machine_check) | (1U << TRAP_invalid_op))
@@ -417,9 +450,9 @@ int hvm_virtual_to_linear_addr(
     unsigned int addr_size,
     unsigned long *linear_addr);
 
-void *hvm_map_guest_frame_rw(unsigned long gfn);
-void *hvm_map_guest_frame_ro(unsigned long gfn);
-void hvm_unmap_guest_frame(void *p);
+void *hvm_map_guest_frame_rw(unsigned long gfn, bool_t permanent);
+void *hvm_map_guest_frame_ro(unsigned long gfn, bool_t permanent);
+void hvm_unmap_guest_frame(void *p, bool_t permanent);
 
 static inline void hvm_set_info_guest(struct vcpu *v)
 {
@@ -428,6 +461,21 @@ static inline void hvm_set_info_guest(struct vcpu *v)
 }
 
 int hvm_debug_op(struct vcpu *v, int32_t op);
+
+static inline void hvm_invalidate_regs_fields(struct cpu_user_regs *regs)
+{
+#ifndef NDEBUG
+    regs->error_code = 0xbeef;
+    regs->entry_vector = 0xbeef;
+    regs->saved_upcall_mask = 0xbf;
+    regs->cs = 0xbeef;
+    regs->ss = 0xbeef;
+    regs->ds = 0xbeef;
+    regs->es = 0xbeef;
+    regs->fs = 0xbeef;
+    regs->gs = 0xbeef;
+#endif
+}
 
 int hvm_hap_nested_page_fault(paddr_t gpa,
                               bool_t gla_valid, unsigned long gla,
@@ -448,6 +496,7 @@ int hvm_x2apic_msr_write(struct vcpu *v, unsigned int msr, uint64_t msr_content)
 void hvm_memory_event_cr0(unsigned long value, unsigned long old);
 void hvm_memory_event_cr3(unsigned long value, unsigned long old);
 void hvm_memory_event_cr4(unsigned long value, unsigned long old);
+void hvm_memory_event_msr(unsigned long msr, unsigned long value);
 /* Called for current VCPU on int3: returns -1 if no listener */
 int hvm_memory_event_int3(unsigned long gla);
 
@@ -475,7 +524,7 @@ uint64_t nhvm_vcpu_guestcr3(struct vcpu *v);
 /* returns l1 guest's cr3 that points to the page table used to
  * translate l2 guest physical address to l1 guest physical address.
  */
-uint64_t nhvm_vcpu_hostcr3(struct vcpu *v);
+uint64_t nhvm_vcpu_p2m_base(struct vcpu *v);
 /* returns the asid number l1 guest wants to use to run the l2 guest */
 uint32_t nhvm_vcpu_asid(struct vcpu *v);
 

@@ -78,10 +78,19 @@ void libxl__free_all(libxl__gc *gc)
     gc->alloc_maxsize = 0;
 }
 
-void *libxl__zalloc(libxl__gc *gc, int bytes)
+void *libxl__malloc(libxl__gc *gc, size_t size)
 {
-    void *ptr = calloc(bytes, 1);
-    if (!ptr) libxl__alloc_failed(CTX, __func__, bytes, 1);
+    void *ptr = malloc(size);
+    if (!ptr) libxl__alloc_failed(CTX, __func__, size, 1);
+
+    libxl__ptr_add(gc, ptr);
+    return ptr;
+}
+
+void *libxl__zalloc(libxl__gc *gc, size_t size)
+{
+    void *ptr = calloc(size, 1);
+    if (!ptr) libxl__alloc_failed(CTX, __func__, size, 1);
 
     libxl__ptr_add(gc, ptr);
     return ptr;
@@ -155,19 +164,19 @@ char *libxl__strndup(libxl__gc *gc, const char *c, size_t n)
 
     if (!s) libxl__alloc_failed(CTX, __func__, n, 1);
 
+    libxl__ptr_add(gc, s);
+
     return s;
 }
 
 char *libxl__dirname(libxl__gc *gc, const char *s)
 {
-    char *c;
-    char *ptr = libxl__strdup(gc, s);
+    char *c = strrchr(s, '/');
 
-    c = strrchr(ptr, '/');
     if (!c)
         return NULL;
-    *c = '\0';
-    return ptr;
+
+    return libxl__strndup(gc, s, c - s);
 }
 
 void libxl__logv(libxl_ctx *ctx, xentoollog_level msglevel, int errnoval,
@@ -228,7 +237,7 @@ int libxl__file_reference_map(libxl__file_reference *f)
         return 0;
 
     fd = open(f->path, O_RDONLY);
-    if (f < 0)
+    if (fd < 0)
         return ERROR_FAIL;
 
     ret = fstat(fd, &st_buf);

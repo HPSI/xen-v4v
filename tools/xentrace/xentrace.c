@@ -425,22 +425,18 @@ fail:
 static void disable_tbufs(void)
 {
     xc_interface *xc_handle = xc_interface_open(0,0,0);
-    int ret;
 
     if ( !xc_handle ) 
     {
         perror("Couldn't open xc handle to disable tbufs.");
-        goto out;
+        return;
     }
 
-    ret = xc_tbuf_disable(xc_handle);
-
-    if ( ret != 0 )
+    if ( xc_tbuf_disable(xc_handle) != 0 )
     {
         perror("Couldn't disable trace buffers");
     }
 
-out:
     xc_interface_close(xc_handle);
 }
 
@@ -862,10 +858,11 @@ long sargtol(const char *restrict arg, int base)
 
 
     return val;
+
 invalid:
-    return 0;
     fprintf(stderr, "Invalid option argument: %s\n\n", arg);
     usage();
+    return 0; /* not actually reached */
 }
 
 /* convert the argument string pointed to by arg to a long int representation */
@@ -1065,7 +1062,7 @@ int main(int argc, char **argv)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

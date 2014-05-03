@@ -62,12 +62,6 @@ struct hvm_domain {
     /* emulated irq to pirq */
     struct radix_tree_root emuirq_pirq;
 
-    /* hvm_print_line() logging. */
-#define HVM_PBUF_SIZE 80
-    char                  *pbuf;
-    int                    pbuf_idx;
-    spinlock_t             pbuf_lock;
-
     uint64_t              *params;
 
     /* Memory ranges with pinned cache attributes. */
@@ -95,6 +89,12 @@ struct hvm_domain {
     bool_t                 mem_sharing_enabled;
     bool_t                 qemu_mapcache_invalidate;
     bool_t                 is_s3_suspended;
+
+    /*
+     * TSC value that VCPUs use to calculate their tsc_offset value.
+     * Used during initialization and save/restore.
+     */
+    uint64_t sync_tsc;
 
     union {
         struct vmx_domain vmx;

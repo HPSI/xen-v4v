@@ -6,32 +6,7 @@ export XEN_OS=MiniOS
 export stubdom=y
 export debug=y
 include $(XEN_ROOT)/Config.mk
-
-#ZLIB_URL?=http://www.zlib.net
-ZLIB_URL=$(XEN_EXTFILES_URL)
-ZLIB_VERSION=1.2.3
-
-#LIBPCI_URL?=http://www.kernel.org/pub/software/utils/pciutils
-LIBPCI_URL?=$(XEN_EXTFILES_URL)
-LIBPCI_VERSION=2.2.9
-
-#NEWLIB_URL?=ftp://sources.redhat.com/pub/newlib
-NEWLIB_URL?=$(XEN_EXTFILES_URL)
-NEWLIB_VERSION=1.16.0
-
-#LWIP_URL?=http://download.savannah.gnu.org/releases/lwip
-LWIP_URL?=$(XEN_EXTFILES_URL)
-LWIP_VERSION=1.3.0
-
-#GRUB_URL?=http://alpha.gnu.org/gnu/grub
-GRUB_URL?=$(XEN_EXTFILES_URL)
-GRUB_VERSION=0.97
-
-#OCAML_URL?=$(XEN_EXTFILES_URL)
-OCAML_URL?=http://caml.inria.fr/pub/distrib/ocaml-3.11
-OCAML_VERSION=3.11.0
-
-WGET=wget -c
+-include $(XEN_ROOT)/config/Stubdom.mk
 
 GNU_TARGET_ARCH:=$(XEN_TARGET_ARCH)
 ifeq ($(XEN_TARGET_ARCH),x86_32)
@@ -47,9 +22,6 @@ ifeq ($(GNU_TARGET_ARCH), x86_64)
 TARGET_CFLAGS=-mno-red-zone
 NEWLIB_CFLAGS+=-D_I386MACH_ALLOW_HW_INTERRUPTS
 STUBDOM_SUPPORTED=1
-endif
-ifeq ($(GNU_TARGET_ARCH), ia64)
-TARGET_CFLAGS=-mconstant-gp
 endif
 
 CROSS_ROOT=cross-root-$(GNU_TARGET_ARCH)
@@ -74,12 +46,12 @@ TARGET_CPPFLAGS += -I$(XEN_ROOT)/xen/include
 
 TARGET_LDFLAGS += -nostdlib -L$(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/lib
 
-TARGETS=ioemu c caml grub xenstore
+TARGETS=$(STUBDOM_TARGETS)
 
 .PHONY: all
 all: build
 ifeq ($(STUBDOM_SUPPORTED),1)
-build: genpath ioemu-stubdom c-stubdom pv-grub xenstore-stubdom
+build: genpath $(STUBDOM_BUILD)
 else
 build: genpath
 endif
@@ -93,7 +65,7 @@ $(eval $(genpath-target))
 ##############
 
 newlib-$(NEWLIB_VERSION).tar.gz:
-	$(WGET) $(NEWLIB_URL)/$@
+	$(FETCHER) $@ $(NEWLIB_URL)/$@
 
 newlib-$(NEWLIB_VERSION): newlib-$(NEWLIB_VERSION).tar.gz
 	tar xzf $<
@@ -119,7 +91,7 @@ $(NEWLIB_STAMPFILE): mk-headers-$(XEN_TARGET_ARCH) newlib-$(NEWLIB_VERSION)
 ############
 
 zlib-$(ZLIB_VERSION).tar.gz:
-	$(WGET) $(ZLIB_URL)/$@
+	$(FETCHER) $@ $(ZLIB_URL)/$@
 
 zlib-$(XEN_TARGET_ARCH): zlib-$(ZLIB_VERSION).tar.gz 
 	tar xzf $<
@@ -139,7 +111,7 @@ $(ZLIB_STAMPFILE): zlib-$(XEN_TARGET_ARCH) $(NEWLIB_STAMPFILE)
 ##############
 
 pciutils-$(LIBPCI_VERSION).tar.bz2:
-	$(WGET) $(LIBPCI_URL)/$@
+	$(FETCHER) $@ $(LIBPCI_URL)/$@
 
 pciutils-$(XEN_TARGET_ARCH): pciutils-$(LIBPCI_VERSION).tar.bz2
 	tar xjf $<
@@ -167,13 +139,89 @@ $(LIBPCI_STAMPFILE): pciutils-$(XEN_TARGET_ARCH) $(NEWLIB_STAMPFILE) $(ZLIB_STAM
 ######
 
 lwip-$(LWIP_VERSION).tar.gz:
-	$(WGET) $(LWIP_URL)/$@
+	$(FETCHER) $@ $(LWIP_URL)/$@
 
 lwip-$(XEN_TARGET_ARCH): lwip-$(LWIP_VERSION).tar.gz
 	tar xzf $<
 	mv lwip $@
 	patch -d $@ -p0 < lwip.patch-cvs
 	touch $@
+
+#############
+# cross-gmp
+#############
+gmp-$(GMP_VERSION).tar.bz2:
+	$(FETCHER) $@ $(GMP_URL)/$@
+
+.PHONY: cross-gmp
+ifeq ($(XEN_TARGET_ARCH), x86_32)
+   GMPEXT=ABI=32
+endif
+gmp-$(XEN_TARGET_ARCH): gmp-$(GMP_VERSION).tar.bz2 $(NEWLIB_STAMPFILE)
+	tar xjf $<
+	rm $@ -rf || :
+	mv gmp-$(GMP_VERSION) $@
+	#patch -d $@ -p0 < gmp.patch
+	cd $@; CPPFLAGS="-isystem $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/include $(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" CC=$(CC) $(GMPEXT) ./configure --disable-shared --enable-static --disable-fft --without-readline --prefix=$(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf
+	sed -i 's/#define HAVE_OBSTACK_VPRINTF 1/\/\/#define HAVE_OBSTACK_VPRINTF 1/' $@/config.h
+	touch $@
+
+GMP_STAMPFILE=$(CROSS_ROOT)/$(GNU_TARGET_ARCH)-xen-elf/lib/libgmp.a
+cross-gmp: $(GMP_STAMPFILE)
+$(GMP_STAMPFILE): gmp-$(XEN_TARGET_ARCH)
+	( cd $< && \
+	  $(MAKE) && \
+	  $(MAKE) DESTDIR= install )
+
+#############
+# cross-polarssl
+#############
+polarssl-$(POLARSSL_VERSION)-gpl.tgz:
+	$(FETCHER) $@ $(POLARSSL_URL)/$@
+
+polarssl-$(XEN_TARGET_ARCH): polarssl-$(POLARSSL_VERSION)-gpl.tgz
+	tar xzf $<
+	mv polarssl-$(POLARSSL_VERSION) $@
+	patch -d $@ -p1 < polarssl.patch
+	touch $@
+
+POLARSSL_STAMPFILE=$(CROSS_ROOT)/$(GNU_TARGET_ARCH)-xen-elf/lib/libpolarssl.a
+cross-polarssl: $(POLARSSL_STAMPFILE)
+$(POLARSSL_STAMPFILE): polarssl-$(XEN_TARGET_ARCH) $(NEWLIB_STAMPFILE) lwip-$(XEN_TARGET_ARCH)
+	 ( cd $</library && \
+	   make CC="$(CC) $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -I $(realpath $(MINI_OS)/include)" && \
+	   mkdir -p $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/include && \
+	   cp -r ../include/* $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/include && \
+	   mkdir -p $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/lib && \
+	   $(INSTALL_DATA) libpolarssl.a $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/lib/ )
+
+#############
+# cross-tpmemu
+#############
+tpm_emulator-$(TPMEMU_VERSION).tar.gz:
+	$(FETCHER) $@ $(TPMEMU_URL)/$@
+
+tpm_emulator-$(XEN_TARGET_ARCH): tpm_emulator-$(TPMEMU_VERSION).tar.gz
+	@if [ ! -f "$(CMAKE)" ]; then echo "cmake not installed! Install it and then rerun ./configure!"; false; fi
+	tar xzf $<
+	mv tpm_emulator-$(TPMEMU_VERSION) $@
+	patch -d $@ -p1 < tpmemu-$(TPMEMU_VERSION).patch;
+	patch -d $@ -p1 < vtpm-bufsize.patch
+	patch -d $@ -p1 < vtpm-locality.patch
+	patch -d $@ -p1 < vtpm-parent-sign-ek.patch
+	patch -d $@ -p1 < vtpm-deepquote.patch
+	mkdir $@/build
+	cd $@/build; CC=${CC} $(CMAKE) .. -DCMAKE_C_FLAGS:STRING="-std=c99 -DTPM_NO_EXTERN $(TARGET_CPPFLAGS) $(TARGET_CFLAGS) -Wno-declaration-after-statement"
+	touch $@
+
+TPMEMU_STAMPFILE=$(CROSS_ROOT)/$(GNU_TARGET_ARCH)-xen-elf/lib/libtpm.a
+$(TPMEMU_STAMPFILE): tpm_emulator-$(XEN_TARGET_ARCH) $(GMP_STAMPFILE)
+	( cd $</build && make VERBOSE=1 tpm_crypto tpm  )
+	cp $</build/crypto/libtpm_crypto.a $(CROSS_ROOT)/$(GNU_TARGET_ARCH)-xen-elf/lib/libtpm_crypto.a
+	cp $</build/tpm/libtpm.a $(TPMEMU_STAMPFILE)
+
+.PHONY: cross-tpmemu
+cross-tpmemu: $(TPMEMU_STAMPFILE)
 
 #############
 # Cross-ocaml
@@ -183,7 +231,7 @@ CAMLLIB = $(CROSS_PREFIX)/$(GNU_TARGET_ARCH)-xen-elf/lib/ocaml
 OCAML_STAMPFILE=$(CAMLLIB)/.dirstamp
 
 ocaml-$(OCAML_VERSION).tar.gz:
-	$(WGET) $(OCAML_URL)/$@
+	$(FETCHER) $@ $(OCAML_URL)/$@
 
 ocaml-$(XEN_TARGET_ARCH)/.dirstamp: ocaml-$(OCAML_VERSION).tar.gz ocaml.patch
 	tar xzf $<
@@ -215,6 +263,10 @@ $(CROSS_ROOT): cross-newlib cross-zlib cross-libpci
 
 QEMU_ROOT := $(shell if [ -d "$(CONFIG_QEMU)" ]; then echo "$(CONFIG_QEMU)"; else echo .; fi)
 
+ifneq ($(filter ioemu,$(STUBDOM_TARGETS)),)
+IOEMU_LINKFARM_TARGET := ioemu/linkfarm.stamp
+endif
+
 ifeq ($(QEMU_ROOT),.)
 $(XEN_ROOT)/tools/qemu-xen-traditional-dir:
 	$(MAKE) DESTDIR= -C $(XEN_ROOT)/tools qemu-xen-traditional-dir-find
@@ -240,10 +292,10 @@ ioemu/linkfarm.stamp:
 	touch ioemu/linkfarm.stamp
 endif
 
-mk-headers-$(XEN_TARGET_ARCH): ioemu/linkfarm.stamp
+mk-headers-$(XEN_TARGET_ARCH): $(IOEMU_LINKFARM_TARGET)
 	mkdir -p include/xen && \
           ln -sf $(wildcard $(XEN_ROOT)/xen/include/public/*.h) include/xen && \
-          ln -sf $(addprefix $(XEN_ROOT)/xen/include/public/,arch-ia64 arch-x86 hvm io xsm) include/xen && \
+          ln -sf $(addprefix $(XEN_ROOT)/xen/include/public/,arch-x86 hvm io xsm) include/xen && \
           ( [ -h include/xen/sys ] || ln -sf $(XEN_ROOT)/tools/include/xen-sys/MiniOS include/xen/sys ) && \
           ( [ -h include/xen/libelf ] || ln -sf $(XEN_ROOT)/tools/include/xen/libelf include/xen/libelf ) && \
 	  mkdir -p include/xen-foreign && \
@@ -255,11 +307,6 @@ mk-headers-$(XEN_TARGET_ARCH): ioemu/linkfarm.stamp
 	  ln -sf $(XEN_ROOT)/tools/libxc/*.h . && \
 	  ln -sf $(XEN_ROOT)/tools/libxc/*.c . && \
 	  ln -sf $(XEN_ROOT)/tools/libxc/Makefile . )
-	mkdir -p libxc-$(XEN_TARGET_ARCH)/$(XEN_TARGET_ARCH)
-	[ -h libxc-$(XEN_TARGET_ARCH)/$(XEN_TARGET_ARCH) ] || ( cd libxc-$(XEN_TARGET_ARCH)/$(XEN_TARGET_ARCH) && \
-	  ln -sf $(XEN_ROOT)/tools/libxc/$(XEN_TARGET_ARCH)/*.c . && \
-	  ln -sf $(XEN_ROOT)/tools/libxc/$(XEN_TARGET_ARCH)/*.h . && \
-	  ln -sf $(XEN_ROOT)/tools/libxc/$(XEN_TARGET_ARCH)/Makefile . )
 	mkdir -p xenstore
 	[ -h xenstore/Makefile ] || ( cd xenstore && \
 	  ln -sf $(XEN_ROOT)/tools/xenstore/*.c . && \
@@ -282,7 +329,7 @@ $(TARGETS_MINIOS): mini-os-%:
 .PHONY: libxc
 libxc: libxc-$(XEN_TARGET_ARCH)/libxenctrl.a libxc-$(XEN_TARGET_ARCH)/libxenguest.a
 libxc-$(XEN_TARGET_ARCH)/libxenctrl.a: cross-zlib
-	CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) DESTDIR= -C libxc-$(XEN_TARGET_ARCH)
+	CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) DESTDIR= CONFIG_LIBXC_MINIOS=y -C libxc-$(XEN_TARGET_ARCH)
 
  libxc-$(XEN_TARGET_ARCH)/libxenguest.a: libxc-$(XEN_TARGET_ARCH)/libxenctrl.a
 
@@ -319,11 +366,29 @@ c: $(CROSS_ROOT)
 	CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) DESTDIR= -C $@ LWIPDIR=$(CURDIR)/lwip-$(XEN_TARGET_ARCH) 
 
 ######
+# VTPM
+######
+
+.PHONY: vtpm
+vtpm: cross-polarssl cross-tpmemu
+	make -C $(MINI_OS) links
+	XEN_TARGET_ARCH="$(XEN_TARGET_ARCH)" CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) -C $@
+
+######
+# VTPMMGR
+######
+
+.PHONY: vtpmmgr
+vtpmmgr: cross-polarssl
+	make -C $(MINI_OS) links
+	XEN_TARGET_ARCH="$(XEN_TARGET_ARCH)" CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) -C $@
+
+######
 # Grub
 ######
 
 grub-$(GRUB_VERSION).tar.gz:
-	$(WGET) $(GRUB_URL)/$@
+	$(FETCHER) $@ $(GRUB_URL)/$@
 
 grub-upstream: grub-$(GRUB_VERSION).tar.gz
 	tar xzf $<
@@ -333,7 +398,7 @@ grub-upstream: grub-$(GRUB_VERSION).tar.gz
 	done
 
 .PHONY: grub
-grub: grub-upstream $(CROSS_ROOT)
+grub: cross-polarssl grub-upstream $(CROSS_ROOT)
 	mkdir -p grub-$(XEN_TARGET_ARCH)
 	CPPFLAGS="$(TARGET_CPPFLAGS)" CFLAGS="$(TARGET_CFLAGS)" $(MAKE) DESTDIR= -C $@ OBJ_DIR=$(CURDIR)/grub-$(XEN_TARGET_ARCH)
 
@@ -362,6 +427,14 @@ caml-stubdom: mini-os-$(XEN_TARGET_ARCH)-caml lwip-$(XEN_TARGET_ARCH) libxc cros
 c-stubdom: mini-os-$(XEN_TARGET_ARCH)-c lwip-$(XEN_TARGET_ARCH) libxc c
 	DEF_CPPFLAGS="$(TARGET_CPPFLAGS)" DEF_CFLAGS="$(TARGET_CFLAGS)" DEF_LDFLAGS="$(TARGET_LDFLAGS)" MINIOS_CONFIG="$(CURDIR)/c/minios.cfg" $(MAKE) DESTDIR= -C $(MINI_OS) OBJ_DIR=$(CURDIR)/$< LWIPDIR=$(CURDIR)/lwip-$(XEN_TARGET_ARCH) APP_OBJS=$(CURDIR)/c/main.a
 
+.PHONY: vtpm-stubdom
+vtpm-stubdom: mini-os-$(XEN_TARGET_ARCH)-vtpm vtpm
+	DEF_CPPFLAGS="$(TARGET_CPPFLAGS)" DEF_CFLAGS="$(TARGET_CFLAGS)" DEF_LDFLAGS="$(TARGET_LDFLAGS)" MINIOS_CONFIG="$(CURDIR)/vtpm/minios.cfg" $(MAKE) -C $(MINI_OS) OBJ_DIR=$(CURDIR)/$< APP_OBJS="$(CURDIR)/vtpm/vtpm.a" APP_LDLIBS="-ltpm -ltpm_crypto -lgmp -lpolarssl"
+
+.PHONY: vtpmmgr-stubdom
+vtpmmgr-stubdom: mini-os-$(XEN_TARGET_ARCH)-vtpmmgr vtpmmgr
+	DEF_CPPFLAGS="$(TARGET_CPPFLAGS)" DEF_CFLAGS="$(TARGET_CFLAGS)" DEF_LDFLAGS="$(TARGET_LDFLAGS)" MINIOS_CONFIG="$(CURDIR)/vtpmmgr/minios.cfg" $(MAKE) -C $(MINI_OS) OBJ_DIR=$(CURDIR)/$< APP_OBJS="$(CURDIR)/vtpmmgr/vtpmmgr.a" APP_LDLIBS="-lm -lpolarssl"
+
 .PHONY: pv-grub
 pv-grub: mini-os-$(XEN_TARGET_ARCH)-grub libxc grub
 	DEF_CPPFLAGS="$(TARGET_CPPFLAGS)" DEF_CFLAGS="$(TARGET_CFLAGS)" DEF_LDFLAGS="$(TARGET_LDFLAGS)" MINIOS_CONFIG="$(CURDIR)/grub/minios.cfg" $(MAKE) DESTDIR= -C $(MINI_OS) OBJ_DIR=$(CURDIR)/$< APP_OBJS=$(CURDIR)/grub-$(XEN_TARGET_ARCH)/main.a
@@ -375,7 +448,7 @@ xenstore-stubdom: mini-os-$(XEN_TARGET_ARCH)-xenstore libxc xenstore
 #########
 
 ifeq ($(STUBDOM_SUPPORTED),1)
-install: genpath install-readme install-ioemu install-grub install-xenstore
+install: genpath install-readme $(STUBDOM_INSTALL)
 else
 install: genpath
 endif
@@ -395,9 +468,19 @@ install-grub: pv-grub
 	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
 	$(INSTALL_DATA) mini-os-$(XEN_TARGET_ARCH)-grub/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/pv-grub-$(XEN_TARGET_ARCH).gz"
 
+install-caml: caml-stubdom
+
 install-xenstore: xenstore-stubdom
-	$(INSTALL_DIR) "$(DESTDIR)/usr/lib/xen/boot"
-	$(INSTALL_DATA) mini-os-$(XEN_TARGET_ARCH)-xenstore/mini-os.gz "$(DESTDIR)/usr/lib/xen/boot/xenstore-stubdom.gz"
+	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
+	$(INSTALL_DATA) mini-os-$(XEN_TARGET_ARCH)-xenstore/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/xenstore-stubdom.gz"
+
+install-vtpm: vtpm-stubdom
+	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
+	$(INSTALL_PROG) mini-os-$(XEN_TARGET_ARCH)-vtpm/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpm-stubdom.gz"
+
+install-vtpmmgr: vtpmmgr-stubdom
+	$(INSTALL_DIR) "$(DESTDIR)$(XENFIRMWAREDIR)"
+	$(INSTALL_PROG) mini-os-$(XEN_TARGET_ARCH)-vtpmmgr/mini-os.gz "$(DESTDIR)$(XENFIRMWAREDIR)/vtpmmgr-stubdom.gz"
 
 #######
 # clean
@@ -411,11 +494,16 @@ clean:
 	rm -fr mini-os-$(XEN_TARGET_ARCH)-caml
 	rm -fr mini-os-$(XEN_TARGET_ARCH)-grub
 	rm -fr mini-os-$(XEN_TARGET_ARCH)-xenstore
+	rm -fr mini-os-$(XEN_TARGET_ARCH)-vtpm
+	rm -fr mini-os-$(XEN_TARGET_ARCH)-vtpmmgr
+	$(MAKE) DESTDIR= -C $(MINI_OS) clean
 	$(MAKE) DESTDIR= -C caml clean
 	$(MAKE) DESTDIR= -C c clean
+	$(MAKE) -C vtpm clean
+	$(MAKE) -C vtpmmgr clean
 	rm -fr grub-$(XEN_TARGET_ARCH)
 	rm -f $(STUBDOMPATH)
-	[ ! -d libxc-$(XEN_TARGET_ARCH) ] || $(MAKE) DESTDIR= -C libxc-$(XEN_TARGET_ARCH) clean
+	[ ! -e libxc-$(XEN_TARGET_ARCH)/Makefile ] || $(MAKE) DESTDIR= -C libxc-$(XEN_TARGET_ARCH) clean
 	-[ ! -d ioemu ] || $(MAKE) DESTDIR= -C ioemu clean
 	-[ ! -d xenstore ] || $(MAKE) DESTDIR= -C xenstore clean
 
@@ -425,7 +513,11 @@ crossclean: clean
 	rm -fr $(CROSS_ROOT)
 	rm -fr newlib-$(XEN_TARGET_ARCH)
 	rm -fr zlib-$(XEN_TARGET_ARCH) pciutils-$(XEN_TARGET_ARCH)
-	rm -fr libxc-$(XEN_TARGET_ARCH) ioemu
+	rm -fr libxc-$(XEN_TARGET_ARCH) ioemu xenstore
+	rm -fr gmp-$(XEN_TARGET_ARCH)
+	rm -fr polarssl-$(XEN_TARGET_ARCH)
+	rm -fr openssl-$(XEN_TARGET_ARCH)
+	rm -fr tpm_emulator-$(XEN_TARGET_ARCH)
 	rm -f mk-headers-$(XEN_TARGET_ARCH)
 	rm -fr ocaml-$(XEN_TARGET_ARCH)
 	rm -fr include
@@ -434,6 +526,10 @@ crossclean: clean
 .PHONY: patchclean
 patchclean: crossclean
 	rm -fr newlib-$(NEWLIB_VERSION)
+	rm -fr gmp-$(XEN_TARGET_ARCH)
+	rm -fr polarssl-$(XEN_TARGET_ARCH)
+	rm -fr openssl-$(XEN_TARGET_ARCH)
+	rm -fr tpm_emulator-$(XEN_TARGET_ARCH)
 	rm -fr lwip-$(XEN_TARGET_ARCH)
 	rm -fr grub-upstream
 
@@ -442,10 +538,20 @@ patchclean: crossclean
 downloadclean: patchclean
 	rm -f newlib-$(NEWLIB_VERSION).tar.gz
 	rm -f zlib-$(ZLIB_VERSION).tar.gz
+	rm -f gmp-$(GMP_VERSION).tar.gz
+	rm -f tpm_emulator-$(TPMEMU_VERSION).tar.gz
 	rm -f pciutils-$(LIBPCI_VERSION).tar.bz2
 	rm -f grub-$(GRUB_VERSION).tar.gz
 	rm -f lwip-$(LWIP_VERSION).tar.gz
 	rm -f ocaml-$(OCAML_VERSION).tar.gz
+	rm -f polarssl-$(POLARSSL_VERSION)-gpl.tgz
+	rm -f openssl-$(POLARSSL_VERSION)-gpl.tgz
 
 .PHONY: distclean
 distclean: downloadclean
+	rm -rf config.log config.status config.cache autom4te.cache ../config/Stubdom.mk
+
+ifeq (,$(findstring clean,$(MAKECMDGOALS)))
+$(XEN_ROOT)/config/Stubdom.mk:
+	$(error You have to run ./configure before building or installing stubdom)
+endif

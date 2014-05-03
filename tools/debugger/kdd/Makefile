@@ -10,11 +10,11 @@ OBJS    := $(CFILES:.c=.o)
 all: kdd
 
 kdd: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS) $(APPEND_LDFLAGS)
 
 .PHONY: clean
 clean:
-	rm -f $(OBJS) kdd
+	rm -f $(OBJS) $(DEPS) kdd
 
 .PHONY: install
 install: all

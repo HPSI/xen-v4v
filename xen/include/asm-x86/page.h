@@ -172,6 +172,10 @@ static inline l4_pgentry_t l4e_from_paddr(paddr_t pa, unsigned int flags)
 #define l3e_to_l2e(x)              ((l2_pgentry_t *)__va(l3e_get_paddr(x)))
 #define l4e_to_l3e(x)              ((l3_pgentry_t *)__va(l4e_get_paddr(x)))
 
+#define map_l1t_from_l2e(x)        ((l1_pgentry_t *)map_domain_page(l2e_get_pfn(x)))
+#define map_l2t_from_l3e(x)        ((l2_pgentry_t *)map_domain_page(l3e_get_pfn(x)))
+#define map_l3t_from_l4e(x)        ((l3_pgentry_t *)map_domain_page(l4e_get_pfn(x)))
+
 /* Given a virtual address, get an entry offset into a page table. */
 #define l1_table_offset(a)         \
     (((a) >> L1_PAGETABLE_SHIFT) & (L1_PAGETABLE_ENTRIES - 1))
@@ -261,18 +265,6 @@ void copy_page_sse2(void *, const void *);
 
 #endif /* !defined(__ASSEMBLY__) */
 
-/* High table entries are reserved by the hypervisor. */
-#define DOMAIN_ENTRIES_PER_L2_PAGETABLE     0
-#define HYPERVISOR_ENTRIES_PER_L2_PAGETABLE 0
-
-#define DOMAIN_ENTRIES_PER_L4_PAGETABLE     \
-    (l4_table_offset(HYPERVISOR_VIRT_START))
-#define GUEST_ENTRIES_PER_L4_PAGETABLE     \
-    (l4_table_offset(HYPERVISOR_VIRT_END))
-#define HYPERVISOR_ENTRIES_PER_L4_PAGETABLE \
-    (L4_PAGETABLE_ENTRIES - GUEST_ENTRIES_PER_L4_PAGETABLE  \
-     + DOMAIN_ENTRIES_PER_L4_PAGETABLE)
-
 /* Where to find each level of the linear mapping */
 #define __linear_l1_table ((l1_pgentry_t *)(LINEAR_PT_VIRT_START))
 #define __linear_l2_table \
@@ -294,9 +286,9 @@ extern l2_pgentry_t l2_identmap[4*L2_PAGETABLE_ENTRIES];
 extern l1_pgentry_t l1_identmap[L1_PAGETABLE_ENTRIES],
     l1_fixmap[L1_PAGETABLE_ENTRIES];
 void paging_init(void);
-void setup_idle_pagetable(void);
 #endif /* !defined(__ASSEMBLY__) */
 
+#define _PAGE_NONE     _AC(0x000,U)
 #define _PAGE_PRESENT  _AC(0x001,U)
 #define _PAGE_RW       _AC(0x002,U)
 #define _PAGE_USER     _AC(0x004,U)
@@ -340,18 +332,9 @@ void setup_idle_pagetable(void);
 /* Allocator functions for Xen pagetables. */
 void *alloc_xen_pagetable(void);
 void free_xen_pagetable(void *v);
-l2_pgentry_t *virt_to_xen_l2e(unsigned long v);
-l3_pgentry_t *virt_to_xen_l3e(unsigned long v);
+l1_pgentry_t *virt_to_xen_l1e(unsigned long v);
 
 extern void set_pdx_range(unsigned long smfn, unsigned long emfn);
-
-/* Map machine page range in Xen virtual address space. */
-int map_pages_to_xen(
-    unsigned long virt,
-    unsigned long mfn,
-    unsigned long nr_mfns,
-    unsigned int flags);
-void destroy_xen_mappings(unsigned long v, unsigned long e);
 
 /* Convert between PAT/PCD/PWT embedded in PTE flags and 3-bit cacheattr. */
 static inline uint32_t pte_flags_to_cacheattr(uint32_t flags)
@@ -362,6 +345,9 @@ static inline uint32_t cacheattr_to_pte_flags(uint32_t cacheattr)
 {
     return ((cacheattr & 4) << 5) | ((cacheattr & 3) << 3);
 }
+
+/* No cache maintenance required on x86 architecture. */
+static inline void flush_page_to_ram(unsigned long mfn) {}
 
 /* return true if permission increased */
 static inline bool_t
@@ -389,7 +375,7 @@ perms_strictly_increased(uint32_t old_flags, uint32_t new_flags)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

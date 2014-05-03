@@ -8,8 +8,9 @@
  * See detailed comments in the file linux/bitmap.h describing the
  * data type on which these nodemasks are based.
  *
- * For details of nodemask_scnprintf() and nodemask_parse(),
- * see bitmap_scnprintf() and bitmap_parse() in lib/bitmap.c.
+ * For details of nodemask_scnprintf(), nodelist_scnpintf() and
+ * nodemask_parse(), see bitmap_scnprintf() and bitmap_parse()
+ * in lib/bitmap.c.
  *
  * The available nodemask operations are:
  *
@@ -41,6 +42,8 @@
  * int last_node(mask)			Number highest set bit, or MAX_NUMNODES
  * int first_unset_node(mask)		First node not set in mask, or 
  *					MAX_NUMNODES.
+ * int cycle_node(node, mask)		Next node cycling from 'node', or
+ *					MAX_NUMNODES
  *
  * nodemask_t nodemask_of_node(node)	Return nodemask with bit 'node' set
  * NODE_MASK_ALL			Initializer - all bits set
@@ -48,6 +51,7 @@
  * unsigned long *nodes_addr(mask)	Array of unsigned long's in mask
  *
  * int nodemask_scnprintf(buf, len, mask) Format nodemask for printing
+ * int nodelist_scnprintf(buf, len, mask) Format nodemask as a list for printing
  * int nodemask_parse(ubuf, ulen, mask)	Parse ascii string as nodemask
  *
  * for_each_node_mask(node, mask)	for-loop node over mask
@@ -254,6 +258,16 @@ static inline int __first_unset_node(const nodemask_t *maskp)
 			find_first_zero_bit(maskp->bits, MAX_NUMNODES));
 }
 
+#define cycle_node(n, src) __cycle_node((n), &(src), MAX_NUMNODES)
+static inline int __cycle_node(int n, const nodemask_t *maskp, int nbits)
+{
+    int nxt = __next_node(n, maskp, nbits);
+
+    if (nxt == nbits)
+        nxt = __first_node(maskp, nbits);
+    return nxt;
+}
+
 #define NODE_MASK_LAST_WORD BITMAP_LAST_WORD_MASK(MAX_NUMNODES)
 
 #if MAX_NUMNODES <= BITS_PER_LONG
@@ -279,6 +293,14 @@ static inline int __first_unset_node(const nodemask_t *maskp)
 } })
 
 #define nodes_addr(src) ((src).bits)
+
+#define nodelist_scnprintf(buf, len, src) \
+			__nodelist_scnprintf((buf), (len), (src), MAX_NUMNODES)
+static inline int __nodelist_scnprintf(char *buf, int len,
+					const nodemask_t *srcp, int nbits)
+{
+	return bitmap_scnlistprintf(buf, len, srcp->bits, nbits);
+}
 
 #if 0
 #define nodemask_scnprintf(buf, len, src) \

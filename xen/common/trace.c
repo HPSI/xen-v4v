@@ -133,7 +133,7 @@ static int calculate_tbuf_size(unsigned int pages, uint16_t t_info_first_offset)
      * The array of mfns for the highest cpu can start at the maximum value
      * mfn_offset can hold. So reduce the number of cpus and also the mfn_offset.
      */
-    max_mfn_offset -= t_info_first_offset - 1;
+    max_mfn_offset -= t_info_first_offset;
     max_cpus--;
     if ( max_cpus )
         max_mfn_offset /= max_cpus;
@@ -255,7 +255,7 @@ static int alloc_trace_bufs(unsigned int pages)
     opt_tbuf_size = pages;
 
     printk("xentrace: initialised\n");
-    wmb(); /* above must be visible before tb_init_done flag set */
+    smp_wmb(); /* above must be visible before tb_init_done flag set */
     tb_init_done = 1;
 
     return 0;
@@ -384,7 +384,7 @@ int tb_control(xen_sysctl_tbuf_op_t *tbc)
     {
         cpumask_var_t mask;
 
-        rc = xenctl_cpumap_to_cpumask(&mask, &tbc->cpu_mask);
+        rc = xenctl_bitmap_to_cpumask(&mask, &tbc->cpu_mask);
         if ( !rc )
         {
             cpumask_copy(&tb_cpu_mask, mask);
@@ -414,13 +414,13 @@ int tb_control(xen_sysctl_tbuf_op_t *tbc)
         int i;
 
         tb_init_done = 0;
-        wmb();
+        smp_wmb();
         /* Clear any lost-record info so we don't get phantom lost records next time we
          * start tracing.  Grab the lock to make sure we're not racing anyone.  After this
          * hypercall returns, no more records should be placed into the buffers. */
         for_each_online_cpu(i)
         {
-            int flags;
+            unsigned long flags;
             spin_lock_irqsave(&per_cpu(t_lock, i), flags);
             per_cpu(lost_records, i)=0;
             spin_unlock_irqrestore(&per_cpu(t_lock, i), flags);
@@ -607,7 +607,7 @@ static inline void __insert_record(struct t_buf *buf,
         memcpy(next_page, (char *)rec + remaining, rec_size - remaining);
     }
 
-    wmb();
+    smp_wmb();
 
     next += rec_size;
     if ( next >= 2*data_size )
@@ -641,11 +641,11 @@ static inline void insert_wrap_record(struct t_buf *buf,
 
 static inline void insert_lost_records(struct t_buf *buf)
 {
-    struct {
+    struct __packed {
         u32 lost_records;
-        u32 did:16, vid:16;
+        u16 did, vid;
         u64 first_tsc;
-    } __attribute__((packed)) ed;
+    } ed;
 
     ed.vid = current->vcpu_id;
     ed.did = current->domain->domain_id;
@@ -718,7 +718,7 @@ void __trace_var(u32 event, bool_t cycles, unsigned int extra,
         return;
 
     /* Read tb_init_done /before/ t_bufs. */
-    rmb();
+    smp_rmb();
 
     spin_lock_irqsave(&this_cpu(t_lock), flags);
 
@@ -817,12 +817,12 @@ unlock:
 }
 
 void __trace_hypercall(uint32_t event, unsigned long op,
-                       const unsigned long *args)
+                       const xen_ulong_t *args)
 {
-    struct {
+    struct __packed {
         uint32_t op;
         uint32_t args[6];
-    } __attribute__((packed)) d;
+    } d;
     uint32_t *a = d.args;
 
 #define APPEND_ARG32(i)                         \
@@ -871,7 +871,7 @@ void __trace_hypercall(uint32_t event, unsigned long op,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

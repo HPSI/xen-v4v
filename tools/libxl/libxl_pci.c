@@ -102,7 +102,8 @@ int libxl__create_pci_backend(libxl__gc *gc, uint32_t domid,
 
     libxl__device_generic_add(gc, XBT_NULL, &device,
                               libxl__xs_kvs_of_flexarray(gc, back, back->count),
-                              libxl__xs_kvs_of_flexarray(gc, front, front->count));
+                              libxl__xs_kvs_of_flexarray(gc, front, front->count),
+                              NULL);
 
     return 0;
 }
@@ -822,7 +823,7 @@ static int qemu_pci_add_xenstore(libxl__gc *gc, uint32_t domid,
     }
 
     libxl__qemu_traditional_cmd(gc, domid, "pci-ins");
-    rc = libxl__wait_for_device_model(gc, domid, NULL, NULL,
+    rc = libxl__wait_for_device_model_deprecated(gc, domid, NULL, NULL,
                                       pci_ins_check, state);
     path = libxl__sprintf(gc, "/local/domain/0/device-model/%d/parameter",
                           domid);
@@ -850,7 +851,7 @@ static int do_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcidev, i
     switch (libxl__domain_type(gc, domid)) {
     case LIBXL_DOMAIN_TYPE_HVM:
         hvm = 1;
-        if (libxl__wait_for_device_model(gc, domid, "running",
+        if (libxl__wait_for_device_model_deprecated(gc, domid, "running",
                                          NULL, NULL, NULL) < 0) {
             return ERROR_FAIL;
         }
@@ -888,7 +889,7 @@ static int do_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcidev, i
                 if (flags & PCI_BAR_IO) {
                     rc = xc_domain_ioport_permission(ctx->xch, domid, start, size, 1);
                     if (rc < 0) {
-                        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "Error: xc_domain_ioport_permission error 0x%llx/0x%llx", start, size);
+                        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Error: xc_domain_ioport_permission error 0x%llx/0x%llx", start, size);
                         fclose(f);
                         return ERROR_FAIL;
                     }
@@ -896,7 +897,7 @@ static int do_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcidev, i
                     rc = xc_domain_iomem_permission(ctx->xch, domid, start>>XC_PAGE_SHIFT,
                                                     (size+(XC_PAGE_SIZE-1))>>XC_PAGE_SHIFT, 1);
                     if (rc < 0) {
-                        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "Error: xc_domain_iomem_permission error 0x%llx/0x%llx", start, size);
+                        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Error: xc_domain_iomem_permission error 0x%llx/0x%llx", start, size);
                         fclose(f);
                         return ERROR_FAIL;
                     }
@@ -914,13 +915,13 @@ static int do_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcidev, i
         if ((fscanf(f, "%u", &irq) == 1) && irq) {
             rc = xc_physdev_map_pirq(ctx->xch, domid, irq, &irq);
             if (rc < 0) {
-                LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "Error: xc_physdev_map_pirq irq=%d", irq);
+                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Error: xc_physdev_map_pirq irq=%d", irq);
                 fclose(f);
                 return ERROR_FAIL;
             }
             rc = xc_domain_irq_permission(ctx->xch, domid, irq, 1);
             if (rc < 0) {
-                LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "Error: xc_domain_irq_permission irq=%d", irq);
+                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Error: xc_domain_irq_permission irq=%d", irq);
                 fclose(f);
                 return ERROR_FAIL;
             }
@@ -945,7 +946,7 @@ out:
     if (!libxl_is_stubdom(ctx, domid, NULL)) {
         rc = xc_assign_device(ctx->xch, domid, pcidev_encode_bdf(pcidev));
         if (rc < 0 && (hvm || errno != ENOSYS)) {
-            LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_assign_device failed");
+            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_assign_device failed");
             return ERROR_FAIL;
         }
     }
@@ -966,7 +967,7 @@ static int libxl__device_pci_reset(libxl__gc *gc, unsigned int domain, unsigned 
 
     reset = libxl__sprintf(gc, "%s/pciback/do_flr", SYSFS_PCI_DEV);
     fd = open(reset, O_WRONLY);
-    if (fd > 0) {
+    if (fd >= 0) {
         char *buf = libxl__sprintf(gc, PCI_BDF, domain, bus, dev, func);
         rc = write(fd, buf, strlen(buf));
         if (rc < 0)
@@ -978,7 +979,7 @@ static int libxl__device_pci_reset(libxl__gc *gc, unsigned int domain, unsigned 
         LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "Failed to access pciback path %s", reset);
     reset = libxl__sprintf(gc, "%s/"PCI_BDF"/reset", SYSFS_PCI_DEV, domain, bus, dev, func);
     fd = open(reset, O_WRONLY);
-    if (fd > 0) {
+    if (fd >= 0) {
         rc = write(fd, "1", 1);
         if (rc < 0)
             LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "write to %s returned %d", reset, rc);
@@ -1020,11 +1021,10 @@ static int libxl_pcidev_assignable(libxl_ctx *ctx, libxl_device_pci *pcidev)
             pcidevs[i].bus == pcidev->bus &&
             pcidevs[i].dev == pcidev->dev &&
             pcidevs[i].func == pcidev->func)
-        {
-            return 1;
-        }
+            break;
     }
-    return 0;
+    free(pcidevs);
+    return i != num;
 }
 
 int libxl__device_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcidev, int starting)
@@ -1035,8 +1035,26 @@ int libxl__device_pci_add(libxl__gc *gc, uint32_t domid, libxl_device_pci *pcide
     int num_assigned, i, rc;
     int stubdomid = 0;
 
+    if (libxl__domain_type(gc, domid) == LIBXL_DOMAIN_TYPE_HVM) {
+        rc = xc_test_assign_device(ctx->xch, domid, pcidev_encode_bdf(pcidev));
+        if (rc) {
+            LIBXL__LOG(ctx, LIBXL__LOG_ERROR,
+                       "PCI device %04x:%02x:%02x.%u %s?",
+                       pcidev->domain, pcidev->bus, pcidev->dev, pcidev->func,
+                       errno == ENOSYS ? "cannot be assigned - no IOMMU"
+                                       : "already assigned to a different guest");
+            goto out;
+        }
+    }
+
     rc = libxl__device_pci_setdefault(gc, pcidev);
     if (rc) goto out;
+
+    if (pcidev->seize && !pciback_dev_is_assigned(gc, pcidev)) {
+        rc = libxl__device_pci_assignable_add(gc, pcidev, 1);
+        if ( rc )
+            goto out;
+    }
 
     if (!libxl_pcidev_assignable(ctx, pcidev)) {
         LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "PCI device %x:%x:%x.%x is not assignable",
@@ -1124,7 +1142,7 @@ static int qemu_pci_remove_xenstore(libxl__gc *gc, uint32_t domid,
      * device-model for function 0 */
     if ( !force && (pcidev->vdevfn & 0x7) == 0 ) {
         libxl__qemu_traditional_cmd(gc, domid, "pci-rem");
-        if (libxl__wait_for_device_model(gc, domid, "pci-removed",
+        if (libxl__wait_for_device_model_deprecated(gc, domid, "pci-removed",
                                          NULL, NULL, NULL) < 0) {
             LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "Device Model didn't respond in time");
             /* This depends on guest operating system acknowledging the
@@ -1166,7 +1184,7 @@ static int do_pci_remove(libxl__gc *gc, uint32_t domid,
     switch (libxl__domain_type(gc, domid)) {
     case LIBXL_DOMAIN_TYPE_HVM:
         hvm = 1;
-        if (libxl__wait_for_device_model(gc, domid, "running",
+        if (libxl__wait_for_device_model_deprecated(gc, domid, "running",
                                          NULL, NULL, NULL) < 0)
             goto out_fail;
 
@@ -1207,12 +1225,12 @@ static int do_pci_remove(libxl__gc *gc, uint32_t domid,
                 if (flags & PCI_BAR_IO) {
                     rc = xc_domain_ioport_permission(ctx->xch, domid, start, size, 0);
                     if (rc < 0)
-                        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_domain_ioport_permission error 0x%x/0x%x", start, size);
+                        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_domain_ioport_permission error 0x%x/0x%x", start, size);
                 } else {
                     rc = xc_domain_iomem_permission(ctx->xch, domid, start>>XC_PAGE_SHIFT,
                                                     (size+(XC_PAGE_SIZE-1))>>XC_PAGE_SHIFT, 0);
                     if (rc < 0)
-                        LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_domain_iomem_permission error 0x%x/0x%x", start, size);
+                        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_domain_iomem_permission error 0x%x/0x%x", start, size);
                 }
             }
         }
@@ -1228,11 +1246,11 @@ skip1:
         if ((fscanf(f, "%u", &irq) == 1) && irq) {
             rc = xc_physdev_unmap_pirq(ctx->xch, domid, irq);
             if (rc < 0) {
-                LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_physdev_unmap_pirq irq=%d", irq);
+                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_physdev_unmap_pirq irq=%d", irq);
             }
             rc = xc_domain_irq_permission(ctx->xch, domid, irq, 0);
             if (rc < 0) {
-                LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_domain_irq_permission irq=%d", irq);
+                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_domain_irq_permission irq=%d", irq);
             }
         }
         fclose(f);
@@ -1250,7 +1268,7 @@ out:
     if (!libxl_is_stubdom(ctx, domid, NULL)) {
         rc = xc_deassign_device(ctx->xch, domid, pcidev_encode_bdf(pcidev));
         if (rc < 0 && (hvm || errno != ENOSYS))
-            LIBXL__LOG_ERRNOVAL(ctx, LIBXL__LOG_ERROR, rc, "xc_deassign_device failed");
+            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "xc_deassign_device failed");
     }
 
     stubdomid = libxl_get_stubdom_id(ctx, domid);

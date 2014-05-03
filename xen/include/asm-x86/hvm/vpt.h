@@ -104,15 +104,18 @@ typedef struct RTCState {
     struct hvm_hw_rtc hw;
     /* RTC's idea of the current time */
     struct tm current_tm;
-    /* second update */
-    int64_t next_second_time;
-    struct periodic_time pt;
     /* update-ended timer */
     struct timer update_timer;
     struct timer update_timer2;
+    uint64_t next_update_time;
     /* alarm timer */
     struct timer alarm_timer;
-    uint64_t next_update_time;
+    /* periodic timer */
+    struct periodic_time pt;
+    s_time_t start_time;
+    s_time_t check_ticks_since;
+    int period;
+    uint8_t pt_dead_ticks;
     uint32_t use_timer;
     spinlock_t lock;
 } RTCState;
@@ -173,7 +176,7 @@ void destroy_periodic_time(struct periodic_time *pt);
 int pv_pit_handler(int port, int data, int write);
 void pit_reset(struct domain *d);
 
-void pit_init(struct vcpu *v, unsigned long cpu_khz);
+void pit_init(struct domain *d, unsigned long cpu_khz);
 void pit_stop_channel0_irq(PITState * pit);
 void pit_deinit(struct domain *d);
 void rtc_init(struct domain *d);

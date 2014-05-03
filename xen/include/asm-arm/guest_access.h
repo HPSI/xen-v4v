@@ -11,6 +11,8 @@
     (likely(count < (~0UL/size)) && access_ok(addr,count*size))
 
 unsigned long raw_copy_to_guest(void *to, const void *from, unsigned len);
+unsigned long raw_copy_to_guest_flush_dcache(void *to, const void *from,
+                                             unsigned len);
 unsigned long raw_copy_from_guest(void *to, const void *from, unsigned len);
 unsigned long raw_clear_guest(void *to, unsigned len);
 
@@ -77,8 +79,9 @@ unsigned long raw_clear_guest(void *to, unsigned len);
  * Clear an array of objects in guest context via a guest handle,
  * specifying an offset into the guest array.
  */
-#define clear_guest_offset(hnd, off, ptr, nr) ({      \
-    raw_clear_guest(_d+(off), nr);  \
+#define clear_guest_offset(hnd, off, nr) ({    \
+    void *_d = (hnd).p;                        \
+    raw_clear_guest(_d+(off), nr);             \
 })
 
 /*
@@ -148,7 +151,7 @@ unsigned long raw_clear_guest(void *to, unsigned len);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

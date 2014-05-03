@@ -26,7 +26,7 @@
 #include <public/hvm/ioreq.h>
 #include <public/domctl.h>
 
-extern bool_t iommu_enabled;
+extern bool_t iommu_enable, iommu_enabled;
 extern bool_t force_iommu, iommu_verbose;
 extern bool_t iommu_workaround_bios_bug, iommu_passthrough;
 extern bool_t iommu_snoop, iommu_qinval, iommu_intremap;
@@ -36,8 +36,6 @@ extern bool_t amd_iommu_perdev_intremap;
 
 /* Does this domain have a P2M table we can use as its IOMMU pagetable? */
 #define iommu_use_hap_pt(d) (hap_enabled(d) && iommu_hap_pt_share)
-
-extern struct rangeset *mmio_ro_ranges;
 
 #define domain_hvm_iommu(d)     (&d->arch.hvm_domain.hvm_iommu)
 
@@ -57,7 +55,7 @@ int iommu_add_device(struct pci_dev *pdev);
 int iommu_enable_device(struct pci_dev *pdev);
 int iommu_remove_device(struct pci_dev *pdev);
 int iommu_domain_init(struct domain *d);
-void iommu_dom0_init(struct domain *d);
+void iommu_hwdom_init(struct domain *d);
 void iommu_domain_destroy(struct domain *d);
 int deassign_device(struct domain *d, u16 seg, u8 bus, u8 devfn);
 
@@ -70,8 +68,6 @@ int iommu_map_page(struct domain *d, unsigned long gfn, unsigned long mfn,
                    unsigned int flags);
 int iommu_unmap_page(struct domain *d, unsigned long gfn);
 void iommu_pte_flush(struct domain *d, u64 gfn, u64 *pte, int order, int present);
-void iommu_set_pgd(struct domain *d);
-void iommu_domain_teardown(struct domain *d);
 
 void pt_pci_init(void);
 
@@ -90,23 +86,25 @@ bool_t pt_irq_need_timer(uint32_t flags);
 
 struct msi_desc;
 struct msi_msg;
+struct page_info;
 
 struct iommu_ops {
     int (*init)(struct domain *d);
-    void (*dom0_init)(struct domain *d);
-    int (*add_device)(struct pci_dev *pdev);
+    void (*hwdom_init)(struct domain *d);
+    int (*add_device)(u8 devfn, struct pci_dev *);
     int (*enable_device)(struct pci_dev *pdev);
-    int (*remove_device)(struct pci_dev *pdev);
-    int (*assign_device)(struct domain *d, u16 seg, u8 bus, u8 devfn);
+    int (*remove_device)(u8 devfn, struct pci_dev *);
+    int (*assign_device)(struct domain *, u8 devfn, struct pci_dev *);
     void (*teardown)(struct domain *d);
     int (*map_page)(struct domain *d, unsigned long gfn, unsigned long mfn,
                     unsigned int flags);
     int (*unmap_page)(struct domain *d, unsigned long gfn);
+    void (*free_page_table)(struct page_info *);
     int (*reassign_device)(struct domain *s, struct domain *t,
-			   u16 seg, u8 bus, u8 devfn);
+			   u8 devfn, struct pci_dev *);
     int (*get_device_group_id)(u16 seg, u8 bus, u8 devfn);
     void (*update_ire_from_apic)(unsigned int apic, unsigned int reg, unsigned int value);
-    void (*update_ire_from_msi)(struct msi_desc *msi_desc, struct msi_msg *msg);
+    int (*update_ire_from_msi)(struct msi_desc *msi_desc, struct msi_msg *msg);
     void (*read_msi_from_ire)(struct msi_desc *msi_desc, struct msi_msg *msg);
     unsigned int (*read_apic_from_ire)(unsigned int apic, unsigned int reg);
     int (*setup_hpet_msi)(struct msi_desc *);
@@ -120,7 +118,7 @@ struct iommu_ops {
 };
 
 void iommu_update_ire_from_apic(unsigned int apic, unsigned int reg, unsigned int value);
-void iommu_update_ire_from_msi(struct msi_desc *msi_desc, struct msi_msg *msg);
+int iommu_update_ire_from_msi(struct msi_desc *msi_desc, struct msi_msg *msg);
 void iommu_read_msi_from_ire(struct msi_desc *msi_desc, struct msi_msg *msg);
 unsigned int iommu_read_apic_from_ire(unsigned int apic, unsigned int reg);
 int iommu_setup_hpet_msi(struct msi_desc *);
@@ -129,13 +127,17 @@ void iommu_suspend(void);
 void iommu_resume(void);
 void iommu_crash_shutdown(void);
 
-void iommu_set_dom0_mapping(struct domain *d);
+void iommu_set_hwdom_mapping(struct domain *d);
 void iommu_share_p2m_table(struct domain *d);
 
-int iommu_do_domctl(struct xen_domctl *, XEN_GUEST_HANDLE_PARAM(xen_domctl_t));
+int iommu_do_domctl(struct xen_domctl *, struct domain *d,
+                    XEN_GUEST_HANDLE_PARAM(xen_domctl_t));
 
 void iommu_iotlb_flush(struct domain *d, unsigned long gfn, unsigned int page_count);
 void iommu_iotlb_flush_all(struct domain *d);
+
+/* While VT-d specific, this must get declared in a generic header. */
+int adjust_vtd_irq_affinities(void);
 
 /*
  * The purpose of the iommu_dont_flush_iotlb optional cpu flag is to
@@ -148,5 +150,8 @@ void iommu_iotlb_flush_all(struct domain *d);
  * the caller.
  */
 DECLARE_PER_CPU(bool_t, iommu_dont_flush_iotlb);
+
+extern struct spinlock iommu_pt_cleanup_lock;
+extern struct page_list_head iommu_pt_cleanup_list;
 
 #endif /* _IOMMU_H_ */

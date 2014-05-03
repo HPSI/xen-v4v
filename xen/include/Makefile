@@ -27,6 +27,7 @@ headers-$(CONFIG_X86)     += compat/arch-x86/xen-mca.h
 headers-$(CONFIG_X86)     += compat/arch-x86/xen.h
 headers-$(CONFIG_X86)     += compat/arch-x86/xen-$(compat-arch-y).h
 headers-y                 += compat/arch-$(compat-arch-y).h compat/xlat.h
+headers-$(FLASK_ENABLE)   += compat/xsm/flask_op.h
 
 cppflags-y                := -include public/xen-compat.h
 cppflags-$(CONFIG_X86)    += -m32
@@ -65,12 +66,24 @@ compat/%.c: public/%.h xlat.lst Makefile $(BASEDIR)/tools/compat-build-source.py
 	$(PYTHON) $(BASEDIR)/tools/compat-build-source.py >$@.new
 	mv -f $@.new $@
 
-compat/xlat.h: xlat.lst $(filter-out compat/xlat.h,$(headers-y)) $(BASEDIR)/tools/get-fields.sh Makefile
+compat/.xlat/%.h: compat/%.h compat/.xlat/%.lst $(BASEDIR)/tools/get-fields.sh Makefile
 	export PYTHON=$(PYTHON); \
-	grep -v '^[	 ]*#' xlat.lst | \
-	while read what name hdr; do \
-		$(SHELL) $(BASEDIR)/tools/get-fields.sh "$$what" compat_$$name $$(echo compat/$$hdr | sed 's,@arch@,$(compat-arch-y),g') || exit $$?; \
-	done >$@.new
+	while read what name; do \
+		$(SHELL) $(BASEDIR)/tools/get-fields.sh "$$what" compat_$$name $< || exit $$?; \
+	done <$(patsubst compat/%,compat/.xlat/%,$(basename $<)).lst >$@.new
+	mv -f $@.new $@
+
+.PRECIOUS: compat/.xlat/%.lst
+compat/.xlat/%.lst: xlat.lst Makefile
+	mkdir -p $(@D)
+	grep -v '^[[:blank:]]*#' $< | sed -ne 's,@arch@,$(compat-arch-y),g' -re 's,[[:blank:]]+$*\.h[[:blank:]]*$$,,p' >$@.new
+	$(call move-if-changed,$@.new,$@)
+
+xlat-y := $(shell sed -ne 's,@arch@,$(compat-arch-y),g' -re 's,^[?!][[:blank:]]+[^[:blank:]]+[[:blank:]]+,,p' xlat.lst | uniq)
+xlat-y := $(filter $(patsubst compat/%,%,$(headers-y)),$(xlat-y))
+
+compat/xlat.h: $(addprefix compat/.xlat/,$(xlat-y)) Makefile
+	cat $(filter %.h,$^) >$@.new
 	mv -f $@.new $@
 
 ifeq ($(XEN_TARGET_ARCH),$(XEN_COMPILE_ARCH))
@@ -78,7 +91,7 @@ ifeq ($(XEN_TARGET_ARCH),$(XEN_COMPILE_ARCH))
 all: headers.chk
 
 headers.chk: $(filter-out public/arch-% public/%ctl.h public/xsm/% public/%hvm/save.h, $(wildcard public/*.h public/*/*.h) $(public-y)) Makefile
-	for i in $(filter %.h,$^); do $(CC) -ansi -include stdint.h -Wall -W -Werror -S -o /dev/null -xc $$i || exit 1; echo $$i; done >$@.new
+	for i in $(filter %.h,$^); do $(CC) -ansi -include stdint.h -Wall -W -Werror -S -o /dev/null -x c $$i || exit 1; echo $$i; done >$@.new
 	mv $@.new $@
 
 endif

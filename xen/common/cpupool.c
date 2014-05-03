@@ -41,16 +41,28 @@ static struct cpupool *alloc_cpupool_struct(void)
 {
     struct cpupool *c = xzalloc(struct cpupool);
 
-    if ( c && zalloc_cpumask_var(&c->cpu_valid) )
-        return c;
-    xfree(c);
-    return NULL;
+    if ( !c || !zalloc_cpumask_var(&c->cpu_valid) )
+    {
+        xfree(c);
+        c = NULL;
+    }
+    else if ( !zalloc_cpumask_var(&c->cpu_suspended) )
+    {
+        free_cpumask_var(c->cpu_valid);
+        xfree(c);
+        c = NULL;
+    }
+
+    return c;
 }
 
 static void free_cpupool_struct(struct cpupool *c)
 {
     if ( c )
+    {
+        free_cpumask_var(c->cpu_suspended);
         free_cpumask_var(c->cpu_valid);
+    }
     xfree(c);
 }
 
@@ -295,7 +307,7 @@ out:
  * - last cpu and still active domains in cpupool
  * - cpu just being unplugged
  */
-int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
+static int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
 {
     int work_cpu;
     int ret;
@@ -343,6 +355,12 @@ int cpupool_unassign_cpu(struct cpupool *c, unsigned int cpu)
     atomic_inc(&c->refcnt);
     cpupool_cpu_moving = c;
     cpumask_clear_cpu(cpu, c->cpu_valid);
+
+    rcu_read_lock(&domlist_read_lock);
+    for_each_domain_in_cpupool(d, c)
+        domain_update_node_affinity(d);
+    rcu_read_unlock(&domlist_read_lock);
+
     spin_unlock(&cpupool_lock);
 
     work_cpu = smp_processor_id();
@@ -417,14 +435,32 @@ void cpupool_rm_domain(struct domain *d)
 
 /*
  * called to add a new cpu to pool admin
- * we add a hotplugged cpu to the cpupool0 to be able to add it to dom0
+ * we add a hotplugged cpu to the cpupool0 to be able to add it to dom0,
+ * unless we are resuming from S3, in which case we put the cpu back
+ * in the cpupool it was in prior to suspend.
  */
 static void cpupool_cpu_add(unsigned int cpu)
 {
     spin_lock(&cpupool_lock);
     cpumask_clear_cpu(cpu, &cpupool_locked_cpus);
     cpumask_set_cpu(cpu, &cpupool_free_cpus);
-    cpupool_assign_cpu_locked(cpupool0, cpu);
+
+    if ( system_state == SYS_STATE_resume )
+    {
+        struct cpupool **c;
+
+        for_each_cpupool(c)
+        {
+            if ( cpumask_test_cpu(cpu, (*c)->cpu_suspended ) )
+            {
+                cpupool_assign_cpu_locked(*c, cpu);
+                cpumask_clear_cpu(cpu, (*c)->cpu_suspended);
+            }
+        }
+    }
+
+    if ( cpumask_test_cpu(cpu, &cpupool_free_cpus) )
+        cpupool_assign_cpu_locked(cpupool0, cpu);
     spin_unlock(&cpupool_lock);
 }
 
@@ -436,7 +472,7 @@ static void cpupool_cpu_add(unsigned int cpu)
 static int cpupool_cpu_remove(unsigned int cpu)
 {
     int ret = 0;
-	
+
     spin_lock(&cpupool_lock);
     if ( !cpumask_test_cpu(cpu, cpupool0->cpu_valid))
         ret = -EBUSY;
@@ -493,7 +529,7 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
         op->cpupool_id = c->cpupool_id;
         op->sched_id = c->sched->sched_id;
         op->n_dom = c->n_dom;
-        ret = cpumask_to_xenctl_cpumap(&op->cpumap, c->cpu_valid);
+        ret = cpumask_to_xenctl_bitmap(&op->cpumap, c->cpu_valid);
         cpupool_put(c);
     }
     break;
@@ -546,12 +582,8 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
     {
         struct domain *d;
 
-        ret = -EINVAL;
-        if ( op->domid == 0 )
-            break;
-        ret = -ESRCH;
-        d = rcu_lock_domain_by_id(op->domid);
-        if ( d == NULL )
+        ret = rcu_lock_remote_domain_by_id(op->domid, &d);
+        if ( ret )
             break;
         if ( d->cpupool == NULL )
         {
@@ -588,7 +620,7 @@ int cpupool_do_sysctl(struct xen_sysctl_cpupool_op *op)
 
     case XEN_SYSCTL_CPUPOOL_OP_FREEINFO:
     {
-        ret = cpumask_to_xenctl_cpumap(
+        ret = cpumask_to_xenctl_bitmap(
             &op->cpumap, &cpupool_free_cpus);
     }
     break;
@@ -633,9 +665,14 @@ static int cpu_callback(
     unsigned int cpu = (unsigned long)hcpu;
     int rc = 0;
 
-    if ( (system_state == SYS_STATE_suspend) ||
-         (system_state == SYS_STATE_resume) )
-        goto out;
+    if ( system_state == SYS_STATE_suspend )
+    {
+        struct cpupool **c;
+
+        for_each_cpupool(c)
+            if ( cpumask_test_cpu(cpu, (*c)->cpu_valid ) )
+                cpumask_set_cpu(cpu, (*c)->cpu_suspended);
+    }
 
     switch ( action )
     {
@@ -650,7 +687,6 @@ static int cpu_callback(
         break;
     }
 
-out:
     return !rc ? NOTIFY_DONE : notifier_from_errno(rc);
 }
 
@@ -674,7 +710,7 @@ presmp_initcall(cpupool_presmp_init);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -16,7 +16,7 @@
 #include <asm/system.h>
 #include <asm/io.h>
 #include <asm/desc.h>
-#include <asm/bitops.h>
+#include <xen/bitops.h>
 #include <xen/delay.h>
 #include <asm/apic.h>
 #include <asm/asm_defns.h>
@@ -165,7 +165,7 @@ static void _disable_8259A_irq(unsigned int irq)
         outb(cached_A1,0xA1);
     else
         outb(cached_21,0x21);
-    per_cpu(vector_irq, 0)[LEGACY_VECTOR(irq)] = -1;
+    per_cpu(vector_irq, 0)[LEGACY_VECTOR(irq)] = ~irq;
     spin_unlock_irqrestore(&i8259A_lock, flags);
 }
 
@@ -416,6 +416,8 @@ void __init init_IRQ(void)
     for (irq = 0; platform_legacy_irq(irq); irq++) {
         struct irq_desc *desc = irq_to_desc(irq);
         
+        if ( irq == 2 ) /* IRQ2 doesn't exist */
+            continue;
         desc->handler = &i8259A_irq_type;
         per_cpu(vector_irq, cpu)[FIRST_LEGACY_VECTOR + irq] = irq;
         cpumask_copy(desc->arch.cpu_mask, cpumask_of(cpu));

@@ -3,6 +3,17 @@
 
 #include <xen/config.h>
 
+/*
+ * We don't do inline string functions, since the
+ * optimised inline asm versions are not small.
+ */
+
+#define __HAVE_ARCH_STRRCHR
+extern char * strrchr(const char * s, int c);
+
+#define __HAVE_ARCH_STRCHR
+extern char * strchr(const char * s, int c);
+
 #define __HAVE_ARCH_MEMCPY
 extern void * memcpy(void *, const void *, __kernel_size_t);
 
@@ -12,6 +23,11 @@ extern void *memmove(void *dest, const void *src, size_t n);
 
 #define __HAVE_ARCH_MEMSET
 extern void * memset(void *, int, __kernel_size_t);
+
+#define __HAVE_ARCH_MEMCHR
+extern void * memchr(const void *, int, __kernel_size_t);
+
+#if defined(CONFIG_ARM_32)
 
 extern void __memzero(void *ptr, __kernel_size_t n);
 
@@ -27,11 +43,13 @@ extern void __memzero(void *ptr, __kernel_size_t n);
                 (__p);                                                  \
         })
 
+#endif
+
 #endif /* __ARM_STRING_H__ */
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

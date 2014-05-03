@@ -125,7 +125,7 @@ static int e820_sanitize(libxl_ctx *ctx, struct e820entry src[],
             src[i].type = E820_UNUSABLE;
             delta = ram_end - src[i].addr;
             /* The end < ram_end should weed this out */
-            if (src[i].size - delta < 0)
+            if (src[i].size < delta)
                 src[i].type = 0;
             else {
                 src[i].size -= delta;
@@ -182,7 +182,7 @@ static int e820_sanitize(libxl_ctx *ctx, struct e820entry src[],
         idx++;
     }
     /* At this point we have the mapped RAM + E820 entries from src. */
-    if (balloon_kb) {
+    if (balloon_kb || delta_kb) {
         /* and if we truncated the RAM region, then add it to the end. */
         e820[idx].type = E820_RAM;
         e820[idx].addr = (uint64_t)(1ULL << 32) > last ?
@@ -248,6 +248,56 @@ int libxl__arch_domain_create(libxl__gc *gc, libxl_domain_config *d_config,
         uint32_t domid)
 {
     int ret = 0;
+    int tsc_mode;
+    uint32_t rtc_timeoffset;
+    libxl_ctx *ctx = libxl__gc_owner(gc);
+
+    if (d_config->b_info.type == LIBXL_DOMAIN_TYPE_PV)
+        xc_domain_set_memmap_limit(ctx->xch, domid,
+                                   (d_config->b_info.max_memkb +
+                                    d_config->b_info.u.pv.slack_memkb));
+
+    switch (d_config->b_info.tsc_mode) {
+    case LIBXL_TSC_MODE_DEFAULT:
+        tsc_mode = 0;
+        break;
+    case LIBXL_TSC_MODE_ALWAYS_EMULATE:
+        tsc_mode = 1;
+        break;
+    case LIBXL_TSC_MODE_NATIVE:
+        tsc_mode = 2;
+        break;
+    case LIBXL_TSC_MODE_NATIVE_PARAVIRT:
+        tsc_mode = 3;
+        break;
+    default:
+        abort();
+    }
+    xc_domain_set_tsc_info(ctx->xch, domid, tsc_mode, 0, 0, 0);
+    if (libxl_defbool_val(d_config->b_info.disable_migrate))
+        xc_domain_disable_migrate(ctx->xch, domid);
+    rtc_timeoffset = d_config->b_info.rtc_timeoffset;
+    if (libxl_defbool_val(d_config->b_info.localtime)) {
+        time_t t;
+        struct tm *tm;
+
+        t = time(NULL);
+        tm = localtime(&t);
+
+        rtc_timeoffset += tm->tm_gmtoff;
+    }
+
+    if (rtc_timeoffset)
+        xc_domain_set_time_offset(ctx->xch, domid, rtc_timeoffset);
+
+    if (d_config->b_info.type == LIBXL_DOMAIN_TYPE_HVM ||
+        libxl_defbool_val(d_config->c_info.pvh)) {
+
+        unsigned long shadow;
+        shadow = (d_config->b_info.shadow_memkb + 1023) / 1024;
+        xc_shadow_control(ctx->xch, domid, XEN_DOMCTL_SHADOW_OP_SET_ALLOCATION, NULL, 0, &shadow, 0, NULL);
+    }
+
     if (d_config->c_info.type == LIBXL_DOMAIN_TYPE_PV &&
             libxl_defbool_val(d_config->b_info.u.pv.e820_host)) {
         ret = libxl__e820_alloc(gc, domid, d_config);
@@ -259,4 +309,18 @@ int libxl__arch_domain_create(libxl__gc *gc, libxl_domain_config *d_config,
     }
 
     return ret;
+}
+
+int libxl__arch_domain_init_hw_description(libxl__gc *gc,
+                                           libxl_domain_build_info *info,
+                                           struct xc_dom_image *dom)
+{
+    return 0;
+}
+
+int libxl__arch_domain_finalise_hw_description(libxl__gc *gc,
+                                               libxl_domain_build_info *info,
+                                               struct xc_dom_image *dom)
+{
+    return 0;
 }

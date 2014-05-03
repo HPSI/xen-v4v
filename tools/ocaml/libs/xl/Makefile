@@ -2,13 +2,17 @@ TOPLEVEL=$(CURDIR)/../..
 XEN_ROOT=$(TOPLEVEL)/../..
 include $(TOPLEVEL)/common.make
 
-# ignore unused generated functions
-CFLAGS += -Wno-unused
+# ignore unused generated functions and allow mixed declarations and code
+CFLAGS += -Wno-unused -Wno-declaration-after-statement
+
 CFLAGS += $(CFLAGS_libxenlight)
+CFLAGS += -I ../xentoollog
 
 OBJS = xenlight
 INTF = xenlight.cmi
 LIBS = xenlight.cma xenlight.cmxa
+
+OCAMLINCLUDE += -I ../xentoollog
 
 LIBS_xenlight = $(LDLIBS_libxenlight)
 
@@ -19,7 +23,7 @@ OCAML_LIBRARY = xenlight
 
 GENERATED_FILES += xenlight.ml xenlight.ml.tmp xenlight.mli xenlight.mli.tmp
 GENERATED_FILES += _libxl_types.ml.in _libxl_types.mli.in
-GENERATED_FILES += _libxl_types.inc
+GENERATED_FILES += _libxl_types.inc META
 
 all: $(INTF) $(LIBS)
 
@@ -56,11 +60,11 @@ libs: $(LIBS)
 .PHONY: install
 install: $(LIBS) META
 	mkdir -p $(OCAMLDESTDIR)
-	ocamlfind remove -destdir $(OCAMLDESTDIR) xenlight
-	ocamlfind install -destdir $(OCAMLDESTDIR) -ldconf ignore xenlight META $(INTF) $(LIBS) *.a *.so *.cmx
+	$(OCAMLFIND) remove -destdir $(OCAMLDESTDIR) xenlight
+	$(OCAMLFIND) install -destdir $(OCAMLDESTDIR) -ldconf ignore xenlight META $(INTF) $(LIBS) *.a *.so *.cmx
 
 .PHONY: uninstall
 uninstall:
-	ocamlfind remove -destdir $(OCAMLDESTDIR) xenlight
+	$(OCAMLFIND) remove -destdir $(OCAMLDESTDIR) xenlight
 
 include $(TOPLEVEL)/Makefile.rules

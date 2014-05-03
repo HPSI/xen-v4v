@@ -62,14 +62,15 @@ SHLIB_libxenlight  = -Wl,-rpath-link=$(XEN_XENLIGHT)
 CFLAGS += -D__XEN_TOOLS__
 
 # Get gcc to generate the dependencies for us.
-CFLAGS += -MMD -MF .$(@F).d
+CFLAGS += -MMD -MF .$(if $(filter-out .,$(@D)),$(subst /,@,$(@D))@)$(@F).d
 DEPS = .*.d
 
+ifneq ($(FILE_OFFSET_BITS),)
+CFLAGS  += -D_FILE_OFFSET_BITS=$(FILE_OFFSET_BITS)
+endif
 ifneq ($(XEN_OS),NetBSD)
 # Enable implicit LFS support *and* explicit LFS names.
-CFLAGS  += $(shell getconf LFS_CFLAGS)
 CFLAGS  += -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE
-LDFLAGS += $(shell getconf LFS_LDFLAGS)
 endif
 
 # 32-bit x86 does not perform well with -ve segment accesses on Xen.

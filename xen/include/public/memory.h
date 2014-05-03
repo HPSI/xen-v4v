@@ -68,6 +68,8 @@ struct xen_memory_reservation {
      *   IN:  GPFN bases of extents to populate with memory
      *   OUT: GMFN bases of extents that were allocated
      *   (NB. This command also updates the mach_to_phys translation table)
+     * XENMEM_claim_pages:
+     *   IN: must be zero
      */
     XEN_GUEST_HANDLE(xen_pfn_t) extent_start;
 
@@ -185,6 +187,15 @@ typedef struct xen_machphys_mfn_list xen_machphys_mfn_list_t;
 DEFINE_XEN_GUEST_HANDLE(xen_machphys_mfn_list_t);
 
 /*
+ * For a compat caller, this is identical to XENMEM_machphys_mfn_list.
+ *
+ * For a non compat caller, this functions similarly to
+ * XENMEM_machphys_mfn_list, but returns the mfns making up the compatibility
+ * m2p table.
+ */
+#define XENMEM_machphys_compat_mfn_list     25
+
+/*
  * Returns the location in virtual address space of the machine_to_phys
  * mapping table. Architectures which do not have a m2p table, or which do not
  * map it by default into guest address space, do not implement this command.
@@ -203,8 +214,9 @@ DEFINE_XEN_GUEST_HANDLE(xen_machphys_mapping_t);
 #define XENMAPSPACE_shared_info  0 /* shared info page */
 #define XENMAPSPACE_grant_table  1 /* grant table page */
 #define XENMAPSPACE_gmfn         2 /* GMFN */
-#define XENMAPSPACE_gmfn_range   3 /* GMFN range */
-#define XENMAPSPACE_gmfn_foreign 4 /* GMFN from another dom */
+#define XENMAPSPACE_gmfn_range   3 /* GMFN range, XENMEM_add_to_physmap only. */
+#define XENMAPSPACE_gmfn_foreign 4 /* GMFN from another dom,
+                                    * XENMEM_add_to_physmap_batch only. */
 /* ` } */
 
 /*
@@ -234,8 +246,9 @@ typedef struct xen_add_to_physmap xen_add_to_physmap_t;
 DEFINE_XEN_GUEST_HANDLE(xen_add_to_physmap_t);
 
 /* A batched version of add_to_physmap. */
-#define XENMEM_add_to_physmap_range 23
-struct xen_add_to_physmap_range {
+#define XENMEM_add_to_physmap_batch 23
+struct xen_add_to_physmap_batch {
+    /* IN */
     /* Which domain to change the mapping for. */
     domid_t domid;
     uint16_t space; /* => enum phys_map_space */
@@ -247,11 +260,23 @@ struct xen_add_to_physmap_range {
     /* Indexes into space being mapped. */
     XEN_GUEST_HANDLE(xen_ulong_t) idxs;
 
-    /* GPFN in domdwhere the source mapping page should appear. */
+    /* GPFN in domid where the source mapping page should appear. */
     XEN_GUEST_HANDLE(xen_pfn_t) gpfns;
+
+    /* OUT */
+
+    /* Per index error code. */
+    XEN_GUEST_HANDLE(int) errs;
 };
-typedef struct xen_add_to_physmap_range xen_add_to_physmap_range_t;
+typedef struct xen_add_to_physmap_batch xen_add_to_physmap_batch_t;
+DEFINE_XEN_GUEST_HANDLE(xen_add_to_physmap_batch_t);
+
+#if __XEN_INTERFACE_VERSION__ < 0x00040400
+#define XENMEM_add_to_physmap_range XENMEM_add_to_physmap_batch
+#define xen_add_to_physmap_range xen_add_to_physmap_batch
+typedef struct xen_add_to_physmap_batch xen_add_to_physmap_range_t;
 DEFINE_XEN_GUEST_HANDLE(xen_add_to_physmap_range_t);
+#endif
 
 /*
  * Unmaps the page appearing at a particular GPFN from the specified guest's
@@ -347,9 +372,6 @@ typedef struct xen_pod_target xen_pod_target_t;
 #define XENMEM_paging_op_evict              1
 #define XENMEM_paging_op_prep               2
 
-#define XENMEM_access_op                    21
-#define XENMEM_access_op_resume             0
-
 struct xen_mem_event_op {
     uint8_t     op;         /* XENMEM_*_op_* */
     domid_t     domain;
@@ -362,6 +384,56 @@ struct xen_mem_event_op {
 };
 typedef struct xen_mem_event_op xen_mem_event_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_mem_event_op_t);
+
+#define XENMEM_access_op                    21
+#define XENMEM_access_op_resume             0
+#define XENMEM_access_op_set_access         1
+#define XENMEM_access_op_get_access         2
+
+typedef enum {
+    XENMEM_access_n,
+    XENMEM_access_r,
+    XENMEM_access_w,
+    XENMEM_access_rw,
+    XENMEM_access_x,
+    XENMEM_access_rx,
+    XENMEM_access_wx,
+    XENMEM_access_rwx,
+    /*
+     * Page starts off as r-x, but automatically
+     * change to r-w on a write
+     */
+    XENMEM_access_rx2rw,
+    /*
+     * Log access: starts off as n, automatically
+     * goes to rwx, generating an event without
+     * pausing the vcpu
+     */
+    XENMEM_access_n2rwx,
+    /* Take the domain default */
+    XENMEM_access_default
+} xenmem_access_t;
+
+struct xen_mem_access_op {
+    /* XENMEM_access_op_* */
+    uint8_t op;
+    /* xenmem_access_t */
+    uint8_t access;
+    domid_t domid;
+    /*
+     * Number of pages for set op
+     * Ignored on setting default access and other ops
+     */
+    uint32_t nr;
+    /*
+     * First pfn for set op
+     * pfn for get op
+     * ~0ull is used to set and get the default access for pages
+     */
+    uint64_aligned_t pfn;
+};
+typedef struct xen_mem_access_op xen_mem_access_op_t;
+DEFINE_XEN_GUEST_HANDLE(xen_mem_access_op_t);
 
 #define XENMEM_sharing_op                   22
 #define XENMEM_sharing_op_nominate_gfn      0
@@ -421,14 +493,44 @@ struct xen_mem_sharing_op {
 typedef struct xen_mem_sharing_op xen_mem_sharing_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_mem_sharing_op_t);
 
+/*
+ * Attempt to stake a claim for a domain on a quantity of pages
+ * of system RAM, but _not_ assign specific pageframes.  Only
+ * arithmetic is performed so the hypercall is very fast and need
+ * not be preemptible, thus sidestepping time-of-check-time-of-use
+ * races for memory allocation.  Returns 0 if the hypervisor page
+ * allocator has atomically and successfully claimed the requested
+ * number of pages, else non-zero.
+ *
+ * Any domain may have only one active claim.  When sufficient memory
+ * has been allocated to resolve the claim, the claim silently expires.
+ * Claiming zero pages effectively resets any outstanding claim and
+ * is always successful.
+ *
+ * Note that a valid claim may be staked even after memory has been
+ * allocated for a domain.  In this case, the claim is not incremental,
+ * i.e. if the domain's tot_pages is 3, and a claim is staked for 10,
+ * only 7 additional pages are claimed.
+ *
+ * Caller must be privileged or the hypercall fails.
+ */
+#define XENMEM_claim_pages                  24
+
+/*
+ * XENMEM_claim_pages flags - the are no flags at this time.
+ * The zero value is appropiate.
+ */
+
 #endif /* defined(__XEN__) || defined(__XEN_TOOLS__) */
+
+/* Next available subop number is 26 */
 
 #endif /* __XEN_PUBLIC_MEMORY_H__ */
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

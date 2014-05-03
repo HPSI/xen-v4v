@@ -57,10 +57,7 @@
 #define X86_FEATURE_3DNOWEXT	(1*32+30) /* AMD 3DNow! extensions */
 #define X86_FEATURE_3DNOW	(1*32+31) /* 3DNow! */
 
-/* Transmeta-defined CPU features, CPUID level 0x80860001, word 2 */
-#define X86_FEATURE_RECOVERY	(2*32+ 0) /* CPU in recovery mode */
-#define X86_FEATURE_LONGRUN	(2*32+ 1) /* Longrun power control */
-#define X86_FEATURE_LRTI	(2*32+ 3) /* LongRun table interface */
+/* *** Available for re-use ***, word 2 */
 
 /* Other features, Linux-defined mapping, word 3 */
 /* This range is used for feature bits which conflict or are synthesized */
@@ -71,6 +68,7 @@
 #define X86_FEATURE_TSC_RELIABLE (3*32+12) /* TSC is known to be reliable */
 #define X86_FEATURE_XTOPOLOGY    (3*32+13) /* cpu topology enum extensions */
 #define X86_FEATURE_CPUID_FAULTING (3*32+14) /* cpuid faulting */
+#define X86_FEATURE_CLFLUSH_MONITOR (3*32+15) /* clflush reqd with monitor */
 
 /* Intel-defined CPU features, CPUID level 0x00000001 (ecx), word 4 */
 #define X86_FEATURE_XMM3	(4*32+ 0) /* Streaming SIMD Extensions-3 */
@@ -136,6 +134,7 @@
 #define X86_FEATURE_NODEID_MSR  (6*32+19) /* NodeId MSR */
 #define X86_FEATURE_TBM         (6*32+21) /* trailing bit manipulations */
 #define X86_FEATURE_TOPOEXT     (6*32+22) /* topology extensions CPUID leafs */
+#define X86_FEATURE_DBEXT       (6*32+26) /* data breakpoint extension */
 
 /* Intel-defined CPU features, CPUID level 0x00000007:0 (ebx), word 7 */
 #define X86_FEATURE_FSGSBASE	(7*32+ 0) /* {RD,WR}{FS,GS}BASE instructions */
@@ -147,6 +146,11 @@
 #define X86_FEATURE_ERMS	(7*32+ 9) /* Enhanced REP MOVSB/STOSB */
 #define X86_FEATURE_INVPCID	(7*32+10) /* Invalidate Process Context ID */
 #define X86_FEATURE_RTM 	(7*32+11) /* Restricted Transactional Memory */
+#define X86_FEATURE_NO_FPU_SEL 	(7*32+13) /* FPU CS/DS stored as zero */
+#define X86_FEATURE_MPX		(7*32+14) /* Memory Protection Extensions */
+#define X86_FEATURE_RDSEED	(7*32+18) /* RDSEED instruction */
+#define X86_FEATURE_ADX		(7*32+19) /* ADCX, ADOX instructions */
+#define X86_FEATURE_SMAP	(7*32+20) /* Supervisor Mode Access Prevention */
 
 #define cpu_has(c, bit)		test_bit(bit, (c)->x86_capability)
 #define boot_cpu_has(bit)	test_bit(bit, boot_cpu_data.x86_capability)
@@ -183,6 +187,7 @@
 #define cpu_has_fsgsbase	boot_cpu_has(X86_FEATURE_FSGSBASE)
 
 #define cpu_has_smep            boot_cpu_has(X86_FEATURE_SMEP)
+#define cpu_has_fpu_sel         (!boot_cpu_has(X86_FEATURE_NO_FPU_SEL))
 
 #define cpu_has_ffxsr           ((boot_cpu_data.x86_vendor == X86_VENDOR_AMD) \
                                  && boot_cpu_has(X86_FEATURE_FFXSR))
@@ -194,6 +199,7 @@
 #define cpu_has_xsave           boot_cpu_has(X86_FEATURE_XSAVE)
 #define cpu_has_avx             boot_cpu_has(X86_FEATURE_AVX)
 #define cpu_has_lwp             boot_cpu_has(X86_FEATURE_LWP)
+#define cpu_has_mpx             boot_cpu_has(X86_FEATURE_MPX)
 
 #define cpu_has_arch_perfmon    boot_cpu_has(X86_FEATURE_ARCH_PERFMON)
 

@@ -27,7 +27,7 @@ void *xc_map_foreign_pages(xc_interface *xch, uint32_t dom, int prot,
     int i, *err;
 
     if (num < 0) {
-        errno = -EINVAL;
+        errno = EINVAL;
         return NULL;
     }
 
@@ -124,7 +124,7 @@ void *xc_map_foreign_bulk_compat(xc_interface *xch, xc_osdep_handle h,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

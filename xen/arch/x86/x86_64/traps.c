@@ -13,6 +13,7 @@
 #include <xen/shutdown.h>
 #include <xen/nmi.h>
 #include <xen/guest_access.h>
+#include <xen/watchdog.h>
 #include <asm/current.h>
 #include <asm/flushtlb.h>
 #include <asm/traps.h>
@@ -28,15 +29,10 @@
 static void print_xen_info(void)
 {
     char taint_str[TAINT_STRING_MAX_LEN];
-    char debug = 'n';
-
-#ifndef NDEBUG
-    debug = 'y';
-#endif
 
     printk("----[ Xen-%d.%d%s  x86_64  debug=%c  %s ]----\n",
            xen_major_version(), xen_minor_version(), xen_extra_version(),
-           debug, print_tainted(taint_str));
+           debug_build() ? 'y' : 'n', print_tainted(taint_str));
 }
 
 enum context { CTXT_hypervisor, CTXT_pv_guest, CTXT_hvm_guest };
@@ -45,7 +41,7 @@ static void _show_registers(
     const struct cpu_user_regs *regs, unsigned long crs[8],
     enum context context, const struct vcpu *v)
 {
-    const static char *context_names[] = {
+    static const char *const context_names[] = {
         [CTXT_hypervisor] = "hypervisor",
         [CTXT_pv_guest]   = "pv guest",
         [CTXT_hvm_guest]  = "hvm guest"
@@ -53,7 +49,7 @@ static void _show_registers(
 
     printk("RIP:    %04x:[<%016lx>]", regs->cs, regs->rip);
     if ( context == CTXT_hypervisor )
-        print_symbol(" %s", regs->rip);
+        printk(" %pS", _p(regs->rip));
     printk("\nRFLAGS: %016lx   ", regs->rflags);
     if ( (context == CTXT_pv_guest) && v && v->vcpu_info )
         printk("EM: %d   ", !!vcpu_info(v, evtchn_upcall_mask));
@@ -67,10 +63,15 @@ static void _show_registers(
            regs->rbp, regs->rsp, regs->r8);
     printk("r9:  %016lx   r10: %016lx   r11: %016lx\n",
            regs->r9,  regs->r10, regs->r11);
-    printk("r12: %016lx   r13: %016lx   r14: %016lx\n",
-           regs->r12, regs->r13, regs->r14);
-    printk("r15: %016lx   cr0: %016lx   cr4: %016lx\n",
-           regs->r15, crs[0], crs[4]);
+    if ( !(regs->entry_vector & TRAP_regs_partial) )
+    {
+        printk("r12: %016lx   r13: %016lx   r14: %016lx\n",
+               regs->r12, regs->r13, regs->r14);
+        printk("r15: %016lx   cr0: %016lx   cr4: %016lx\n",
+               regs->r15, crs[0], crs[4]);
+    }
+    else
+        printk("cr0: %016lx   cr4: %016lx\n", crs[0], crs[4]);
     printk("cr3: %016lx   cr2: %016lx\n", crs[3], crs[2]);
     printk("ds: %04x   es: %04x   fs: %04x   gs: %04x   "
            "ss: %04x   cs: %04x\n",
@@ -85,7 +86,7 @@ void show_registers(struct cpu_user_regs *regs)
     enum context context;
     struct vcpu *v = current;
 
-    if ( is_hvm_vcpu(v) && guest_mode(regs) )
+    if ( has_hvm_container_vcpu(v) && guest_mode(regs) )
     {
         struct segment_register sreg;
         context = CTXT_hvm_guest;
@@ -146,8 +147,8 @@ void vcpu_show_registers(const struct vcpu *v)
     const struct cpu_user_regs *regs = &v->arch.user_regs;
     unsigned long crs[8];
 
-    /* No need to handle HVM for now. */
-    if ( is_hvm_vcpu(v) )
+    /* Only handle PV guests for now */
+    if ( !is_pv_vcpu(v) )
         return;
 
     crs[0] = v->arch.pv_vcpu.ctrlreg[0];
@@ -169,9 +170,12 @@ void show_page_walk(unsigned long addr)
     l1_pgentry_t l1e, *l1t;
 
     printk("Pagetable walk from %016lx:\n", addr);
+    if ( !is_canonical_address(addr) )
+        return;
 
-    l4t = mfn_to_virt(mfn);
+    l4t = map_domain_page(mfn);
     l4e = l4t[l4_table_offset(addr)];
+    unmap_domain_page(l4t);
     mfn = l4e_get_pfn(l4e);
     pfn = mfn_valid(mfn) && machine_to_phys_mapping_valid ?
           get_gpfn_from_mfn(mfn) : INVALID_M2P_ENTRY;
@@ -181,8 +185,9 @@ void show_page_walk(unsigned long addr)
          !mfn_valid(mfn) )
         return;
 
-    l3t = mfn_to_virt(mfn);
+    l3t = map_domain_page(mfn);
     l3e = l3t[l3_table_offset(addr)];
+    unmap_domain_page(l3t);
     mfn = l3e_get_pfn(l3e);
     pfn = mfn_valid(mfn) && machine_to_phys_mapping_valid ?
           get_gpfn_from_mfn(mfn) : INVALID_M2P_ENTRY;
@@ -194,8 +199,9 @@ void show_page_walk(unsigned long addr)
          !mfn_valid(mfn) )
         return;
 
-    l2t = mfn_to_virt(mfn);
+    l2t = map_domain_page(mfn);
     l2e = l2t[l2_table_offset(addr)];
+    unmap_domain_page(l2t);
     mfn = l2e_get_pfn(l2e);
     pfn = mfn_valid(mfn) && machine_to_phys_mapping_valid ?
           get_gpfn_from_mfn(mfn) : INVALID_M2P_ENTRY;
@@ -207,8 +213,9 @@ void show_page_walk(unsigned long addr)
          !mfn_valid(mfn) )
         return;
 
-    l1t = mfn_to_virt(mfn);
+    l1t = map_domain_page(mfn);
     l1e = l1t[l1_table_offset(addr)];
+    unmap_domain_page(l1t);
     mfn = l1e_get_pfn(l1e);
     pfn = mfn_valid(mfn) && machine_to_phys_mapping_valid ?
           get_gpfn_from_mfn(mfn) : INVALID_M2P_ENTRY;
@@ -220,8 +227,7 @@ void double_fault(void);
 void do_double_fault(struct cpu_user_regs *regs)
 {
     unsigned int cpu;
-
-    watchdog_disable();
+    unsigned long crs[8];
 
     console_force_unlock();
 
@@ -230,31 +236,34 @@ void do_double_fault(struct cpu_user_regs *regs)
     /* Find information saved during fault and dump it to the console. */
     printk("*** DOUBLE FAULT ***\n");
     print_xen_info();
-    printk("CPU:    %d\nRIP:    %04x:[<%016lx>]",
-           cpu, regs->cs, regs->rip);
-    print_symbol(" %s", regs->rip);
-    printk("\nRFLAGS: %016lx\n", regs->rflags);
-    printk("rax: %016lx   rbx: %016lx   rcx: %016lx\n",
-           regs->rax, regs->rbx, regs->rcx);
-    printk("rdx: %016lx   rsi: %016lx   rdi: %016lx\n",
-           regs->rdx, regs->rsi, regs->rdi);
-    printk("rbp: %016lx   rsp: %016lx   r8:  %016lx\n",
-           regs->rbp, regs->rsp, regs->r8);
-    printk("r9:  %016lx   r10: %016lx   r11: %016lx\n",
-           regs->r9,  regs->r10, regs->r11);
-    printk("r12: %016lx   r13: %016lx   r14: %016lx\n",
-           regs->r12, regs->r13, regs->r14);
-    printk("r15: %016lx    cs: %016lx    ss: %016lx\n",
-           regs->r15, (long)regs->cs, (long)regs->ss);
-    show_stack_overflow(cpu, regs->rsp);
 
-    panic("DOUBLE FAULT -- system shutdown\n");
+    crs[0] = read_cr0();
+    crs[2] = read_cr2();
+    crs[3] = read_cr3();
+    crs[4] = read_cr4();
+    regs->ds = read_segment_register(ds);
+    regs->es = read_segment_register(es);
+    regs->fs = read_segment_register(fs);
+    regs->gs = read_segment_register(gs);
+
+    printk("CPU:    %d\n", cpu);
+    _show_registers(regs, crs, CTXT_hypervisor, NULL);
+    show_stack_overflow(cpu, regs);
+
+    panic("DOUBLE FAULT -- system shutdown");
 }
 
 void toggle_guest_mode(struct vcpu *v)
 {
     if ( is_pv_32bit_vcpu(v) )
         return;
+    if ( cpu_has_fsgsbase )
+    {
+        if ( v->arch.flags & TF_kernel_mode )
+            v->arch.pv_vcpu.gs_base_kernel = __rdgsbase();
+        else
+            v->arch.pv_vcpu.gs_base_user = __rdgsbase();
+    }
     v->arch.flags ^= TF_kernel_mode;
     asm volatile ( "swapgs" );
     update_cr3(v);
@@ -264,6 +273,18 @@ void toggle_guest_mode(struct vcpu *v)
 #else
     write_ptbase(v);
 #endif
+
+    if ( !(v->arch.flags & TF_kernel_mode) )
+        return;
+
+    if ( v->arch.pv_vcpu.need_update_runstate_area &&
+         update_runstate_area(v) )
+        v->arch.pv_vcpu.need_update_runstate_area = 0;
+
+    if ( v->arch.pv_vcpu.pending_system_time.version &&
+         update_secondary_system_time(v,
+                                      &v->arch.pv_vcpu.pending_system_time) )
+        v->arch.pv_vcpu.pending_system_time.version = 0;
 }
 
 unsigned long do_iret(void)
@@ -301,7 +322,7 @@ unsigned long do_iret(void)
 
     if ( !(iret_saved.flags & VGCF_in_syscall) )
     {
-        regs->entry_vector = 0;
+        regs->entry_vector &= ~TRAP_syscall;
         regs->r11 = iret_saved.r11;
         regs->rcx = iret_saved.rcx;
     }
@@ -365,9 +386,9 @@ void __devinit subarch_percpu_traps_init(void)
     {
         /* Specify dedicated interrupt stacks for NMI, #DF, and #MC. */
         set_intr_gate(TRAP_double_fault, &double_fault);
-        idt_table[TRAP_double_fault].a  |= IST_DF << 32;
-        idt_table[TRAP_nmi].a           |= IST_NMI << 32;
-        idt_table[TRAP_machine_check].a |= IST_MCE << 32;
+        set_ist(&idt_table[TRAP_double_fault],  IST_DF);
+        set_ist(&idt_table[TRAP_nmi],           IST_NMI);
+        set_ist(&idt_table[TRAP_machine_check], IST_MCE);
 
         /*
          * The 32-on-64 hypercall entry vector is only accessible from ring 1.
@@ -589,6 +610,9 @@ static void hypercall_page_initialise_ring3_kernel(void *hypercall_page)
     /* Fill in all the transfer points with template machine code. */
     for ( i = 0; i < (PAGE_SIZE / 32); i++ )
     {
+        if ( i == __HYPERVISOR_iret )
+            continue;
+
         p = (char *)(hypercall_page + (i * 32));
         *(u8  *)(p+ 0) = 0x51;    /* push %rcx */
         *(u16 *)(p+ 1) = 0x5341;  /* push %r11 */
@@ -601,8 +625,8 @@ static void hypercall_page_initialise_ring3_kernel(void *hypercall_page)
     }
 
     /*
-     * HYPERVISOR_iret is special because it doesn't return and expects a 
-     * special stack frame. Guests jump at this transfer point instead of 
+     * HYPERVISOR_iret is special because it doesn't return and expects a
+     * special stack frame. Guests jump at this transfer point instead of
      * calling it.
      */
     p = (char *)(hypercall_page + (__HYPERVISOR_iret * 32));
@@ -619,7 +643,7 @@ static void hypercall_page_initialise_ring3_kernel(void *hypercall_page)
 void hypercall_page_initialise(struct domain *d, void *hypercall_page)
 {
     memset(hypercall_page, 0xCC, PAGE_SIZE);
-    if ( is_hvm_domain(d) )
+    if ( has_hvm_container_domain(d) )
         hvm_hypercall_page_initialise(d, hypercall_page);
     else if ( !is_pv_32bit_domain(d) )
         hypercall_page_initialise_ring3_kernel(hypercall_page);
@@ -630,7 +654,7 @@ void hypercall_page_initialise(struct domain *d, void *hypercall_page)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

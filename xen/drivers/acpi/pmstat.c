@@ -264,13 +264,13 @@ static int get_cpufreq_para(struct xen_sysctl_pm_op *op)
     op->u.get_para.scaling_max_freq = policy->max;
     op->u.get_para.scaling_min_freq = policy->min;
 
-    if ( cpufreq_driver->name )
+    if ( cpufreq_driver->name[0] )
         strlcpy(op->u.get_para.scaling_driver, 
             cpufreq_driver->name, CPUFREQ_NAME_LEN);
     else
         strlcpy(op->u.get_para.scaling_driver, "Unknown", CPUFREQ_NAME_LEN);
 
-    if ( policy->governor->name )
+    if ( policy->governor->name[0] )
         strlcpy(op->u.get_para.scaling_governor, 
             policy->governor->name, CPUFREQ_NAME_LEN);
     else
@@ -521,8 +521,8 @@ int acpi_set_pdc_bits(u32 acpi_id, XEN_GUEST_HANDLE_PARAM(uint32) pdc)
                     ACPI_PDC_SMP_C1PT) & ~mask;
         ret = arch_acpi_set_pdc_bits(acpi_id, bits, mask);
     }
-    if ( !ret )
-        ret = copy_to_guest_offset(pdc, 2, bits + 2, 1);
+    if ( !ret && __copy_to_guest_offset(pdc, 2, bits + 2, 1) )
+        ret = -EFAULT;
 
     return ret;
 }

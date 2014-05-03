@@ -28,114 +28,66 @@
 
 #define VMRESUME     .byte 0x0f,0x01,0xc3
 #define VMLAUNCH     .byte 0x0f,0x01,0xc2
-#define VMREAD(off)  .byte 0x0f,0x78,0x47,((off)-UREGS_rip)
-#define VMWRITE(off) .byte 0x0f,0x79,0x47,((off)-UREGS_rip)
 
-/* VMCS field encodings */
-#define GUEST_RSP    0x681c
-#define GUEST_RIP    0x681e
-#define GUEST_RFLAGS 0x6820
-
-#define get_current(reg) GET_CURRENT(r(reg))
-
-#define r(reg) %r##reg
-#define addr_of(lbl) lbl(%rip)
-#define call_with_regs(fn)                      \
-        mov  %rsp,%rdi;                         \
-        call fn;
-
-        ALIGN
-.globl vmx_asm_vmexit_handler
-vmx_asm_vmexit_handler:
+ENTRY(vmx_asm_vmexit_handler)
         push %rdi
         push %rsi
         push %rdx
         push %rcx
         push %rax
+        mov  %cr2,%rax
         push %r8
         push %r9
         push %r10
         push %r11
         push %rbx
+        GET_CURRENT(%rbx)
         push %rbp
         push %r12
         push %r13
         push %r14
         push %r15
 
-        get_current(bx)
+        movb $1,VCPU_vmx_launched(%rbx)
+        mov  %rax,VCPU_hvm_guest_cr2(%rbx)
 
-        movb $1,VCPU_vmx_launched(r(bx))
+        mov  %rsp,%rdi
+        call vmx_vmexit_handler
 
-        lea  UREGS_rip(r(sp)),r(di)
-        mov  $GUEST_RIP,%eax
-        /*VMREAD(UREGS_rip)*/
-        .byte 0x0f,0x78,0x07  /* vmread r(ax),(r(di)) */
-        mov  $GUEST_RSP,%eax
-        VMREAD(UREGS_rsp)
-        mov  $GUEST_RFLAGS,%eax
-        VMREAD(UREGS_eflags)
-
-        mov  %cr2,r(ax)
-        mov  r(ax),VCPU_hvm_guest_cr2(r(bx))
-
-#ifndef NDEBUG
-        mov  $0xbeef,%ax
-        mov  %ax,UREGS_error_code(r(sp))
-        mov  %ax,UREGS_entry_vector(r(sp))
-        mov  %ax,UREGS_saved_upcall_mask(r(sp))
-        mov  %ax,UREGS_cs(r(sp))
-        mov  %ax,UREGS_ds(r(sp))
-        mov  %ax,UREGS_es(r(sp))
-        mov  %ax,UREGS_fs(r(sp))
-        mov  %ax,UREGS_gs(r(sp))
-        mov  %ax,UREGS_ss(r(sp))
-#endif
-
-        call_with_regs(vmx_vmexit_handler)
-
-.globl vmx_asm_do_vmentry
-vmx_asm_do_vmentry:
+.Lvmx_do_vmentry:
         call vmx_intr_assist
         call nvmx_switch_guest
+        ASSERT_NOT_IN_ATOMIC
 
-        get_current(bx)
+        mov  VCPU_processor(%rbx),%eax
+        lea  irq_stat+IRQSTAT_softirq_pending(%rip),%rdx
+        xor  %ecx,%ecx
+        shl  $IRQSTAT_shift,%eax
         cli
-
-        mov  VCPU_processor(r(bx)),%eax
-        shl  $IRQSTAT_shift,r(ax)
-        lea  addr_of(irq_stat),r(dx)
-        cmpl $0,(r(dx),r(ax),1)
+        cmp  %ecx,(%rdx,%rax,1)
         jnz  .Lvmx_process_softirqs
 
-        testb $0xff,VCPU_vmx_emulate(r(bx))
+        cmp  %cl,VCPU_vmx_emulate(%rbx)
+        jne .Lvmx_goto_emulator
+        cmp  %cl,VCPU_vmx_realmode(%rbx)
+UNLIKELY_START(ne, realmode)
+        cmp  %cx,VCPU_vm86_seg_mask(%rbx)
         jnz .Lvmx_goto_emulator
-        testb $0xff,VCPU_vmx_realmode(r(bx))
-UNLIKELY_START(nz, realmode)
-        cmpw $0,VCPU_vm86_seg_mask(r(bx))
-        jnz .Lvmx_goto_emulator
-        call_with_regs(vmx_enter_realmode) 
+        mov  %rsp,%rdi
+        call vmx_enter_realmode
 UNLIKELY_END(realmode)
 
+        mov  %rsp,%rdi
         call vmx_vmenter_helper
-        mov  VCPU_hvm_guest_cr2(r(bx)),r(ax)
-        mov  r(ax),%cr2
+        mov  VCPU_hvm_guest_cr2(%rbx),%rax
 
-        lea  UREGS_rip(r(sp)),r(di)
-        mov  $GUEST_RIP,%eax
-        /*VMWRITE(UREGS_rip)*/
-        .byte 0x0f,0x79,0x07  /* vmwrite (r(di)),r(ax) */
-        mov  $GUEST_RSP,%eax
-        VMWRITE(UREGS_rsp)
-        mov  $GUEST_RFLAGS,%eax
-        VMWRITE(UREGS_eflags)
-
-        cmpb $0,VCPU_vmx_launched(r(bx))
         pop  %r15
         pop  %r14
         pop  %r13
         pop  %r12
         pop  %rbp
+        mov  %rax,%cr2
+        cmpb $0,VCPU_vmx_launched(%rbx)
         pop  %rbx
         pop  %r11
         pop  %r10
@@ -160,12 +112,17 @@ UNLIKELY_END(realmode)
         call vm_launch_fail
         ud2
 
+ENTRY(vmx_asm_do_vmentry)
+        GET_CURRENT(%rbx)
+        jmp  .Lvmx_do_vmentry
+
 .Lvmx_goto_emulator:
         sti
-        call_with_regs(vmx_realmode)
-        jmp  vmx_asm_do_vmentry
+        mov  %rsp,%rdi
+        call vmx_realmode
+        jmp  .Lvmx_do_vmentry
 
 .Lvmx_process_softirqs:
         sti
         call do_softirq
-        jmp  vmx_asm_do_vmentry
+        jmp  .Lvmx_do_vmentry

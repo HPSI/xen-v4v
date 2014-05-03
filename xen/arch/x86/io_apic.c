@@ -133,6 +133,37 @@ static void add_pin_to_irq(unsigned int irq, int apic, int pin)
     share_vector_maps(irq_2_pin[irq].apic, apic);
 }
 
+static void remove_pin_from_irq(unsigned int irq, int apic, int pin)
+{
+    struct irq_pin_list *entry, *prev;
+
+    for (entry = &irq_2_pin[irq]; ; entry = &irq_2_pin[entry->next]) {
+        if ((entry->apic == apic) && (entry->pin == pin))
+            break;
+        BUG_ON(!entry->next);
+    }
+
+    entry->pin = entry->apic = -1;
+
+    if (entry != &irq_2_pin[irq]) {
+        /* Removed entry is not at head of list. */
+        prev = &irq_2_pin[irq];
+        while (&irq_2_pin[prev->next] != entry)
+            prev = &irq_2_pin[prev->next];
+        prev->next = entry->next;
+    } else if (entry->next) {
+        /* Removed entry is at head of multi-item list. */
+        prev  = entry;
+        entry = &irq_2_pin[entry->next];
+        *prev = *entry;
+        entry->pin = entry->apic = -1;
+    } else
+        return;
+
+    entry->next = irq_2_pin_free_entry;
+    irq_2_pin_free_entry = entry - irq_2_pin;
+}
+
 /*
  * Reroute an IRQ to a different pin.
  */
@@ -1390,7 +1421,7 @@ static void __init setup_ioapic_ids_from_mpc(void)
                 if (!physid_isset(i, phys_id_present_map))
                     break;
             if (i >= get_physical_broadcast())
-                panic("Max APIC ID exceeded!\n");
+                panic("Max APIC ID exceeded");
             printk(KERN_ERR "... fixing up to %d. (tell your hw vendor)\n",
                    i);
             mp_ioapics[apic].mpc_apicid = i;
@@ -1797,7 +1828,7 @@ static void __init unlock_ExtINT_logic(void)
 
     pin = find_isa_irq_pin(8, mp_INT);
     apic = find_isa_irq_apic(8, mp_INT);
-    if (pin == -1)
+    if ( pin == -1 || apic == -1 )
         return;
 
     entry0 = ioapic_read_entry(apic, pin, 0);
@@ -2104,7 +2135,7 @@ int __init io_apic_get_unique_id (int ioapic, int apic_id)
         }
 
         if (i == get_physical_broadcast())
-            panic("Max apic_id exceeded!\n");
+            panic("Max apic_id exceeded");
 
         printk(KERN_WARNING "IOAPIC[%d]: apic_id %d already used, "
                "trying %d\n", ioapic, apic_id, i);
@@ -2280,7 +2311,7 @@ int ioapic_guest_read(unsigned long physbase, unsigned int reg, u32 *pval)
 
 int ioapic_guest_write(unsigned long physbase, unsigned int reg, u32 val)
 {
-    int apic, pin, irq, ret, vector, pirq;
+    int apic, pin, irq, ret, pirq;
     struct IO_APIC_route_entry rte = { 0 };
     unsigned long flags;
     struct irq_desc *desc;
@@ -2332,7 +2363,7 @@ int ioapic_guest_write(unsigned long physbase, unsigned int reg, u32 val)
      * that dom0 pirq == irq.
      */
     pirq = (irq >= 256) ? irq : rte.vector;
-    if ( (pirq < 0) || (pirq >= dom0->nr_pirqs) )
+    if ( (pirq < 0) || (pirq >= hardware_domain->nr_pirqs) )
         return -EINVAL;
     
     if ( desc->action )
@@ -2348,18 +2379,30 @@ int ioapic_guest_write(unsigned long physbase, unsigned int reg, u32 val)
         return 0;
     }
 
-    if ( desc->arch.vector <= 0 || desc->arch.vector > LAST_DYNAMIC_VECTOR ) {
-        add_pin_to_irq(irq, apic, pin);
-        vector = assign_irq_vector(irq, NULL);
-        if ( vector < 0 )
-            return vector;
+    if ( desc->arch.vector <= 0 || desc->arch.vector > LAST_DYNAMIC_VECTOR )
+    {
+        int vector = desc->arch.vector;
 
-        printk(XENLOG_INFO "allocated vector %02x for irq %d\n", vector, irq);
+        if ( vector < FIRST_HIPRIORITY_VECTOR )
+            add_pin_to_irq(irq, apic, pin);
+        else
+            desc->arch.vector = IRQ_VECTOR_UNASSIGNED;
+        ret = assign_irq_vector(irq, NULL);
+        if ( ret < 0 )
+        {
+            if ( vector < FIRST_HIPRIORITY_VECTOR )
+                remove_pin_from_irq(irq, apic, pin);
+            else
+                desc->arch.vector = vector;
+            return ret;
+        }
+
+        printk(XENLOG_INFO "allocated vector %02x for irq %d\n", ret, irq);
     }
-    spin_lock(&dom0->event_lock);
-    ret = map_domain_pirq(dom0, pirq, irq,
+    spin_lock(&hardware_domain->event_lock);
+    ret = map_domain_pirq(hardware_domain, pirq, irq,
             MAP_PIRQ_TYPE_GSI, NULL);
-    spin_unlock(&dom0->event_lock);
+    spin_unlock(&hardware_domain->event_lock);
     if ( ret < 0 )
         return ret;
 
@@ -2507,6 +2550,11 @@ void __init init_ioapic_mappings(void)
             reg_01.raw = io_apic_read(i, 1);
             nr_ioapic_entries[i] = reg_01.bits.entries + 1;
             nr_irqs_gsi += nr_ioapic_entries[i];
+
+            if ( rangeset_add_singleton(mmio_ro_ranges,
+                                        ioapic_phys >> PAGE_SHIFT) )
+                printk(KERN_ERR "Failed to mark IO-APIC page %lx read-only\n",
+                       ioapic_phys);
         }
     }
 

@@ -946,7 +946,7 @@ void __init x2apic_bsp_setup(void)
             return;
         }
         panic("x2APIC: already enabled by BIOS, but "
-              "iommu_supports_eim failed!\n");
+              "iommu_supports_eim failed");
     }
 
     if ( (ioapic_entries = alloc_ioapic_entries()) == NULL )
@@ -968,12 +968,14 @@ void __init x2apic_bsp_setup(void)
     {
         if ( x2apic_enabled )
             panic("Interrupt remapping could not be enabled while "
-                  "x2APIC is already enabled by BIOS!\n");
+                  "x2APIC is already enabled by BIOS");
 
-        printk("Would not enable x2APIC due to interrupt remapping "
-               "cannot be enabled.\n");
+        printk(XENLOG_ERR
+               "Failed to enable Interrupt Remapping: Will not enable x2APIC.\n");
         goto restore_out;
     }
+
+    force_iommu = 1;
 
     genapic = apic_x2apic_probe();
     printk("Switched to APIC driver %s.\n", genapic->name);
@@ -1022,7 +1024,6 @@ __next:
     if (boot_cpu_physical_apicid == -1U)
         boot_cpu_physical_apicid = get_apic_id();
     x86_cpu_to_apicid[0] = get_apic_id();
-    cpu_2_logical_apicid[0] = get_logical_apic_id();
 
     init_ioapic_mappings();
 }
@@ -1041,7 +1042,7 @@ __next:
  *****************************************************************************/
 
 /* used for system time scaling */
-static u32 __read_mostly bus_scale; /* scaling factor convert ns to bus cycles */
+static u32 __read_mostly bus_scale; /* scaling factor: ns -> bus cycles */
 
 /*
  * The timer chip is already set up at HZ interrupts per second here,
@@ -1473,7 +1474,7 @@ enum apic_mode current_local_apic_mode(void)
 
     /* Reading EXTD bit from the MSR is only valid if CPUID
      * says so, else reserved */
-    if ( cpu_has(&current_cpu_data, X86_FEATURE_X2APIC)
+    if ( boot_cpu_has(X86_FEATURE_X2APIC)
          && (msr_contents & MSR_IA32_APICBASE_EXTD) )
         return APIC_MODE_X2APIC;
 

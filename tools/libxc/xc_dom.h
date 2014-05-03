@@ -18,9 +18,6 @@
 
 #define INVALID_P2M_ENTRY   ((xen_pfn_t)-1)
 
-/* Scrach PFN for temporary mappings in HVM */
-#define SCRATCH_PFN_GNTTAB 0xFFFFE
-
 /* --- typedefs and structs ---------------------------------------- */
 
 typedef uint64_t xen_vaddr_t;
@@ -54,6 +51,12 @@ struct xc_dom_image {
     size_t kernel_size;
     void *ramdisk_blob;
     size_t ramdisk_size;
+    void *devicetree_blob;
+    size_t devicetree_size;
+
+    size_t max_kernel_size;
+    size_t max_ramdisk_size;
+    size_t max_devicetree_size;
 
     /* arguments and parameters */
     char *cmdline;
@@ -65,6 +68,14 @@ struct xc_dom_image {
 
     /* memory layout */
     struct xc_dom_seg kernel_seg;
+    /* If ramdisk_seg.vstart is non zero then the ramdisk will be
+     * loaded at that address, otherwise it will automatically placed.
+     *
+     * If automatic placement is used and the ramdisk is gzip
+     * compressed then it will be decompressed as it is loaded. If the
+     * ramdisk has been explicitly placed then it is loaded as is
+     * otherwise decompressing risks undoing the manual placement.
+     */
     struct xc_dom_seg ramdisk_seg;
     struct xc_dom_seg p2m_seg;
     struct xc_dom_seg pgtables_seg;
@@ -127,11 +138,13 @@ struct xc_dom_image {
     domid_t console_domid;
     domid_t xenstore_domid;
     xen_pfn_t shared_info_mfn;
+    int pvh_enabled;
 
     xc_interface *xch;
     domid_t guest_domid;
     int8_t vhpt_size_log2; /* for IA64 */
     int8_t superpages;
+    int claim_enabled; /* 0 by default, 1 enables it */
     int shadow_enabled;
 
     int xen_version;
@@ -151,9 +164,10 @@ struct xc_dom_image {
 
 struct xc_dom_loader {
     char *name;
-    int (*probe) (struct xc_dom_image * dom);
-    int (*parser) (struct xc_dom_image * dom);
-    int (*loader) (struct xc_dom_image * dom);
+    /* Sadly the error returns from these functions are not consistent: */
+    elf_negerrnoval (*probe) (struct xc_dom_image * dom);
+    elf_negerrnoval (*parser) (struct xc_dom_image * dom);
+    elf_errorstatus (*loader) (struct xc_dom_image * dom);
 
     struct xc_dom_loader *next;
 };
@@ -192,7 +206,27 @@ struct xc_dom_image *xc_dom_allocate(xc_interface *xch,
                                      const char *cmdline, const char *features);
 void xc_dom_release_phys(struct xc_dom_image *dom);
 void xc_dom_release(struct xc_dom_image *dom);
+int xc_dom_rambase_init(struct xc_dom_image *dom, uint64_t rambase);
 int xc_dom_mem_init(struct xc_dom_image *dom, unsigned int mem_mb);
+
+/* Set this larger if you have enormous ramdisks/kernels. Note that
+ * you should trust all kernels not to be maliciously large (e.g. to
+ * exhaust all dom0 memory) if you do this (see CVE-2012-4544 /
+ * XSA-25). You can also set the default independently for
+ * ramdisks/kernels in xc_dom_allocate() or call
+ * xc_dom_{kernel,ramdisk}_max_size.
+ */
+#ifndef XC_DOM_DECOMPRESS_MAX
+#define XC_DOM_DECOMPRESS_MAX (1024*1024*1024) /* 1GB */
+#endif
+
+int xc_dom_kernel_check_size(struct xc_dom_image *dom, size_t sz);
+int xc_dom_kernel_max_size(struct xc_dom_image *dom, size_t sz);
+
+int xc_dom_ramdisk_check_size(struct xc_dom_image *dom, size_t sz);
+int xc_dom_ramdisk_max_size(struct xc_dom_image *dom, size_t sz);
+
+int xc_dom_devicetree_max_size(struct xc_dom_image *dom, size_t sz);
 
 size_t xc_dom_check_gzip(xc_interface *xch,
                      void *blob, size_t ziplen);
@@ -206,6 +240,9 @@ int xc_dom_kernel_mem(struct xc_dom_image *dom, const void *mem,
                       size_t memsize);
 int xc_dom_ramdisk_mem(struct xc_dom_image *dom, const void *mem,
                        size_t memsize);
+int xc_dom_devicetree_file(struct xc_dom_image *dom, const char *filename);
+int xc_dom_devicetree_mem(struct xc_dom_image *dom, const void *mem,
+                          size_t memsize);
 
 int xc_dom_parse_image(struct xc_dom_image *dom);
 struct xc_dom_arch *xc_dom_find_arch_hooks(xc_interface *xch, char *guest_type);
@@ -230,6 +267,7 @@ int xc_dom_gnttab_seed(xc_interface *xch, domid_t domid,
                        xen_pfn_t xenstore_gmfn,
                        domid_t console_domid,
                        domid_t xenstore_domid);
+int xc_dom_feature_translated(struct xc_dom_image *dom);
 
 /* --- debugging bits ---------------------------------------------- */
 
@@ -254,7 +292,8 @@ void xc_dom_log_memory_footprint(struct xc_dom_image *dom);
 void *xc_dom_malloc(struct xc_dom_image *dom, size_t size);
 void *xc_dom_malloc_page_aligned(struct xc_dom_image *dom, size_t size);
 void *xc_dom_malloc_filemap(struct xc_dom_image *dom,
-                            const char *filename, size_t * size);
+                            const char *filename, size_t * size,
+                            const size_t max_size);
 char *xc_dom_strdup(struct xc_dom_image *dom, const char *str);
 
 /* --- alloc memory pool ------------------------------------------- */
@@ -268,38 +307,58 @@ int xc_dom_alloc_segment(struct xc_dom_image *dom,
 
 void *xc_dom_pfn_to_ptr(struct xc_dom_image *dom, xen_pfn_t first,
                         xen_pfn_t count);
+void *xc_dom_pfn_to_ptr_retcount(struct xc_dom_image *dom, xen_pfn_t first,
+                                 xen_pfn_t count, xen_pfn_t *count_out);
 void xc_dom_unmap_one(struct xc_dom_image *dom, xen_pfn_t pfn);
 void xc_dom_unmap_all(struct xc_dom_image *dom);
 
-static inline void *xc_dom_seg_to_ptr(struct xc_dom_image *dom,
-                                      struct xc_dom_seg *seg)
+static inline void *xc_dom_seg_to_ptr_pages(struct xc_dom_image *dom,
+                                      struct xc_dom_seg *seg,
+                                      xen_pfn_t *pages_out)
 {
     xen_vaddr_t segsize = seg->vend - seg->vstart;
     unsigned int page_size = XC_DOM_PAGE_SIZE(dom);
     xen_pfn_t pages = (segsize + page_size - 1) / page_size;
+    void *retval;
 
-    return xc_dom_pfn_to_ptr(dom, seg->pfn, pages);
+    retval = xc_dom_pfn_to_ptr(dom, seg->pfn, pages);
+
+    *pages_out = retval ? pages : 0;
+    return retval;
+}
+
+static inline void *xc_dom_seg_to_ptr(struct xc_dom_image *dom,
+                                      struct xc_dom_seg *seg)
+{
+    xen_pfn_t dummy;
+
+    return xc_dom_seg_to_ptr_pages(dom, seg, &dummy);
 }
 
 static inline void *xc_dom_vaddr_to_ptr(struct xc_dom_image *dom,
-                                        xen_vaddr_t vaddr)
+                                        xen_vaddr_t vaddr,
+                                        size_t *safe_region_out)
 {
     unsigned int page_size = XC_DOM_PAGE_SIZE(dom);
     xen_pfn_t page = (vaddr - dom->parms.virt_base) / page_size;
     unsigned int offset = (vaddr - dom->parms.virt_base) % page_size;
-    void *ptr = xc_dom_pfn_to_ptr(dom, page, 0);
-    return (ptr ? (ptr + offset) : NULL);
-}
+    xen_pfn_t safe_region_count;
+    void *ptr;
 
-static inline int xc_dom_feature_translated(struct xc_dom_image *dom)
-{
-    return elf_xen_feature_get(XENFEAT_auto_translated_physmap, dom->f_active);
+    *safe_region_out = 0;
+    ptr = xc_dom_pfn_to_ptr_retcount(dom, page, 0, &safe_region_count);
+    if ( ptr == NULL )
+        return ptr;
+    *safe_region_out = (safe_region_count << XC_DOM_PAGE_SHIFT(dom)) - offset;
+    return ptr + offset;
 }
 
 static inline xen_pfn_t xc_dom_p2m_host(struct xc_dom_image *dom, xen_pfn_t pfn)
 {
     if (dom->shadow_enabled)
         return pfn;
+    if (pfn < dom->rambase_pfn || pfn >= dom->rambase_pfn + dom->total_pages)
+        return INVALID_MFN;
     return dom->p2m_host[pfn - dom->rambase_pfn];
 }
 
@@ -308,6 +367,8 @@ static inline xen_pfn_t xc_dom_p2m_guest(struct xc_dom_image *dom,
 {
     if (xc_dom_feature_translated(dom))
         return pfn;
+    if (pfn < dom->rambase_pfn || pfn >= dom->rambase_pfn + dom->total_pages)
+        return INVALID_MFN;
     return dom->p2m_host[pfn - dom->rambase_pfn];
 }
 
@@ -320,7 +381,7 @@ int arch_setup_bootlate(struct xc_dom_image *dom);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

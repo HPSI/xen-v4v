@@ -134,7 +134,7 @@ struct xenpf_efi_runtime_call {
      * where it holds the single returned value.
      */
     uint32_t misc;
-    unsigned long status;
+    xen_ulong_t status;
     union {
 #define XEN_EFI_GET_TIME_SET_CLEARS_NS 0x00000001
         struct {
@@ -168,7 +168,7 @@ struct xenpf_efi_runtime_call {
 #define XEN_EFI_VARIABLE_RUNTIME_ACCESS     0x00000004
         struct {
             XEN_GUEST_HANDLE(void) name;  /* UCS-2/UTF-16 string */
-            unsigned long size;
+            xen_ulong_t size;
             XEN_GUEST_HANDLE(void) data;
             struct xenpf_efi_guid {
                 uint32_t data1;
@@ -179,11 +179,12 @@ struct xenpf_efi_runtime_call {
         } get_variable, set_variable;
 
         struct {
-            unsigned long size;
+            xen_ulong_t size;
             XEN_GUEST_HANDLE(void) name;  /* UCS-2/UTF-16 string */
             struct xenpf_efi_guid vendor_guid;
         } get_next_variable_name;
 
+#define XEN_EFI_VARINFO_BOOT_SNAPSHOT       0x00000001
         struct {
             uint32_t attr;
             uint64_t max_store_size;
@@ -193,14 +194,14 @@ struct xenpf_efi_runtime_call {
 
         struct {
             XEN_GUEST_HANDLE(void) capsule_header_array;
-            unsigned long capsule_count;
+            xen_ulong_t capsule_count;
             uint64_t max_capsule_size;
-            unsigned int reset_type;
+            uint32_t reset_type;
         } query_capsule_capabilities;
 
         struct {
             XEN_GUEST_HANDLE(void) capsule_header_array;
-            unsigned long capsule_count;
+            xen_ulong_t capsule_count;
             uint64_t sg_list; /* machine address */
         } update_capsule;
     } u;
@@ -218,6 +219,7 @@ DEFINE_XEN_GUEST_HANDLE(xenpf_efi_runtime_call_t);
 #define  XEN_FW_EFI_VENDOR         2
 #define  XEN_FW_EFI_MEM_INFO       3
 #define  XEN_FW_EFI_RT_VERSION     4
+#define  XEN_FW_EFI_PCI_ROM        5
 #define XEN_FW_KBD_SHIFT_FLAGS    5
 struct xenpf_firmware_info {
     /* IN variables. */
@@ -266,6 +268,17 @@ struct xenpf_firmware_info {
                 uint64_t attr;
                 uint32_t type;
             } mem;
+            struct {
+                /* IN variables */
+                uint16_t segment;
+                uint8_t bus;
+                uint8_t devfn;
+                uint16_t vendor;
+                uint16_t devid;
+                /* OUT variables */
+                uint64_t address;
+                xen_ulong_t size;
+            } pci_rom;
         } efi_info; /* XEN_FW_EFI_INFO */
 
         /* Int16, Fn02: Get keyboard shift flags. */
@@ -278,10 +291,16 @@ DEFINE_XEN_GUEST_HANDLE(xenpf_firmware_info_t);
 #define XENPF_enter_acpi_sleep    51
 struct xenpf_enter_acpi_sleep {
     /* IN variables */
+#if __XEN_INTERFACE_VERSION__ < 0x00040300
     uint16_t pm1a_cnt_val;      /* PM1a control value. */
     uint16_t pm1b_cnt_val;      /* PM1b control value. */
+#else
+    uint16_t val_a;             /* PM1a control / sleep type A. */
+    uint16_t val_b;             /* PM1b control / sleep type B. */
+#endif
     uint32_t sleep_state;       /* Which state to enter (Sn). */
-    uint32_t flags;             /* Must be zero. */
+#define XENPF_ACPI_SLEEP_EXTENDED 0x00000001
+    uint32_t flags;             /* XENPF_ACPI_SLEEP_*. */
 };
 typedef struct xenpf_enter_acpi_sleep xenpf_enter_acpi_sleep_t;
 DEFINE_XEN_GUEST_HANDLE(xenpf_enter_acpi_sleep_t);
@@ -545,7 +564,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_platform_op_t);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

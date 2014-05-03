@@ -247,9 +247,6 @@ static int erst_exec_move_data(struct apei_exec_context *ctx,
 {
 	int rc;
 	u64 offset;
-#ifdef CONFIG_X86
-	enum fixed_addresses idx;
-#endif
 	void *src, *dst;
 
 	/* ioremap does not work in interrupt context */
@@ -263,39 +260,11 @@ static int erst_exec_move_data(struct apei_exec_context *ctx,
 	if (rc)
 		return rc;
 
-#ifdef CONFIG_X86
-	switch (ctx->var2) {
-	case 0:
-		return 0;
-	case 1 ... PAGE_SIZE:
-		break;
-	default:
-		printk(KERN_WARNING
-		       "MOVE_DATA cannot be used for %#"PRIx64" bytes of data\n",
-		       ctx->var2);
-		return -EOPNOTSUPP;
-	}
-
-	src = __acpi_map_table(ctx->src_base + offset, ctx->var2);
-#else
 	src = ioremap(ctx->src_base + offset, ctx->var2);
-#endif
 	if (!src)
 		return -ENOMEM;
 
-#ifdef CONFIG_X86
-	BUILD_BUG_ON(FIX_ACPI_PAGES < 4);
-	idx = virt_to_fix((unsigned long)src + 2 * PAGE_SIZE);
-	offset += ctx->dst_base;
-	dst = (void *)fix_to_virt(idx) + (offset & ~PAGE_MASK);
-	set_fixmap(idx, offset);
-	if (PFN_DOWN(offset) != PFN_DOWN(offset + ctx->var2 - 1)) {
-		idx = virt_to_fix((unsigned long)dst + PAGE_SIZE);
-		set_fixmap(idx, offset + PAGE_SIZE);
-	}
-#else
 	dst = ioremap(ctx->dst_base + offset, ctx->var2);
-#endif
 	if (dst) {
 		memmove(dst, src, ctx->var2);
 		iounmap(dst);
@@ -414,21 +383,24 @@ static int erst_get_erange(struct erst_erange *range)
 	return 0;
 }
 
-static size_t __erst_get_record_count(void)
+static ssize_t __erst_get_record_count(void)
 {
 	struct apei_exec_context ctx;
 	int rc;
+	u64 output;
+	ssize_t count;
 
 	erst_exec_ctx_init(&ctx);
 	rc = apei_exec_run(&ctx, ACPI_ERST_GET_RECORD_COUNT);
 	if (rc)
 		return rc;
-	return apei_exec_ctx_get_output(&ctx);
+	count = output = apei_exec_ctx_get_output(&ctx);
+	return count >= 0 && count == output ? count : -ERANGE;
 }
 
-size_t erst_get_record_count(void)
+ssize_t erst_get_record_count(void)
 {
-	size_t count;
+	ssize_t count;
 	unsigned long flags;
 
 	if (!erst_enabled)
@@ -514,6 +486,8 @@ static int __erst_write_to_storage(u64 offset)
 	return erst_errno(val);
 }
 
+#ifndef NDEBUG /* currently dead code */
+
 static int __erst_read_from_storage(u64 record_id, u64 offset)
 {
 	struct apei_exec_context ctx;
@@ -596,12 +570,16 @@ static int __erst_clear_from_storage(u64 record_id)
 	return erst_errno(val);
 }
 
+#endif /* currently dead code */
+
 /* NVRAM ERST Error Log Address Range is not supported yet */
 static int __erst_write_to_nvram(const struct cper_record_header *record)
 {
 	/* do not print message, because printk is not safe for NMI */
 	return -ENOSYS;
 }
+
+#ifndef NDEBUG /* currently dead code */
 
 static int __erst_read_to_erange_from_nvram(u64 record_id, u64 *offset)
 {
@@ -616,6 +594,8 @@ static int __erst_clear_from_nvram(u64 record_id)
 		"NVRAM ERST Log Address Range is not implemented yet\n");
 	return -ENOSYS;
 }
+
+#endif /* currently dead code */
 
 int erst_write(const struct cper_record_header *record)
 {
@@ -656,6 +636,8 @@ int erst_write(const struct cper_record_header *record)
 	return rc;
 }
 
+#ifndef NDEBUG /* currently dead code */
+
 static int __erst_read_to_erange(u64 record_id, u64 *offset)
 {
 	int rc;
@@ -672,22 +654,24 @@ static int __erst_read_to_erange(u64 record_id, u64 *offset)
 	return 0;
 }
 
-static size_t __erst_read(u64 record_id, struct cper_record_header *record,
+static ssize_t __erst_read(u64 record_id, struct cper_record_header *record,
 			   size_t buflen)
 {
 	int rc;
-	u64 offset, len = 0;
+	u64 offset;
+	ssize_t len;
 	struct cper_record_header *rcd_tmp;
 
 	rc = __erst_read_to_erange(record_id, &offset);
 	if (rc)
 		return rc;
 	rcd_tmp = erst_erange.vaddr + offset;
+	if (rcd_tmp->record_length > buflen)
+		return -ENOBUFS;
 	len = rcd_tmp->record_length;
-	if (len <= buflen)
-		memcpy(record, rcd_tmp, len);
+	memcpy(record, rcd_tmp, len);
 
-	return len;
+	return len >= 0 ? len : -ERANGE;
 }
 
 /*
@@ -695,10 +679,10 @@ static size_t __erst_read(u64 record_id, struct cper_record_header *record,
  * else if return value < 0, something goes wrong,
  * else everything is OK, and return value is record length
  */
-size_t erst_read(u64 record_id, struct cper_record_header *record,
+ssize_t erst_read(u64 record_id, struct cper_record_header *record,
 		  size_t buflen)
 {
-	size_t len;
+	ssize_t len;
 	unsigned long flags;
 
 	if (!erst_enabled)
@@ -716,10 +700,10 @@ size_t erst_read(u64 record_id, struct cper_record_header *record,
  * else if return value < 0, something goes wrong,
  * else everything is OK, and return value is record length
  */
-size_t erst_read_next(struct cper_record_header *record, size_t buflen)
+ssize_t erst_read_next(struct cper_record_header *record, size_t buflen)
 {
 	int rc;
-	size_t len;
+	ssize_t len;
 	unsigned long flags;
 	u64 record_id;
 
@@ -762,6 +746,8 @@ int erst_clear(u64 record_id)
 	return rc;
 }
 
+#endif /* currently dead code */
+
 static int __init erst_check_table(struct acpi_table_erst *erst_tab)
 {
 	if (erst_tab->header.length < sizeof(*erst_tab))
@@ -769,19 +755,6 @@ static int __init erst_check_table(struct acpi_table_erst *erst_tab)
 
 	switch (erst_tab->header_length) {
 	case sizeof(*erst_tab) - sizeof(erst_tab->header):
-#ifdef CONFIG_X86
-		/* XXX
-		 * While the rest of the ERST code appears to work on Intel
-		 * systems with properly sized tables, various AMD systems
-		 * appear to get hung (at boot time) by allowing this. Until
-		 * someone with access to suitable hardware can debug this,
-		 * disable the rest of the code by considering this case
-		 * invalid.
-		 */
-		if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
-			return -EINVAL;
-		/* fall through */
-#endif
 	/*
 	 * While invalid per specification, there are (early?) systems
 	 * indicating the full header size here, so accept that value too.
@@ -812,11 +785,11 @@ int __init erst_init(void)
 	status = acpi_get_table(ACPI_SIG_ERST, 0,
 				(struct acpi_table_header **)&erst_tab);
 	if (status == AE_NOT_FOUND) {
-		printk(KERN_ERR "Table is not found!\n");
+		printk(KERN_INFO "ERST table was not found\n");
 		return -ENODEV;
 	} else if (ACPI_FAILURE(status)) {
 		const char *msg = acpi_format_exception(status);
-		printk(KERN_ERR "Failed to get table, %s\n", msg);
+		printk(KERN_WARNING "Failed to get ERST table: %s\n", msg);
 		return -EINVAL;
 	}
 

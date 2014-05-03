@@ -149,8 +149,7 @@ int iommu_supports_eim(void)
     struct acpi_drhd_unit *drhd;
     int apic;
 
-    if ( !iommu_enabled || !iommu_qinval || !iommu_intremap ||
-         list_empty(&acpi_drhd_units) )
+    if ( !iommu_qinval || !iommu_intremap || list_empty(&acpi_drhd_units) )
         return 0;
 
     /* We MUST have a DRHD unit for each IOAPIC. */
@@ -195,18 +194,18 @@ static void free_remap_entry(struct iommu *iommu, int index)
 }
 
 /*
- * Look for a free intr remap entry.
+ * Look for a free intr remap entry (or a contiguous set thereof).
  * Need hold iremap_lock, and setup returned entry before releasing lock.
  */
-static int alloc_remap_entry(struct iommu *iommu)
+static unsigned int alloc_remap_entry(struct iommu *iommu, unsigned int nr)
 {
     struct iremap_entry *iremap_entries = NULL;
     struct ir_ctrl *ir_ctrl = iommu_ir_ctrl(iommu);
-    int i;
+    unsigned int i, found;
 
     ASSERT( spin_is_locked(&ir_ctrl->iremap_lock) );
 
-    for ( i = 0; i < IREMAP_ENTRY_NR; i++ )
+    for ( found = i = 0; i < IREMAP_ENTRY_NR; i++ )
     {
         struct iremap_entry *p;
         if ( i % (1 << IREMAP_ENTRY_ORDER) == 0 )
@@ -221,7 +220,9 @@ static int alloc_remap_entry(struct iommu *iommu)
         else
             p = &iremap_entries[i % (1 << IREMAP_ENTRY_ORDER)];
 
-        if ( p->lo_val == 0 && p->hi_val == 0 ) /* a free entry */
+        if ( p->lo_val || p->hi_val ) /* not a free entry */
+            found = 0;
+        else if ( ++found == nr )
             break;
     }
 
@@ -229,7 +230,7 @@ static int alloc_remap_entry(struct iommu *iommu)
         unmap_vtd_domain_page(iremap_entries);
 
     if ( i < IREMAP_ENTRY_NR ) 
-        ir_ctrl->iremap_num++;
+        ir_ctrl->iremap_num += nr;
     return i;
 }
 
@@ -294,7 +295,7 @@ static int ioapic_rte_to_remap_entry(struct iommu *iommu,
     index = apic_pin_2_ir_idx[apic][ioapic_pin];
     if ( index < 0 )
     {
-        index = alloc_remap_entry(iommu);
+        index = alloc_remap_entry(iommu, 1);
         if ( index < IREMAP_ENTRY_NR )
             apic_pin_2_ir_idx[apic][ioapic_pin] = index;
     }
@@ -374,7 +375,7 @@ unsigned int io_apic_read_remap_rte(
     struct iommu *iommu = ioapic_to_iommu(IO_APIC_ID(apic));
     struct ir_ctrl *ir_ctrl = iommu_ir_ctrl(iommu);
 
-    if ( !ir_ctrl || !ir_ctrl->iremap_maddr || !ir_ctrl->iremap_num ||
+    if ( !ir_ctrl->iremap_num ||
         ( (index = apic_pin_2_ir_idx[apic][ioapic_pin]) < 0 ) )
         return __io_apic_read(apic, reg);
 
@@ -397,14 +398,7 @@ void io_apic_write_remap_rte(
     struct IO_APIC_route_remap_entry *remap_rte;
     unsigned int rte_upper = (reg & 1) ? 1 : 0;
     struct iommu *iommu = ioapic_to_iommu(IO_APIC_ID(apic));
-    struct ir_ctrl *ir_ctrl = iommu_ir_ctrl(iommu);
     int saved_mask;
-
-    if ( !ir_ctrl || !ir_ctrl->iremap_maddr )
-    {
-        __io_apic_write(apic, reg, value);
-        return;
-    }
 
     old_rte = __ioapic_read_entry(apic, ioapic_pin, 1);
 
@@ -431,7 +425,6 @@ void io_apic_write_remap_rte(
 
 static void set_msi_source_id(struct pci_dev *pdev, struct iremap_entry *ire)
 {
-    int type;
     u16 seg;
     u8 bus, devfn, secbus;
     int ret;
@@ -442,19 +435,27 @@ static void set_msi_source_id(struct pci_dev *pdev, struct iremap_entry *ire)
     seg = pdev->seg;
     bus = pdev->bus;
     devfn = pdev->devfn;
-    type = pdev_type(seg, bus, devfn);
-    switch ( type )
+    switch ( pdev->type )
     {
-    case DEV_TYPE_PCIe_BRIDGE:
-    case DEV_TYPE_PCIe2PCI_BRIDGE:
-    case DEV_TYPE_LEGACY_PCI_BRIDGE:
-        break;
+        unsigned int sq;
 
     case DEV_TYPE_PCIe_ENDPOINT:
-        set_ire_sid(ire, SVT_VERIFY_SID_SQ, SQ_ALL_16, PCI_BDF2(bus, devfn));
+    case DEV_TYPE_PCIe_BRIDGE:
+    case DEV_TYPE_PCIe2PCI_BRIDGE:
+    case DEV_TYPE_PCI_HOST_BRIDGE:
+        switch ( pdev->phantom_stride )
+        {
+        case 1: sq = SQ_13_IGNORE_3; break;
+        case 2: sq = SQ_13_IGNORE_2; break;
+        case 4: sq = SQ_13_IGNORE_1; break;
+        default: sq = SQ_ALL_16; break;
+        }
+        set_ire_sid(ire, SVT_VERIFY_SID_SQ, sq, PCI_BDF2(bus, devfn));
         break;
 
     case DEV_TYPE_PCI:
+    case DEV_TYPE_LEGACY_PCI_BRIDGE:
+    case DEV_TYPE_PCI2PCIe_BRIDGE:
         ret = find_upstream_bridge(seg, &bus, &devfn, &secbus);
         if ( ret == 0 ) /* integrated PCI device */
         {
@@ -466,35 +467,39 @@ static void set_msi_source_id(struct pci_dev *pdev, struct iremap_entry *ire)
             if ( pdev_type(seg, bus, devfn) == DEV_TYPE_PCIe2PCI_BRIDGE )
                 set_ire_sid(ire, SVT_VERIFY_BUS, SQ_ALL_16,
                             (bus << 8) | pdev->bus);
-            else if ( pdev_type(seg, bus, devfn) == DEV_TYPE_LEGACY_PCI_BRIDGE )
-                set_ire_sid(ire, SVT_VERIFY_BUS, SQ_ALL_16,
+            else
+                set_ire_sid(ire, SVT_VERIFY_SID_SQ, SQ_ALL_16,
                             PCI_BDF2(bus, devfn));
         }
+        else
+            dprintk(XENLOG_WARNING VTDPREFIX,
+                    "d%d: no upstream bridge for %04x:%02x:%02x.%u\n",
+                    pdev->domain->domain_id,
+                    seg, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
         break;
 
     default:
         dprintk(XENLOG_WARNING VTDPREFIX,
                 "d%d: unknown(%u): %04x:%02x:%02x.%u\n",
-                pdev->domain->domain_id, type,
+                pdev->domain->domain_id, pdev->type,
                 seg, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
         break;
    }
 }
 
 static int remap_entry_to_msi_msg(
-    struct iommu *iommu, struct msi_msg *msg)
+    struct iommu *iommu, struct msi_msg *msg, unsigned int index)
 {
     struct iremap_entry *iremap_entry = NULL, *iremap_entries;
     struct msi_msg_remap_entry *remap_rte;
-    int index;
     unsigned long flags;
     struct ir_ctrl *ir_ctrl = iommu_ir_ctrl(iommu);
 
     remap_rte = (struct msi_msg_remap_entry *) msg;
-    index = (remap_rte->address_lo.index_15 << 15) |
+    index += (remap_rte->address_lo.index_15 << 15) |
              remap_rte->address_lo.index_0_14;
 
-    if ( index < 0 || index > IREMAP_ENTRY_NR - 1 )
+    if ( index >= IREMAP_ENTRY_NR )
     {
         dprintk(XENLOG_ERR VTDPREFIX,
                 "%s: index (%d) for remap table is invalid !\n",
@@ -552,31 +557,29 @@ static int msi_msg_to_remap_entry(
     struct iremap_entry *iremap_entry = NULL, *iremap_entries;
     struct iremap_entry new_ire;
     struct msi_msg_remap_entry *remap_rte;
-    int index;
+    unsigned int index, i, nr = 1;
     unsigned long flags;
     struct ir_ctrl *ir_ctrl = iommu_ir_ctrl(iommu);
 
-    remap_rte = (struct msi_msg_remap_entry *) msg;
+    if ( msi_desc->msi_attrib.type == PCI_CAP_ID_MSI )
+        nr = msi_desc->msi.nvec;
+
     spin_lock_irqsave(&ir_ctrl->iremap_lock, flags);
 
     if ( msg == NULL )
     {
-        /* Free specified unused IRTE */
-        free_remap_entry(iommu, msi_desc->remap_index);
+        /* Free specified unused IRTEs */
+        for ( i = 0; i < nr; ++i )
+            free_remap_entry(iommu, msi_desc->remap_index + i);
         spin_unlock_irqrestore(&ir_ctrl->iremap_lock, flags);
         return 0;
     }
 
     if ( msi_desc->remap_index < 0 )
     {
-        /*
-         * TODO: Multiple-vector MSI requires allocating multiple continuous
-         * entries and configuring addr/data of msi_msg in different way. So
-         * alloca_remap_entry will be changed if enabling multiple-vector MSI
-         * in future.
-         */
-        index = alloc_remap_entry(iommu);
-        msi_desc->remap_index = index;
+        index = alloc_remap_entry(iommu, nr);
+        for ( i = 0; i < nr; ++i )
+            msi_desc[i].remap_index = index + i;
     }
     else
         index = msi_desc->remap_index;
@@ -587,7 +590,8 @@ static int msi_msg_to_remap_entry(
                 "%s: intremap index (%d) is larger than"
                 " the maximum index (%d)!\n",
                 __func__, index, IREMAP_ENTRY_NR - 1);
-        msi_desc->remap_index = -1;
+        for ( i = 0; i < nr; ++i )
+            msi_desc[i].remap_index = -1;
         spin_unlock_irqrestore(&ir_ctrl->iremap_lock, flags);
         return -EFAULT;
     }
@@ -623,14 +627,18 @@ static int msi_msg_to_remap_entry(
     new_ire.lo.p = 1;    /* finally, set present bit */
 
     /* now construct new MSI/MSI-X rte entry */
+    remap_rte = (struct msi_msg_remap_entry *)msg;
     remap_rte->address_lo.dontcare = 0;
-    remap_rte->address_lo.index_15 = (index >> 15) & 0x1;
-    remap_rte->address_lo.index_0_14 = index & 0x7fff;
+    i = index;
+    if ( !nr )
+        i -= msi_desc->msi_attrib.entry_nr;
+    remap_rte->address_lo.index_15 = (i >> 15) & 0x1;
+    remap_rte->address_lo.index_0_14 = i & 0x7fff;
     remap_rte->address_lo.SHV = 1;
     remap_rte->address_lo.format = 1;
 
     remap_rte->address_hi = 0;
-    remap_rte->data = 0;
+    remap_rte->data = index - i;
 
     memcpy(iremap_entry, &new_ire, sizeof(struct iremap_entry));
     iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
@@ -647,41 +655,25 @@ void msi_msg_read_remap_rte(
 {
     struct pci_dev *pdev = msi_desc->dev;
     struct acpi_drhd_unit *drhd = NULL;
-    struct iommu *iommu = NULL;
-    struct ir_ctrl *ir_ctrl;
 
     drhd = pdev ? acpi_find_matched_drhd_unit(pdev)
                 : hpet_to_drhd(msi_desc->hpet_id);
-    if ( !drhd )
-        return;
-    iommu = drhd->iommu;
-
-    ir_ctrl = iommu_ir_ctrl(iommu);
-    if ( !ir_ctrl || !ir_ctrl->iremap_maddr )
-        return;
-
-    remap_entry_to_msi_msg(iommu, msg);
+    if ( drhd )
+        remap_entry_to_msi_msg(drhd->iommu, msg,
+                               msi_desc->msi_attrib.type == PCI_CAP_ID_MSI
+                               ? msi_desc->msi_attrib.entry_nr : 0);
 }
 
-void msi_msg_write_remap_rte(
+int msi_msg_write_remap_rte(
     struct msi_desc *msi_desc, struct msi_msg *msg)
 {
     struct pci_dev *pdev = msi_desc->dev;
     struct acpi_drhd_unit *drhd = NULL;
-    struct iommu *iommu = NULL;
-    struct ir_ctrl *ir_ctrl;
 
     drhd = pdev ? acpi_find_matched_drhd_unit(pdev)
                 : hpet_to_drhd(msi_desc->hpet_id);
-    if ( !drhd )
-        return;
-    iommu = drhd->iommu;
-
-    ir_ctrl = iommu_ir_ctrl(iommu);
-    if ( !ir_ctrl || !ir_ctrl->iremap_maddr )
-        return;
-
-    msi_msg_to_remap_entry(iommu, pdev, msi_desc, msg);
+    return drhd ? msi_msg_to_remap_entry(drhd->iommu, pdev, msi_desc, msg)
+                : -EINVAL;
 }
 
 int __init intel_setup_hpet_msi(struct msi_desc *msi_desc)
@@ -695,7 +687,7 @@ int __init intel_setup_hpet_msi(struct msi_desc *msi_desc)
         return 0;
 
     spin_lock_irqsave(&ir_ctrl->iremap_lock, flags);
-    msi_desc->remap_index = alloc_remap_entry(iommu);
+    msi_desc->remap_index = alloc_remap_entry(iommu, 1);
     if ( msi_desc->remap_index >= IREMAP_ENTRY_NR )
     {
         dprintk(XENLOG_ERR VTDPREFIX,
@@ -721,8 +713,8 @@ int enable_intremap(struct iommu *iommu, int eim)
 
     if ( !platform_supports_intremap() )
     {
-        dprintk(XENLOG_ERR VTDPREFIX,
-                "Platform firmware does not support interrupt remapping\n");
+        printk(XENLOG_ERR VTDPREFIX
+               " Platform firmware does not support interrupt remapping\n");
         return -EINVAL;
     }
 
@@ -733,14 +725,18 @@ int enable_intremap(struct iommu *iommu, int eim)
     if ( (sts & DMA_GSTS_IRES) && ir_ctrl->iremap_maddr )
         return 0;
 
-    sts = dmar_readl(iommu->reg, DMAR_GSTS_REG);
     if ( !(sts & DMA_GSTS_QIES) )
     {
-        dprintk(XENLOG_ERR VTDPREFIX,
-                "Queued invalidation is not enabled, should not enable "
-                "interrupt remapping\n");
+        printk(XENLOG_ERR VTDPREFIX
+               " Queued invalidation is not enabled on IOMMU #%u:"
+               " Should not enable interrupt remapping\n", iommu->index);
         return -EINVAL;
     }
+
+    if ( !eim && (sts & DMA_GSTS_CFIS) )
+        printk(XENLOG_WARNING VTDPREFIX
+               " Compatibility Format Interrupts permitted on IOMMU #%u:"
+               " Device pass-through will be insecure\n", iommu->index);
 
     if ( ir_ctrl->iremap_maddr == 0 )
     {

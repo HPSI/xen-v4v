@@ -38,6 +38,7 @@
 #include <xen/spinlock.h>
 #include <xen/serial.h>
 #include <xen/irq.h>
+#include <xen/watchdog.h>
 #include <asm/debugger.h>
 #include <xen/init.h>
 #include <xen/smp.h>
@@ -741,7 +742,7 @@ static void gdb_smp_resume(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * End:

@@ -21,6 +21,7 @@
 
 #include <asm/hvm/io.h>
 #include <asm/hvm/vpmu.h>
+#include <irq_vectors.h>
 
 extern void vmcs_dump_vcpu(struct vcpu *v);
 extern void setup_vmcs_dump(void);
@@ -56,30 +57,39 @@ struct vmx_msr_state {
 
 #define EPT_DEFAULT_MT      MTRR_TYPE_WRBACK
 
-struct vmx_domain {
-    unsigned long apic_access_mfn;
+struct ept_data {
     union {
-        struct {
+    struct {
             u64 ept_mt :3,
                 ept_wl :3,
                 rsvd   :6,
                 asr    :52;
         };
         u64 eptp;
-    } ept_control;
-    cpumask_var_t ept_synced;
+    };
+    cpumask_var_t synced_mask;
 };
 
-#define ept_get_wl(d)   \
-    ((d)->arch.hvm_domain.vmx.ept_control.ept_wl)
-#define ept_get_asr(d)  \
-    ((d)->arch.hvm_domain.vmx.ept_control.asr)
-#define ept_get_eptp(d) \
-    ((d)->arch.hvm_domain.vmx.ept_control.eptp)
+struct vmx_domain {
+    unsigned long apic_access_mfn;
+};
+
+struct pi_desc {
+    DECLARE_BITMAP(pir, NR_VECTORS);
+    u32 control;
+    u32 rsvd[7];
+} __attribute__ ((aligned (64)));
+
+#define ept_get_wl(ept)   ((ept)->ept_wl)
+#define ept_get_asr(ept)  ((ept)->asr)
+#define ept_get_eptp(ept) ((ept)->eptp)
+#define ept_get_synced_mask(ept) ((ept)->synced_mask)
 
 struct arch_vmx_struct {
     /* Virtual address of VMCS. */
     struct vmcs_struct  *vmcs;
+    /* VMCS shadow machine address. */
+    paddr_t             vmcs_shadow_maddr;
 
     /* Protects remote usage of VMCS (VMPTRLD/VMCLEAR). */
     spinlock_t           vmcs_lock;
@@ -108,10 +118,14 @@ struct arch_vmx_struct {
     unsigned int         host_msr_count;
     struct vmx_msr_entry *host_msr_area;
 
-    uint32_t             eoi_exitmap_changed;
-    uint64_t             eoi_exit_bitmap[4];
+    unsigned long        eoi_exitmap_changed;
+    DECLARE_BITMAP(eoi_exit_bitmap, NR_VECTORS);
+    struct pi_desc       pi_desc;
 
     unsigned long        host_cr0;
+
+    /* Do we need to tolerate a spurious EPT_MISCONFIG VM exit? */
+    bool_t               ept_spurious_misconfig;
 
     /* Is the guest in real mode? */
     uint8_t              vmx_realmode;
@@ -124,11 +138,16 @@ struct arch_vmx_struct {
     /* Remember EFLAGS while in virtual 8086 mode */
     uint32_t             vm86_saved_eflags;
     int                  hostenv_migrated;
+
+    /* Bitmap to control vmexit policy for Non-root VMREAD/VMWRITE */
+    struct page_info     *vmread_bitmap;
+    struct page_info     *vmwrite_bitmap;
 };
 
 int vmx_create_vmcs(struct vcpu *v);
 void vmx_destroy_vmcs(struct vcpu *v);
 void vmx_vmcs_enter(struct vcpu *v);
+bool_t __must_check vmx_vmcs_try_enter(struct vcpu *v);
 void vmx_vmcs_exit(struct vcpu *v);
 
 #define CPU_BASED_VIRTUAL_INTR_PENDING        0x00000004
@@ -158,28 +177,35 @@ extern u32 vmx_cpu_based_exec_control;
 #define PIN_BASED_NMI_EXITING           0x00000008
 #define PIN_BASED_VIRTUAL_NMIS          0x00000020
 #define PIN_BASED_PREEMPT_TIMER         0x00000040
+#define PIN_BASED_POSTED_INTERRUPT      0x00000080
 extern u32 vmx_pin_based_exec_control;
 
 #define VM_EXIT_SAVE_DEBUG_CNTRLS       0x00000004
 #define VM_EXIT_IA32E_MODE              0x00000200
+#define VM_EXIT_LOAD_PERF_GLOBAL_CTRL   0x00001000
 #define VM_EXIT_ACK_INTR_ON_EXIT        0x00008000
 #define VM_EXIT_SAVE_GUEST_PAT          0x00040000
 #define VM_EXIT_LOAD_HOST_PAT           0x00080000
 #define VM_EXIT_SAVE_GUEST_EFER         0x00100000
 #define VM_EXIT_LOAD_HOST_EFER          0x00200000
 #define VM_EXIT_SAVE_PREEMPT_TIMER      0x00400000
+#define VM_EXIT_CLEAR_BNDCFGS           0x00800000
 extern u32 vmx_vmexit_control;
 
 #define VM_ENTRY_IA32E_MODE             0x00000200
 #define VM_ENTRY_SMM                    0x00000400
 #define VM_ENTRY_DEACT_DUAL_MONITOR     0x00000800
+#define VM_ENTRY_LOAD_PERF_GLOBAL_CTRL  0x00002000
 #define VM_ENTRY_LOAD_GUEST_PAT         0x00004000
 #define VM_ENTRY_LOAD_GUEST_EFER        0x00008000
+#define VM_ENTRY_LOAD_BNDCFGS           0x00010000
 extern u32 vmx_vmentry_control;
 
 #define SECONDARY_EXEC_VIRTUALIZE_APIC_ACCESSES 0x00000001
 #define SECONDARY_EXEC_ENABLE_EPT               0x00000002
+#define SECONDARY_EXEC_DESCRIPTOR_TABLE_EXITING 0x00000004
 #define SECONDARY_EXEC_ENABLE_RDTSCP            0x00000008
+#define SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE   0x00000010
 #define SECONDARY_EXEC_ENABLE_VPID              0x00000020
 #define SECONDARY_EXEC_WBINVD_EXITING           0x00000040
 #define SECONDARY_EXEC_UNRESTRICTED_GUEST       0x00000080
@@ -187,10 +213,10 @@ extern u32 vmx_vmentry_control;
 #define SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY    0x00000200
 #define SECONDARY_EXEC_PAUSE_LOOP_EXITING       0x00000400
 #define SECONDARY_EXEC_ENABLE_INVPCID           0x00001000
+#define SECONDARY_EXEC_ENABLE_VMCS_SHADOWING    0x00004000
 extern u32 vmx_secondary_exec_control;
 
-extern bool_t cpu_has_vmx_ins_outs_instr_info;
-
+#define VMX_EPT_EXEC_ONLY_SUPPORTED             0x00000001
 #define VMX_EPT_WALK_LENGTH_4_SUPPORTED         0x00000040
 #define VMX_EPT_MEMORY_TYPE_UC                  0x00000100
 #define VMX_EPT_MEMORY_TYPE_WB                  0x00004000
@@ -200,11 +226,15 @@ extern bool_t cpu_has_vmx_ins_outs_instr_info;
 #define VMX_EPT_INVEPT_SINGLE_CONTEXT           0x02000000
 #define VMX_EPT_INVEPT_ALL_CONTEXT              0x04000000
 
+#define VMX_MISC_VMWRITE_ALL                    0x20000000
+
 #define VMX_VPID_INVVPID_INSTRUCTION                        0x100000000ULL
 #define VMX_VPID_INVVPID_INDIVIDUAL_ADDR                    0x10000000000ULL
 #define VMX_VPID_INVVPID_SINGLE_CONTEXT                     0x20000000000ULL
 #define VMX_VPID_INVVPID_ALL_CONTEXT                        0x40000000000ULL
 #define VMX_VPID_INVVPID_SINGLE_CONTEXT_RETAINING_GLOBAL    0x80000000000ULL
+
+#define VMX_MISC_CR3_TARGET             0x1ff0000
 
 #define cpu_has_wbinvd_exiting \
     (vmx_secondary_exec_control & SECONDARY_EXEC_WBINVD_EXITING)
@@ -237,6 +267,14 @@ extern bool_t cpu_has_vmx_ins_outs_instr_info;
     (vmx_secondary_exec_control & SECONDARY_EXEC_APIC_REGISTER_VIRT)
 #define cpu_has_vmx_virtual_intr_delivery \
     (vmx_secondary_exec_control & SECONDARY_EXEC_VIRTUAL_INTR_DELIVERY)
+#define cpu_has_vmx_virtualize_x2apic_mode \
+    (vmx_secondary_exec_control & SECONDARY_EXEC_VIRTUALIZE_X2APIC_MODE)
+#define cpu_has_vmx_posted_intr_processing \
+    (vmx_pin_based_exec_control & PIN_BASED_POSTED_INTERRUPT)
+#define cpu_has_vmx_vmcs_shadowing \
+    (vmx_secondary_exec_control & SECONDARY_EXEC_ENABLE_VMCS_SHADOWING)
+
+#define VMCS_RID_TYPE_MASK              0x80000000
 
 /* GUEST_INTERRUPTIBILITY_INFO flags. */
 #define VMX_INTR_SHADOW_STI             0x00000001
@@ -244,9 +282,30 @@ extern bool_t cpu_has_vmx_ins_outs_instr_info;
 #define VMX_INTR_SHADOW_SMI             0x00000004
 #define VMX_INTR_SHADOW_NMI             0x00000008
 
+#define VMX_BASIC_REVISION_MASK         0x7fffffff
+#define VMX_BASIC_VMCS_SIZE_MASK        (0x1fffULL << 32)
+#define VMX_BASIC_32BIT_ADDRESSES       (1ULL << 48)
+#define VMX_BASIC_DUAL_MONITOR          (1ULL << 49)
+#define VMX_BASIC_MEMORY_TYPE_MASK      (0xfULL << 50)
+#define VMX_BASIC_INS_OUT_INFO          (1ULL << 54)
+/* 
+ * bit 55 of IA32_VMX_BASIC MSR, indicating whether any VMX controls that
+ * default to 1 may be cleared to 0.
+ */
+#define VMX_BASIC_DEFAULT1_ZERO		(1ULL << 55)
+
+extern u64 vmx_basic_msr;
+#define cpu_has_vmx_ins_outs_instr_info \
+    (!!(vmx_basic_msr & VMX_BASIC_INS_OUT_INFO))
+
+/* Guest interrupt status */
+#define VMX_GUEST_INTR_STATUS_SUBFIELD_BITMASK  0x0FF
+#define VMX_GUEST_INTR_STATUS_SVI_OFFSET        8
+
 /* VMCS field encodings. */
 enum vmcs_field {
     VIRTUAL_PROCESSOR_ID            = 0x00000000,
+    POSTED_INTR_NOTIFICATION_VECTOR = 0x00000002,
     GUEST_ES_SELECTOR               = 0x00000800,
     GUEST_CS_SELECTOR               = 0x00000802,
     GUEST_SS_SELECTOR               = 0x00000804,
@@ -281,16 +340,16 @@ enum vmcs_field {
     VIRTUAL_APIC_PAGE_ADDR_HIGH     = 0x00002013,
     APIC_ACCESS_ADDR                = 0x00002014,
     APIC_ACCESS_ADDR_HIGH           = 0x00002015,
+    PI_DESC_ADDR                    = 0x00002016,
+    PI_DESC_ADDR_HIGH               = 0x00002017,
     EPT_POINTER                     = 0x0000201a,
     EPT_POINTER_HIGH                = 0x0000201b,
     EOI_EXIT_BITMAP0                = 0x0000201c,
-    EOI_EXIT_BITMAP0_HIGH           = 0x0000201d,
-    EOI_EXIT_BITMAP1                = 0x0000201e,
-    EOI_EXIT_BITMAP1_HIGH           = 0x0000201f,
-    EOI_EXIT_BITMAP2                = 0x00002020,
-    EOI_EXIT_BITMAP2_HIGH           = 0x00002021,
-    EOI_EXIT_BITMAP3                = 0x00002022,
-    EOI_EXIT_BITMAP3_HIGH           = 0x00002023,
+#define EOI_EXIT_BITMAP(n) (EOI_EXIT_BITMAP0 + (n) * 2) /* n = 0...3 */
+    VMREAD_BITMAP                   = 0x00002026,
+    VMREAD_BITMAP_HIGH              = 0x00002027,
+    VMWRITE_BITMAP                  = 0x00002028,
+    VMWRITE_BITMAP_HIGH             = 0x00002029,
     GUEST_PHYSICAL_ADDRESS          = 0x00002400,
     GUEST_PHYSICAL_ADDRESS_HIGH     = 0x00002401,
     VMCS_LINK_POINTER               = 0x00002800,
@@ -299,6 +358,10 @@ enum vmcs_field {
     GUEST_IA32_DEBUGCTL_HIGH        = 0x00002803,
     GUEST_PAT                       = 0x00002804,
     GUEST_PAT_HIGH                  = 0x00002805,
+    GUEST_EFER                      = 0x00002806,
+    GUEST_EFER_HIGH                 = 0x00002807,
+    GUEST_PERF_GLOBAL_CTRL          = 0x00002808,
+    GUEST_PERF_GLOBAL_CTRL_HIGH     = 0x00002809,
     GUEST_PDPTR0                    = 0x0000280a,
     GUEST_PDPTR0_HIGH               = 0x0000280b,
     GUEST_PDPTR1                    = 0x0000280c,
@@ -307,8 +370,14 @@ enum vmcs_field {
     GUEST_PDPTR2_HIGH               = 0x0000280f,
     GUEST_PDPTR3                    = 0x00002810,
     GUEST_PDPTR3_HIGH               = 0x00002811,
+    GUEST_BNDCFGS                   = 0x00002812,
+    GUEST_BNDCFGS_HIGH              = 0x00002813,
     HOST_PAT                        = 0x00002c00,
     HOST_PAT_HIGH                   = 0x00002c01,
+    HOST_EFER                       = 0x00002c02,
+    HOST_EFER_HIGH                  = 0x00002c03,
+    HOST_PERF_GLOBAL_CTRL           = 0x00002c04,
+    HOST_PERF_GLOBAL_CTRL_HIGH      = 0x00002c05,
     PIN_BASED_VM_EXEC_CONTROL       = 0x00004000,
     CPU_BASED_VM_EXEC_CONTROL       = 0x00004002,
     EXCEPTION_BITMAP                = 0x00004004,
@@ -356,6 +425,7 @@ enum vmcs_field {
     GUEST_INTERRUPTIBILITY_INFO     = 0x00004824,
     GUEST_ACTIVITY_STATE            = 0x00004826,
     GUEST_SYSENTER_CS               = 0x0000482A,
+    GUEST_PREEMPTION_TIMER          = 0x0000482e,
     HOST_SYSENTER_CS                = 0x00004c00,
     CR0_GUEST_HOST_MASK             = 0x00006000,
     CR4_GUEST_HOST_MASK             = 0x00006002,
@@ -399,8 +469,6 @@ enum vmcs_field {
     HOST_SYSENTER_EIP               = 0x00006c12,
     HOST_RSP                        = 0x00006c14,
     HOST_RIP                        = 0x00006c16,
-    /* A virtual VMCS field used for nestedvmx only */
-    NVMX_LAUNCH_STATE               = 0x00006c20,
 };
 
 #define VMCS_VPID_WIDTH 16
@@ -408,6 +476,7 @@ enum vmcs_field {
 #define MSR_TYPE_R 1
 #define MSR_TYPE_W 2
 void vmx_disable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
+void vmx_enable_intercept_for_msr(struct vcpu *v, u32 msr, int type);
 int vmx_read_guest_msr(u32 msr, u64 *val);
 int vmx_write_guest_msr(u32 msr, u64 val);
 int vmx_add_guest_msr(u32 msr);
@@ -415,13 +484,18 @@ int vmx_add_host_load_msr(u32 msr);
 void vmx_vmcs_switch(struct vmcs_struct *from, struct vmcs_struct *to);
 void vmx_set_eoi_exit_bitmap(struct vcpu *v, u8 vector);
 void vmx_clear_eoi_exit_bitmap(struct vcpu *v, u8 vector);
+int vmx_check_msr_bitmap(unsigned long *msr_bitmap, u32 msr, int access_type);
+void virtual_vmcs_enter(void *vvmcs);
+void virtual_vmcs_exit(void *vvmcs);
+u64 virtual_vmcs_vmread(void *vvmcs, u32 vmcs_encoding);
+void virtual_vmcs_vmwrite(void *vvmcs, u32 vmcs_encoding, u64 val);
 
 #endif /* ASM_X86_HVM_VMX_VMCS_H__ */
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

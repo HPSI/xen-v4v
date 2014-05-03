@@ -37,6 +37,11 @@
 TYPE_SAFE(unsigned long,gfn)
 #define PRI_gfn "05lx"
 
+#ifndef gfn_t
+#define gfn_t /* Grep fodder: gfn_t, _gfn() and gfn_x() are defined above */
+#undef gfn_t
+#endif
+
 #define VALID_GFN(m) (m != INVALID_GFN)
 
 static inline int
@@ -191,7 +196,7 @@ guest_supports_superpages(struct vcpu *v)
     /* The _PAGE_PSE bit must be honoured in HVM guests, whenever
      * CR4.PSE is set or the guest is in PAE or long mode. 
      * It's also used in the dummy PT for vcpus with CR4.PG cleared. */
-    return (!is_hvm_vcpu(v)
+    return (is_pv_vcpu(v)
             ? opt_allow_superpage
             : (GUEST_PAGING_LEVELS != 2 
                || !hvm_paging_enabled(v)
@@ -209,7 +214,7 @@ guest_supports_nx(struct vcpu *v)
 {
     if ( GUEST_PAGING_LEVELS == 2 || !cpu_has_nx )
         return 0;
-    if ( !is_hvm_vcpu(v) )
+    if ( is_pv_vcpu(v) )
         return cpu_has_nx;
     return hvm_nx_enabled(v);
 }
@@ -310,6 +315,10 @@ guest_walk_to_page_order(walk_t *gw)
 #define GPT_RENAME2(_n, _l) _n ## _ ## _l ## _levels
 #define GPT_RENAME(_n, _l) GPT_RENAME2(_n, _l)
 #define guest_walk_tables GPT_RENAME(guest_walk_tables, GUEST_PAGING_LEVELS)
+#define map_domain_gfn GPT_RENAME(map_domain_gfn, GUEST_PAGING_LEVELS)
+
+void *map_domain_gfn(struct p2m_domain *p2m, gfn_t gfn, mfn_t *mfn,
+                     p2m_type_t *p2mt, p2m_query_t q, uint32_t *rc);
 
 extern uint32_t 
 guest_walk_tables(struct vcpu *v, struct p2m_domain *p2m, unsigned long va,

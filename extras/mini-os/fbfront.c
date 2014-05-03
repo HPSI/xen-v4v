@@ -75,7 +75,7 @@ struct kbdfront_dev *init_kbdfront(char *_nodename, int abs_pointer)
     char* nodename = _nodename ? _nodename : "device/vkbd/0";
     struct kbdfront_dev *dev;
 
-    char path[strlen(nodename) + 1 + 10 + 1];
+    char path[strlen(nodename) + strlen("/backend-id") + 1];
 
     printk("******************* KBDFRONT for %s **********\n\n\n", nodename);
 
@@ -105,7 +105,7 @@ again:
         free(err);
     }
 
-    err = xenbus_printf(xbt, nodename, "page-ref","%u", virt_to_mfn(s));
+    err = xenbus_printf(xbt, nodename, "page-ref","%lu", virt_to_mfn(s));
     if (err) {
         message = "writing page-ref";
         goto abort_transaction;
@@ -131,7 +131,7 @@ again:
     }
 
     err = xenbus_transaction_end(xbt, 0, &retry);
-    if (err) free(err);
+    free(err);
     if (retry) {
             goto again;
         printk("completing transaction\n");
@@ -158,8 +158,8 @@ done:
 
     {
         XenbusState state;
-        char path[strlen(dev->backend) + 1 + 6 + 1];
-        char frontpath[strlen(nodename) + 1 + 6 + 1];
+        char path[strlen(dev->backend) + strlen("/state") + 1];
+        char frontpath[strlen(nodename) + strlen("/state") + 1];
 
         snprintf(path, sizeof(path), "%s/state", dev->backend);
 
@@ -171,7 +171,8 @@ done:
             err = xenbus_wait_for_state_change(path, &state, &dev->events);
         if (state != XenbusStateConnected) {
             printk("backend not available, state=%d\n", state);
-            xenbus_unwatch_path_token(XBT_NIL, path, path);
+            free(err);
+            err = xenbus_unwatch_path_token(XBT_NIL, path, path);
             goto error;
         }
 
@@ -181,7 +182,8 @@ done:
         if((err = xenbus_switch_state(XBT_NIL, frontpath, XenbusStateConnected))
             != NULL) {
             printk("error switching state: %s\n", err);
-            xenbus_unwatch_path_token(XBT_NIL, path, path);
+            free(err);
+            err = xenbus_unwatch_path_token(XBT_NIL, path, path);
             goto error;
         }
     }
@@ -236,11 +238,11 @@ int kbdfront_receive(struct kbdfront_dev *dev, union xenkbd_in_event *buf, int n
 
 void shutdown_kbdfront(struct kbdfront_dev *dev)
 {
-    char* err = NULL;
+    char* err = NULL, *err2;
     XenbusState state;
 
-    char path[strlen(dev->backend) + 1 + 5 + 1];
-    char nodename[strlen(dev->nodename) + 1 + 5 + 1];
+    char path[strlen(dev->backend) + strlen("/state") + 1];
+    char nodename[strlen(dev->nodename) + strlen("/request-abs-pointer") + 1];
 
     printk("close kbd: backend at %s\n",dev->backend);
 
@@ -254,7 +256,7 @@ void shutdown_kbdfront(struct kbdfront_dev *dev)
     state = xenbus_read_integer(path);
     while (err == NULL && state < XenbusStateClosing)
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-    if (err) free(err);
+    free(err);
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateClosed)) != NULL) {
         printk("shutdown_kbdfront: error changing state to %d: %s\n",
@@ -264,7 +266,7 @@ void shutdown_kbdfront(struct kbdfront_dev *dev)
     state = xenbus_read_integer(path);
     while (state < XenbusStateClosed) {
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-        if (err) free(err);
+        free(err);
     }
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateInitialising)) != NULL) {
@@ -272,21 +274,24 @@ void shutdown_kbdfront(struct kbdfront_dev *dev)
                 XenbusStateInitialising, err);
         goto close_kbdfront;
     }
-    err = NULL;
     state = xenbus_read_integer(path);
     while (err == NULL && (state < XenbusStateInitWait || state >= XenbusStateClosed))
     err = xenbus_wait_for_state_change(path, &state, &dev->events);
 
 close_kbdfront:
-    if (err) free(err);
-    xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
+    err2 = xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err2);
 
-    snprintf(path, sizeof(path), "%s/page-ref", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/event-channel", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/request-abs-pointer", nodename);
-    xenbus_rm(XBT_NIL, path);
+    snprintf(nodename, sizeof(nodename), "%s/page-ref", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/event-channel", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/request-abs-pointer", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
 
     if (!err)
         free_kbdfront(dev);
@@ -406,14 +411,14 @@ struct fbfront_dev *init_fbfront(char *_nodename, unsigned long *mfns, int width
     char* message=NULL;
     struct xenfb_page *s;
     int retry=0;
-    char* msg;
+    char* msg=NULL;
     int i, j;
     struct fbfront_dev *dev;
     int max_pd;
     unsigned long mapped;
     char* nodename = _nodename ? _nodename : "device/vfb/0";
 
-    char path[strlen(nodename) + 1 + 10 + 1];
+    char path[strlen(nodename) + strlen("/backend-id") + 1];
 
     printk("******************* FBFRONT for %s **********\n\n\n", nodename);
 
@@ -463,7 +468,7 @@ again:
         free(err);
     }
 
-    err = xenbus_printf(xbt, nodename, "page-ref","%u", virt_to_mfn(s));
+    err = xenbus_printf(xbt, nodename, "page-ref","%lu", virt_to_mfn(s));
     if (err) {
         message = "writing page-ref";
         goto abort_transaction;
@@ -493,7 +498,7 @@ again:
     }
 
     err = xenbus_transaction_end(xbt, 0, &retry);
-    if (err) free(err);
+    free(err);
     if (retry) {
             goto again;
         printk("completing transaction\n");
@@ -520,8 +525,8 @@ done:
 
     {
         XenbusState state;
-        char path[strlen(dev->backend) + 1 + 14 + 1];
-        char frontpath[strlen(nodename) + 1 + 6 + 1];
+        char path[strlen(dev->backend) + strlen("/request-update") + 1];
+        char frontpath[strlen(nodename) + strlen("/state") + 1];
 
         snprintf(path, sizeof(path), "%s/state", dev->backend);
 
@@ -533,7 +538,8 @@ done:
             err = xenbus_wait_for_state_change(path, &state, &dev->events);
         if (state != XenbusStateConnected) {
             printk("backend not available, state=%d\n", state);
-            xenbus_unwatch_path_token(XBT_NIL, path, path);
+            free(err);
+            err = xenbus_unwatch_path_token(XBT_NIL, path, path);
             goto error;
         }
 
@@ -546,7 +552,8 @@ done:
         if ((err = xenbus_switch_state(XBT_NIL, frontpath, XenbusStateConnected))
             != NULL) {
             printk("error switching state: %s\n", err);
-            xenbus_unwatch_path_token(XBT_NIL, path, path);
+            free(err);
+            err = xenbus_unwatch_path_token(XBT_NIL, path, path);
             goto error;
         }
     }
@@ -557,6 +564,7 @@ done:
     return dev;
 
 error:
+    free(msg);
     free(err);
     free_fbfront(dev);
     return NULL;
@@ -628,11 +636,11 @@ void fbfront_resize(struct fbfront_dev *dev, int width, int height, int stride, 
 
 void shutdown_fbfront(struct fbfront_dev *dev)
 {
-    char* err = NULL;
+    char* err = NULL, *err2;
     XenbusState state;
 
-    char path[strlen(dev->backend) + 1 + 5 + 1];
-    char nodename[strlen(dev->nodename) + 1 + 5 + 1];
+    char path[strlen(dev->backend) + strlen("/state") + 1];
+    char nodename[strlen(dev->nodename) + strlen("/feature-update") + 1];
 
     printk("close fb: backend at %s\n",dev->backend);
 
@@ -646,7 +654,7 @@ void shutdown_fbfront(struct fbfront_dev *dev)
     state = xenbus_read_integer(path);
     while (err == NULL && state < XenbusStateClosing)
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-    if (err) free(err);
+    free(err);
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateClosed)) != NULL) {
         printk("shutdown_fbfront: error changing state to %d: %s\n",
@@ -655,8 +663,8 @@ void shutdown_fbfront(struct fbfront_dev *dev)
     }
     state = xenbus_read_integer(path);
     if (state < XenbusStateClosed) {
-        xenbus_wait_for_state_change(path, &state, &dev->events);
-        if (err) free(err);
+        err = xenbus_wait_for_state_change(path, &state, &dev->events);
+        free(err);
     }
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateInitialising)) != NULL) {
@@ -664,24 +672,27 @@ void shutdown_fbfront(struct fbfront_dev *dev)
                 XenbusStateInitialising, err);
         goto close_fbfront;
     }
-
-    err = NULL;
     state = xenbus_read_integer(path);
     while (err == NULL && (state < XenbusStateInitWait || state >= XenbusStateClosed))
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
 
 close_fbfront:
-    if (err) free(err);
-    xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
+    err2 = xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err2);
 
-    snprintf(path, sizeof(path), "%s/page-ref", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/event-channel", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/protocol", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/feature-update", nodename);
-    xenbus_rm(XBT_NIL, path);
+    snprintf(nodename, sizeof(nodename), "%s/page-ref", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/event-channel", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/protocol", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/feature-update", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
 
     if (!err)
         free_fbfront(dev);

@@ -11,7 +11,13 @@
 
 ENTRY(start)
 
-OUTPUT_ARCH(arm)
+#if defined(__arm__)
+#define FORMAT arm
+#elif defined(__aarch64__)
+#define FORMAT aarch64
+#endif
+
+OUTPUT_ARCH(FORMAT)
 
 PHDRS
 {
@@ -70,6 +76,20 @@ SECTIONS
   __lock_profile_end = .;
 #endif
 
+  . = ALIGN(8);
+  .arch.info : {
+      _splatform = .;
+      *(.arch.info)
+      _eplatform = .;
+  } :text
+
+  . = ALIGN(8);
+  .dev.info : {
+      _sdevice = .;
+      *(.dev.info)
+      _edevice = .;
+  } :text
+
   . = ALIGN(PAGE_SIZE);             /* Init code and data */
   __init_begin = .;
   .init.text : {
@@ -84,12 +104,22 @@ SECTIONS
        *(.init.data)
        *(.init.data.rel)
        *(.init.data.rel.*)
+
+       . = ALIGN(8);
+       __ctors_start = .;
+       *(.init_array)
+       __ctors_end = .;
   } :text
   . = ALIGN(32);
   .init.setup : {
        __setup_start = .;
        *(.init.setup)
        __setup_end = .;
+  } :text
+  .init.proc.info : {
+       __proc_info_start = .;
+       *(.init.proc.info)
+       __proc_info_end = .;
   } :text
   .initcall.init : {
        __initcall_start = .;
@@ -123,9 +153,11 @@ SECTIONS
   } :text
   _end = . ;
 
+#ifdef CONFIG_DTB_FILE
   /* Section for the device tree blob (if any). */
   _sdtb = .;
   .dtb : { *(.dtb) } :text
+#endif
 
   /* Sections to be discarded */
   /DISCARD/ : {

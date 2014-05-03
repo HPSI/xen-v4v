@@ -192,7 +192,7 @@ intel_get_extended_msrs(struct mcinfo_global *mig, struct mc_info *mi)
             !(mig->mc_gstatus & MCG_STATUS_EIPV))
         return NULL;
 
-    mc_ext = x86_mcinfo_reserve(mi, sizeof(struct mcinfo_extended));
+    mc_ext = x86_mcinfo_reserve(mi, sizeof(*mc_ext));
     if (!mc_ext)
     {
         mi->flags |= MCINFO_FLAGS_UNCOMPLETE;
@@ -200,7 +200,6 @@ intel_get_extended_msrs(struct mcinfo_global *mig, struct mc_info *mi)
     }
 
     /* this function will called when CAP(9).MCG_EXT_P = 1 */
-    memset(&mc_ext, 0, sizeof(struct mcinfo_extended));
     mc_ext->common.type = MC_TYPE_EXTENDED;
     mc_ext->common.size = sizeof(struct mcinfo_extended);
 
@@ -644,7 +643,6 @@ static void intel_init_cmci(struct cpuinfo_x86 *c)
 {
     u32 l, apic;
     int cpu = smp_processor_id();
-    static uint8_t cmci_apic_vector;
 
     if (!mce_available(c) || !cmci_support) {
         if (opt_cpu_info)

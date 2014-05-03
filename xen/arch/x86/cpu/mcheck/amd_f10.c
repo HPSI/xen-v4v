@@ -62,14 +62,13 @@ amd_f10_handler(struct mc_info *mi, uint16_t bank, uint64_t status)
 	if (!(status & MCi_STATUS_MISCV))
 		return NULL;
 
-	mc_ext = x86_mcinfo_reserve(mi, sizeof(struct mcinfo_extended));
+	mc_ext = x86_mcinfo_reserve(mi, sizeof(*mc_ext));
 	if (!mc_ext)
 	{
 		mi->flags |= MCINFO_FLAGS_UNCOMPLETE;
 		return NULL;
 	}
 
-	memset(mc_ext, 0, sizeof(*mc_ext));
 	mc_ext->common.type = MC_TYPE_EXTENDED;
 	mc_ext->common.size = sizeof(*mc_ext);
 	mc_ext->mc_msrs = 3;
@@ -106,43 +105,14 @@ enum mcheck_type amd_f10_mcheck_init(struct cpuinfo_x86 *c)
 /* amd specific MCA MSR */
 int vmce_amd_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
 {
-	switch (msr) {
-	case MSR_F10_MC4_MISC1: /* DRAM error type */
-		v->arch.vmce.bank[1].mci_misc = val; 
-		mce_printk(MCE_VERBOSE, "MCE: wr msr %#"PRIx64"\n", val);
-		break;
-	case MSR_F10_MC4_MISC2: /* Link error type */
-	case MSR_F10_MC4_MISC3: /* L3 cache error type */
-		/* ignore write: we do not emulate link and l3 cache errors
-		 * to the guest.
-		 */
-		mce_printk(MCE_VERBOSE, "MCE: wr msr %#"PRIx64"\n", val);
-		break;
-	default:
-		return 0;
-	}
-
-	return 1;
+    /* Do nothing as we don't emulate this MC bank currently */
+    mce_printk(MCE_VERBOSE, "MCE: wr msr %#"PRIx64"\n", val);
+    return 1;
 }
 
 int vmce_amd_rdmsr(const struct vcpu *v, uint32_t msr, uint64_t *val)
 {
-	switch (msr) {
-	case MSR_F10_MC4_MISC1: /* DRAM error type */
-		*val = v->arch.vmce.bank[1].mci_misc;
-		mce_printk(MCE_VERBOSE, "MCE: rd msr %#"PRIx64"\n", *val);
-		break;
-	case MSR_F10_MC4_MISC2: /* Link error type */
-	case MSR_F10_MC4_MISC3: /* L3 cache error type */
-		/* we do not emulate link and l3 cache
-		 * errors to the guest.
-		 */
-		*val = 0;
-		mce_printk(MCE_VERBOSE, "MCE: rd msr %#"PRIx64"\n", *val);
-		break;
-	default:
-		return 0;
-	}
-
-	return 1;
+    /* Assign '0' as we don't emulate this MC bank currently */
+    *val = 0;
+    return 1;
 }

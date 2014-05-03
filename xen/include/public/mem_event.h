@@ -40,11 +40,13 @@
 /* Reasons for the memory event request */
 #define MEM_EVENT_REASON_UNKNOWN     0    /* typical reason */
 #define MEM_EVENT_REASON_VIOLATION   1    /* access violation, GFN is address */
-#define MEM_EVENT_REASON_CR0         2    /* CR0 was hit: gfn is CR0 value */
-#define MEM_EVENT_REASON_CR3         3    /* CR3 was hit: gfn is CR3 value */
-#define MEM_EVENT_REASON_CR4         4    /* CR4 was hit: gfn is CR4 value */
+#define MEM_EVENT_REASON_CR0         2    /* CR0 was hit: gfn is new CR0 value, gla is previous */
+#define MEM_EVENT_REASON_CR3         3    /* CR3 was hit: gfn is new CR3 value, gla is previous */
+#define MEM_EVENT_REASON_CR4         4    /* CR4 was hit: gfn is new CR4 value, gla is previous */
 #define MEM_EVENT_REASON_INT3        5    /* int3 was hit: gla/gfn are RIP */
 #define MEM_EVENT_REASON_SINGLESTEP  6    /* single step was invoked: gla/gfn are RIP */
+#define MEM_EVENT_REASON_MSR         7    /* MSR was hit: gfn is MSR value, gla is MSR address;
+                                             does NOT honour HVMPME_onchangeonly */
 
 typedef struct mem_event_st {
     uint32_t flags;
@@ -72,7 +74,7 @@ DEFINE_RING_TYPES(mem_event, mem_event_request_t, mem_event_response_t);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

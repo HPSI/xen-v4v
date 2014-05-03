@@ -78,8 +78,8 @@ void iommu_dte_set_guest_cr3(u32 *dte, u16 dom_id, u64 gcr3,
 void amd_iommu_flush_all_pages(struct domain *d);
 void amd_iommu_flush_pages(struct domain *d, unsigned long gfn,
                            unsigned int order);
-void amd_iommu_flush_iotlb(struct pci_dev *pdev, uint64_t gaddr,
-                           unsigned int order);
+void amd_iommu_flush_iotlb(u8 devfn, const struct pci_dev *pdev,
+                           uint64_t gaddr, unsigned int order);
 void amd_iommu_flush_device(struct amd_iommu *iommu, uint16_t bdf);
 void amd_iommu_flush_intremap(struct amd_iommu *iommu, uint16_t bdf);
 void amd_iommu_flush_all_caches(struct amd_iommu *iommu);
@@ -89,19 +89,34 @@ struct amd_iommu *find_iommu_for_device(int seg, int bdf);
 
 /* interrupt remapping */
 int amd_iommu_setup_ioapic_remapping(void);
-void *amd_iommu_alloc_intremap_table(void);
+void *amd_iommu_alloc_intremap_table(unsigned long **);
 int amd_iommu_free_intremap_table(u16 seg, struct ivrs_mappings *);
 void amd_iommu_ioapic_update_ire(
     unsigned int apic, unsigned int reg, unsigned int value);
-void amd_iommu_msi_msg_update_ire(
+unsigned int amd_iommu_read_ioapic_from_ire(
+    unsigned int apic, unsigned int reg);
+int amd_iommu_msi_msg_update_ire(
     struct msi_desc *msi_desc, struct msi_msg *msg);
 void amd_iommu_read_msi_from_ire(
     struct msi_desc *msi_desc, struct msi_msg *msg);
+int amd_setup_hpet_msi(struct msi_desc *msi_desc);
 
 extern struct ioapic_sbdf {
     u16 bdf, seg;
+    u16 *pin_2_idx;
 } ioapic_sbdf[MAX_IO_APICS];
+
+extern struct hpet_sbdf {
+    u16 bdf, seg, id;
+    enum {
+        HPET_NONE,
+        HPET_CMDL,
+        HPET_IVHD,
+    } init;
+} hpet_sbdf;
+
 extern void *shared_intremap_table;
+extern unsigned long *shared_intremap_inuse;
 
 /* power management support */
 void amd_iommu_resume(void);

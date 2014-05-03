@@ -309,8 +309,10 @@ struct netfront_dev *init_netfront(char *_nodename, void (*thenetif_rx)(unsigned
 
     if (!_nodename)
         snprintf(nodename, sizeof(nodename), "device/vif/%d", netfrontends);
-    else
-        strncpy(nodename, _nodename, strlen(nodename));
+    else {
+        strncpy(nodename, _nodename, sizeof(nodename) - 1);
+        nodename[sizeof(nodename) - 1] = 0;
+    }
     netfrontends++;
 
     if (!thenetif_rx)
@@ -410,7 +412,7 @@ again:
     }
 
     err = xenbus_transaction_end(xbt, 0, &retry);
-    if (err) free(err);
+    free(err);
     if (retry) {
             goto again;
         printk("completing transaction\n");
@@ -441,7 +443,7 @@ done:
 
     {
         XenbusState state;
-        char path[strlen(dev->backend) + 1 + 5 + 1];
+        char path[strlen(dev->backend) + strlen("/state") + 1];
         snprintf(path, sizeof(path), "%s/state", dev->backend);
 
         xenbus_watch_path_token(XBT_NIL, path, path, &dev->events);
@@ -504,11 +506,11 @@ int netfront_tap_open(char *nodename) {
 
 void shutdown_netfront(struct netfront_dev *dev)
 {
-    char* err = NULL;
+    char* err = NULL, *err2;
     XenbusState state;
 
-    char path[strlen(dev->backend) + 1 + 5 + 1];
-    char nodename[strlen(dev->nodename) + 1 + 5 + 1];
+    char path[strlen(dev->backend) + strlen("/state") + 1];
+    char nodename[strlen(dev->nodename) + strlen("/request-rx-copy") + 1];
 
     printk("close network: backend at %s\n",dev->backend);
 
@@ -523,7 +525,7 @@ void shutdown_netfront(struct netfront_dev *dev)
     state = xenbus_read_integer(path);
     while (err == NULL && state < XenbusStateClosing)
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-    if (err) free(err);
+    free(err);
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateClosed)) != NULL) {
         printk("shutdown_netfront: error changing state to %d: %s\n",
@@ -533,7 +535,7 @@ void shutdown_netfront(struct netfront_dev *dev)
     state = xenbus_read_integer(path);
     while (state < XenbusStateClosed) {
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-        if (err) free(err);
+        free(err);
     }
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateInitialising)) != NULL) {
@@ -541,23 +543,27 @@ void shutdown_netfront(struct netfront_dev *dev)
                 XenbusStateInitialising, err);
         goto close;
     }
-    err = NULL;
     state = xenbus_read_integer(path);
     while (err == NULL && (state < XenbusStateInitWait || state >= XenbusStateClosed))
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
 
 close:
-    if (err) free(err);
-    xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
+    err2 = xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err2);
 
-    snprintf(path, sizeof(path), "%s/tx-ring-ref", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/rx-ring-ref", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/event-channel", nodename);
-    xenbus_rm(XBT_NIL, path);
-    snprintf(path, sizeof(path), "%s/request-rx-copy", nodename);
-    xenbus_rm(XBT_NIL, path);
+    snprintf(nodename, sizeof(nodename), "%s/tx-ring-ref", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/rx-ring-ref", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/event-channel", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
+    snprintf(nodename, sizeof(nodename), "%s/request-rx-copy", dev->nodename);
+    err2 = xenbus_rm(XBT_NIL, nodename);
+    free(err2);
 
     if (!err)
         free_netfront(dev);

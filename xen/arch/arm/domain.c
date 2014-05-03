@@ -1,4 +1,16 @@
+/*
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ */
 #include <xen/config.h>
+#include <xen/hypercall.h>
 #include <xen/init.h>
 #include <xen/lib.h>
 #include <xen/sched.h>
@@ -6,15 +18,22 @@
 #include <xen/wait.h>
 #include <xen/errno.h>
 #include <xen/bitops.h>
+#include <xen/grant_table.h>
 
 #include <asm/current.h>
+#include <asm/event.h>
+#include <asm/guest_access.h>
 #include <asm/regs.h>
 #include <asm/p2m.h>
 #include <asm/irq.h>
+#include <asm/cpufeature.h>
+#include <asm/vfp.h>
+#include <asm/procinfo.h>
 
-#include "gic.h"
+#include <asm/gic.h>
+#include <asm/platform.h>
 #include "vtimer.h"
-#include "vpl011.h"
+#include "vuart.h"
 
 DEFINE_PER_CPU(struct vcpu *, curr_vcpu);
 
@@ -27,7 +46,10 @@ void idle_loop(void)
 
         local_irq_disable();
         if ( cpu_is_haltable(smp_processor_id()) )
-            asm volatile ("dsb; wfi");
+        {
+            dsb(sy);
+            wfi();
+        }
         local_irq_enable();
 
         do_tasklet();
@@ -37,58 +59,74 @@ void idle_loop(void)
 
 static void ctxt_switch_from(struct vcpu *p)
 {
+    p2m_save_state(p);
+
     /* CP 15 */
-    p->arch.csselr = READ_CP32(CSSELR);
+    p->arch.csselr = READ_SYSREG(CSSELR_EL1);
 
     /* Control Registers */
-    p->arch.actlr = READ_CP32(ACTLR);
-    p->arch.sctlr = READ_CP32(SCTLR);
-    p->arch.cpacr = READ_CP32(CPACR);
+    p->arch.cpacr = READ_SYSREG(CPACR_EL1);
 
-    p->arch.contextidr = READ_CP32(CONTEXTIDR);
-    p->arch.tpidrurw = READ_CP32(TPIDRURW);
-    p->arch.tpidruro = READ_CP32(TPIDRURO);
-    p->arch.tpidrprw = READ_CP32(TPIDRPRW);
+    p->arch.contextidr = READ_SYSREG(CONTEXTIDR_EL1);
+    p->arch.tpidr_el0 = READ_SYSREG(TPIDR_EL0);
+    p->arch.tpidrro_el0 = READ_SYSREG(TPIDRRO_EL0);
+    p->arch.tpidr_el1 = READ_SYSREG(TPIDR_EL1);
 
     /* Arch timer */
-    p->arch.cntvoff = READ_CP64(CNTVOFF);
-    p->arch.cntv_cval = READ_CP64(CNTV_CVAL);
-    p->arch.cntv_ctl = READ_CP32(CNTV_CTL);
+    virt_timer_save(p);
 
-    /* XXX only save these if ThumbEE e.g. ID_PFR0.THUMB_EE_SUPPORT */
-    p->arch.teecr = READ_CP32(TEECR);
-    p->arch.teehbr = READ_CP32(TEEHBR);
+    if ( is_32bit_domain(p->domain) && cpu_has_thumbee )
+    {
+        p->arch.teecr = READ_SYSREG32(TEECR32_EL1);
+        p->arch.teehbr = READ_SYSREG32(TEEHBR32_EL1);
+    }
 
+#ifdef CONFIG_ARM_32
     p->arch.joscr = READ_CP32(JOSCR);
     p->arch.jmcr = READ_CP32(JMCR);
+#endif
 
     isb();
 
     /* MMU */
-    p->arch.vbar = READ_CP32(VBAR);
-    p->arch.ttbcr = READ_CP32(TTBCR);
-    /* XXX save 64 bit TTBR if guest is LPAE */
-    p->arch.ttbr0 = READ_CP32(TTBR0);
-    p->arch.ttbr1 = READ_CP32(TTBR1);
-
-    p->arch.dacr = READ_CP32(DACR);
-    p->arch.par = READ_CP64(PAR);
+    p->arch.vbar = READ_SYSREG(VBAR_EL1);
+    p->arch.ttbcr = READ_SYSREG(TCR_EL1);
+    p->arch.ttbr0 = READ_SYSREG64(TTBR0_EL1);
+    p->arch.ttbr1 = READ_SYSREG64(TTBR1_EL1);
+    if ( is_32bit_domain(p->domain) )
+        p->arch.dacr = READ_SYSREG(DACR32_EL2);
+    p->arch.par = READ_SYSREG64(PAR_EL1);
+#if defined(CONFIG_ARM_32)
     p->arch.mair0 = READ_CP32(MAIR0);
     p->arch.mair1 = READ_CP32(MAIR1);
+    p->arch.amair0 = READ_CP32(AMAIR0);
+    p->arch.amair1 = READ_CP32(AMAIR1);
+#else
+    p->arch.mair = READ_SYSREG64(MAIR_EL1);
+    p->arch.amair = READ_SYSREG64(AMAIR_EL1);
+#endif
 
     /* Fault Status */
+#if defined(CONFIG_ARM_32)
     p->arch.dfar = READ_CP32(DFAR);
     p->arch.ifar = READ_CP32(IFAR);
     p->arch.dfsr = READ_CP32(DFSR);
-    p->arch.ifsr = READ_CP32(IFSR);
-    p->arch.adfsr = READ_CP32(ADFSR);
-    p->arch.aifsr = READ_CP32(AIFSR);
+#elif defined(CONFIG_ARM_64)
+    p->arch.far = READ_SYSREG64(FAR_EL1);
+    p->arch.esr = READ_SYSREG64(ESR_EL1);
+#endif
+
+    if ( is_32bit_domain(p->domain) )
+        p->arch.ifsr  = READ_SYSREG(IFSR32_EL2);
+    p->arch.afsr0 = READ_SYSREG(AFSR0_EL1);
+    p->arch.afsr1 = READ_SYSREG(AFSR1_EL1);
 
     /* XXX MPU */
 
-    /* XXX VFP */
+    /* VFP */
+    vfp_save_state(p);
 
-    /* XXX VGIC */
+    /* VGIC */
     gic_save_state(p);
 
     isb();
@@ -97,87 +135,105 @@ static void ctxt_switch_from(struct vcpu *p)
 
 static void ctxt_switch_to(struct vcpu *n)
 {
-    uint32_t hcr;
+    p2m_restore_state(n);
 
-    hcr = READ_CP32(HCR);
-    WRITE_CP32(hcr & ~HCR_VM, HCR);
-    isb();
+    WRITE_SYSREG32(n->domain->arch.vpidr, VPIDR_EL2);
+    WRITE_SYSREG(n->arch.vmpidr, VMPIDR_EL2);
 
-    p2m_load_VTTBR(n->domain);
-    isb();
-
-    /* XXX VGIC */
+    /* VGIC */
     gic_restore_state(n);
 
-    /* XXX VFP */
+    /* VFP */
+    vfp_restore_state(n);
 
     /* XXX MPU */
 
     /* Fault Status */
+#if defined(CONFIG_ARM_32)
     WRITE_CP32(n->arch.dfar, DFAR);
     WRITE_CP32(n->arch.ifar, IFAR);
     WRITE_CP32(n->arch.dfsr, DFSR);
-    WRITE_CP32(n->arch.ifsr, IFSR);
-    WRITE_CP32(n->arch.adfsr, ADFSR);
-    WRITE_CP32(n->arch.aifsr, AIFSR);
+#elif defined(CONFIG_ARM_64)
+    WRITE_SYSREG64(n->arch.far, FAR_EL1);
+    WRITE_SYSREG64(n->arch.esr, ESR_EL1);
+#endif
+
+    if ( is_32bit_domain(n->domain) )
+        WRITE_SYSREG(n->arch.ifsr, IFSR32_EL2);
+    WRITE_SYSREG(n->arch.afsr0, AFSR0_EL1);
+    WRITE_SYSREG(n->arch.afsr1, AFSR1_EL1);
 
     /* MMU */
-    WRITE_CP32(n->arch.vbar, VBAR);
-    WRITE_CP32(n->arch.ttbcr, TTBCR);
-    /* XXX restore 64 bit TTBR if guest is LPAE */
-    WRITE_CP32(n->arch.ttbr0, TTBR0);
-    WRITE_CP32(n->arch.ttbr1, TTBR1);
-
-    WRITE_CP32(n->arch.dacr, DACR);
-    WRITE_CP64(n->arch.par, PAR);
+    WRITE_SYSREG(n->arch.vbar, VBAR_EL1);
+    WRITE_SYSREG(n->arch.ttbcr, TCR_EL1);
+    WRITE_SYSREG64(n->arch.ttbr0, TTBR0_EL1);
+    WRITE_SYSREG64(n->arch.ttbr1, TTBR1_EL1);
+    if ( is_32bit_domain(n->domain) )
+        WRITE_SYSREG(n->arch.dacr, DACR32_EL2);
+    WRITE_SYSREG64(n->arch.par, PAR_EL1);
+#if defined(CONFIG_ARM_32)
     WRITE_CP32(n->arch.mair0, MAIR0);
     WRITE_CP32(n->arch.mair1, MAIR1);
+    WRITE_CP32(n->arch.amair0, AMAIR0);
+    WRITE_CP32(n->arch.amair1, AMAIR1);
+#elif defined(CONFIG_ARM_64)
+    WRITE_SYSREG64(n->arch.mair, MAIR_EL1);
+    WRITE_SYSREG64(n->arch.amair, AMAIR_EL1);
+#endif
     isb();
 
-    /* Arch timer */
-    WRITE_CP64(n->arch.cntvoff, CNTVOFF);
-    WRITE_CP64(n->arch.cntv_cval, CNTV_CVAL);
-    WRITE_CP32(n->arch.cntv_ctl, CNTV_CTL);
-
     /* Control Registers */
-    WRITE_CP32(n->arch.actlr, ACTLR);
-    WRITE_CP32(n->arch.sctlr, SCTLR);
-    WRITE_CP32(n->arch.cpacr, CPACR);
+    WRITE_SYSREG(n->arch.cpacr, CPACR_EL1);
 
-    WRITE_CP32(n->arch.contextidr, CONTEXTIDR);
-    WRITE_CP32(n->arch.tpidrurw, TPIDRURW);
-    WRITE_CP32(n->arch.tpidruro, TPIDRURO);
-    WRITE_CP32(n->arch.tpidrprw, TPIDRPRW);
+    WRITE_SYSREG(n->arch.contextidr, CONTEXTIDR_EL1);
+    WRITE_SYSREG(n->arch.tpidr_el0, TPIDR_EL0);
+    WRITE_SYSREG(n->arch.tpidrro_el0, TPIDRRO_EL0);
+    WRITE_SYSREG(n->arch.tpidr_el1, TPIDR_EL1);
 
-    /* XXX only restore these if ThumbEE e.g. ID_PFR0.THUMB_EE_SUPPORT */
-    WRITE_CP32(n->arch.teecr, TEECR);
-    WRITE_CP32(n->arch.teehbr, TEEHBR);
+    if ( is_32bit_domain(n->domain) && cpu_has_thumbee )
+    {
+        WRITE_SYSREG32(n->arch.teecr, TEECR32_EL1);
+        WRITE_SYSREG32(n->arch.teehbr, TEEHBR32_EL1);
+    }
 
+#ifdef CONFIG_ARM_32
     WRITE_CP32(n->arch.joscr, JOSCR);
     WRITE_CP32(n->arch.jmcr, JMCR);
-
+#endif
     isb();
 
     /* CP 15 */
-    WRITE_CP32(n->arch.csselr, CSSELR);
+    WRITE_SYSREG(n->arch.csselr, CSSELR_EL1);
 
     isb();
 
-    WRITE_CP32(hcr, HCR);
-    isb();
+    /* This is could trigger an hardware interrupt from the virtual
+     * timer. The interrupt needs to be injected into the guest. */
+    virt_timer_restore(n);
+}
+
+/* Update per-VCPU guest runstate shared memory area (if registered). */
+static void update_runstate_area(struct vcpu *v)
+{
+    if ( guest_handle_is_null(runstate_guest(v)) )
+        return;
+
+    __copy_to_guest(runstate_guest(v), &v->runstate, 1);
 }
 
 static void schedule_tail(struct vcpu *prev)
 {
-    /* Re-enable interrupts before restoring state which may fault. */
-    local_irq_enable();
-
     ctxt_switch_from(prev);
 
-    /* TODO
-       update_runstate_area(current);
-    */
     ctxt_switch_to(current);
+
+    local_irq_enable();
+
+    if ( prev != current )
+        update_runstate_area(current);
+
+    /* Ensure that the vcpu has an up-to-date time base. */
+    update_vcpu_system_time(current);
 }
 
 static void continue_new_vcpu(struct vcpu *prev)
@@ -186,9 +242,13 @@ static void continue_new_vcpu(struct vcpu *prev)
 
     if ( is_idle_vcpu(current) )
         reset_stack_and_jump(idle_loop);
+    else if ( is_32bit_domain(current->domain) )
+        /* check_wakeup_from_wait(); */
+        reset_stack_and_jump(return_to_new_vcpu32);
     else
         /* check_wakeup_from_wait(); */
-        reset_stack_and_jump(return_to_new_vcpu);
+        reset_stack_and_jump(return_to_new_vcpu64);
+
 }
 
 void context_switch(struct vcpu *prev, struct vcpu *next)
@@ -197,9 +257,8 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
     ASSERT(prev != next);
     ASSERT(cpumask_empty(next->vcpu_dirty_cpumask));
 
-    /* TODO
-       update_runstate_area(prev);
-    */
+    if ( prev != next )
+        update_runstate_area(prev);
 
     local_irq_disable();
 
@@ -329,13 +388,17 @@ struct domain *alloc_domain_struct(void)
     struct domain *d;
     BUILD_BUG_ON(sizeof(*d) > PAGE_SIZE);
     d = alloc_xenheap_pages(0, 0);
-    if ( d != NULL )
-        clear_page(d);
+    if ( d == NULL )
+        return NULL;
+
+    clear_page(d);
+    d->arch.grant_table_gpfn = xmalloc_array(xen_pfn_t, max_nr_grant_frames);
     return d;
 }
 
 void free_domain_struct(struct domain *d)
 {
+    xfree(d->arch.grant_table_gpfn);
     free_xenheap_page(d);
 }
 
@@ -374,6 +437,8 @@ int vcpu_initialise(struct vcpu *v)
 {
     int rc = 0;
 
+    BUILD_BUG_ON( sizeof(struct cpu_info) > STACK_SIZE );
+
     v->arch.stack = alloc_xenheap_pages(STACK_ORDER, MEMF_node(vcpu_to_node(v)));
     if ( v->arch.stack == NULL )
         return -ENOMEM;
@@ -383,12 +448,24 @@ int vcpu_initialise(struct vcpu *v)
                                            - sizeof(struct cpu_info));
 
     memset(&v->arch.saved_context, 0, sizeof(v->arch.saved_context));
-    v->arch.saved_context.sp = (uint32_t)v->arch.cpu_info;
-    v->arch.saved_context.pc = (uint32_t)continue_new_vcpu;
+    v->arch.saved_context.sp = (register_t)v->arch.cpu_info;
+    v->arch.saved_context.pc = (register_t)continue_new_vcpu;
 
     /* Idle VCPUs don't need the rest of this setup */
     if ( is_idle_vcpu(v) )
         return rc;
+
+    v->arch.sctlr = SCTLR_GUEST_INIT;
+
+    /*
+     * By default exposes an SMP system with AFF0 set to the VCPU ID
+     * TODO: Handle multi-threading processor and cluster
+     */
+    v->arch.vmpidr = MPIDR_SMP | (v->vcpu_id << MPIDR_AFF0_SHIFT);
+
+    v->arch.actlr = READ_SYSREG32(ACTLR_EL1);
+
+    processor_vcpu_initialise(v);
 
     if ( (rc = vcpu_vgic_init(v)) != 0 )
         return rc;
@@ -401,6 +478,7 @@ int vcpu_initialise(struct vcpu *v)
 
 void vcpu_destroy(struct vcpu *v)
 {
+    vcpu_timer_destroy(v);
     free_xenheap_pages(v->arch.stack, STACK_ORDER);
 }
 
@@ -408,16 +486,21 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
 {
     int rc;
 
+    d->arch.relmem = RELMEM_not_started;
+
     /* Idle domains do not need this setup */
     if ( is_idle_domain(d) )
         return 0;
 
-    rc = -ENOMEM;
     if ( (rc = p2m_init(d)) != 0 )
         goto fail;
 
+    rc = -ENOMEM;
     if ( (d->shared_info = alloc_xenheap_pages(0, 0)) == NULL )
         goto fail;
+
+    /* Default the virtual ID to match the physical */
+    d->arch.vpidr = boot_cpu_data.midr.bits;
 
     clear_page(d->shared_info);
     share_xen_page_with_guest(
@@ -432,31 +515,40 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
     if ( (rc = domain_vgic_init(d)) != 0 )
         goto fail;
 
-    /* Domain 0 gets a real UART not an emulated one */
-    if ( d->domain_id && (rc = domain_uart0_init(d)) != 0 )
+    if ( (rc = vcpu_domain_init(d)) != 0 )
+        goto fail;
+
+    if ( d->domain_id )
+        d->arch.evtchn_irq = GUEST_EVTCHN_PPI;
+    else
+        d->arch.evtchn_irq = platform_dom0_evtchn_ppi();
+
+    /*
+     * Virtual UART is only used by linux early printk and decompress code.
+     * Only use it for the hardware domain because the linux kernel may not
+     * support multi-platform.
+     */
+    if ( is_hardware_domain(d) && (rc = domain_vuart_init(d)) )
         goto fail;
 
     return 0;
 
 fail:
     d->is_dying = DOMDYING_dead;
-    free_xenheap_page(d->shared_info);
-
-    p2m_teardown(d);
-
-    domain_vgic_free(d);
-    domain_uart0_free(d);
+    arch_domain_destroy(d);
 
     return rc;
 }
 
 void arch_domain_destroy(struct domain *d)
 {
-    /* p2m_destroy */
-    /* domain_vgic_destroy */
+    p2m_teardown(d);
+    domain_vgic_free(d);
+    domain_vuart_free(d);
+    free_xenheap_page(d->shared_info);
 }
 
-static int is_guest_psr(uint32_t psr)
+static int is_guest_pv32_psr(uint32_t psr)
 {
     switch (psr & PSR_MODE_MASK)
     {
@@ -475,6 +567,29 @@ static int is_guest_psr(uint32_t psr)
     }
 }
 
+
+#ifdef CONFIG_ARM_64
+static int is_guest_pv64_psr(uint32_t psr)
+{
+    if ( psr & PSR_MODE_BIT )
+        return 0;
+
+    switch (psr & PSR_MODE_MASK)
+    {
+    case PSR_MODE_EL1h:
+    case PSR_MODE_EL1t:
+    case PSR_MODE_EL0t:
+        return 1;
+    case PSR_MODE_EL3h:
+    case PSR_MODE_EL3t:
+    case PSR_MODE_EL2h:
+    case PSR_MODE_EL2t:
+    default:
+        return 0;
+    }
+}
+#endif
+
 /*
  * Initialise VCPU state. The context can be supplied by either the
  * toolstack (XEN_DOMCTL_setvcpucontext) or the guest
@@ -484,28 +599,43 @@ int arch_set_info_guest(
     struct vcpu *v, vcpu_guest_context_u c)
 {
     struct vcpu_guest_context *ctxt = c.nat;
-    struct cpu_user_regs *regs = &c.nat->user_regs;
+    struct vcpu_guest_core_regs *regs = &c.nat->user_regs;
 
-    if ( !is_guest_psr(regs->cpsr) )
-        return -EINVAL;
+    if ( is_32bit_domain(v->domain) )
+    {
+        if ( !is_guest_pv32_psr(regs->cpsr) )
+            return -EINVAL;
 
-    if ( regs->spsr_svc && !is_guest_psr(regs->spsr_svc) )
-        return -EINVAL;
-    if ( regs->spsr_abt && !is_guest_psr(regs->spsr_abt) )
-        return -EINVAL;
-    if ( regs->spsr_und && !is_guest_psr(regs->spsr_und) )
-        return -EINVAL;
-    if ( regs->spsr_irq && !is_guest_psr(regs->spsr_irq) )
-        return -EINVAL;
-    if ( regs->spsr_fiq && !is_guest_psr(regs->spsr_fiq) )
-        return -EINVAL;
+        if ( regs->spsr_svc && !is_guest_pv32_psr(regs->spsr_svc) )
+            return -EINVAL;
+        if ( regs->spsr_abt && !is_guest_pv32_psr(regs->spsr_abt) )
+            return -EINVAL;
+        if ( regs->spsr_und && !is_guest_pv32_psr(regs->spsr_und) )
+            return -EINVAL;
+        if ( regs->spsr_irq && !is_guest_pv32_psr(regs->spsr_irq) )
+            return -EINVAL;
+        if ( regs->spsr_fiq && !is_guest_pv32_psr(regs->spsr_fiq) )
+            return -EINVAL;
+    }
+#ifdef CONFIG_ARM_64
+    else
+    {
+        if ( !is_guest_pv64_psr(regs->cpsr) )
+            return -EINVAL;
 
-    v->arch.cpu_info->guest_cpu_user_regs = *regs;
+        if ( regs->spsr_el1 && !is_guest_pv64_psr(regs->spsr_el1) )
+            return -EINVAL;
+    }
+#endif
+
+    vcpu_regs_user_to_hyp(v, regs);
 
     v->arch.sctlr = ctxt->sctlr;
     v->arch.ttbr0 = ctxt->ttbr0;
     v->arch.ttbr1 = ctxt->ttbr1;
     v->arch.ttbcr = ctxt->ttbcr;
+
+    v->is_initialised = 1;
 
     if ( ctxt->flags & VGCF_online )
         clear_bit(_VPF_down, &v->pause_flags);
@@ -515,8 +645,109 @@ int arch_set_info_guest(
     return 0;
 }
 
+int arch_vcpu_reset(struct vcpu *v)
+{
+    vcpu_end_shutdown_deferral(v);
+    return 0;
+}
+
+static int relinquish_memory(struct domain *d, struct page_list_head *list)
+{
+    struct page_info *page, *tmp;
+    int               ret = 0;
+
+    /* Use a recursive lock, as we may enter 'free_domheap_page'. */
+    spin_lock_recursive(&d->page_alloc_lock);
+
+    page_list_for_each_safe( page, tmp, list )
+    {
+        /* Grab a reference to the page so it won't disappear from under us. */
+        if ( unlikely(!get_page(page, d)) )
+            /* Couldn't get a reference -- someone is freeing this page. */
+            BUG();
+
+        if ( test_and_clear_bit(_PGC_allocated, &page->count_info) )
+            put_page(page);
+
+        put_page(page);
+
+        if ( hypercall_preempt_check() )
+        {
+            ret = -EAGAIN;
+            goto out;
+        }
+    }
+
+  out:
+    spin_unlock_recursive(&d->page_alloc_lock);
+    return ret;
+}
+
+int domain_relinquish_resources(struct domain *d)
+{
+    int ret = 0;
+
+    switch ( d->arch.relmem )
+    {
+    case RELMEM_not_started:
+        d->arch.relmem = RELMEM_xen;
+        /* Falltrough */
+
+    case RELMEM_xen:
+        ret = relinquish_memory(d, &d->xenpage_list);
+        if ( ret )
+            return ret;
+
+        d->arch.relmem = RELMEM_page;
+        /* Fallthrough */
+
+    case RELMEM_page:
+        ret = relinquish_memory(d, &d->page_list);
+        if ( ret )
+            return ret;
+
+        d->arch.relmem = RELMEM_mapping;
+        /* Fallthrough */
+
+    case RELMEM_mapping:
+        ret = relinquish_p2m_mapping(d);
+        if ( ret )
+            return ret;
+
+        d->arch.relmem = RELMEM_done;
+        /* Fallthrough */
+
+    case RELMEM_done:
+        break;
+
+    default:
+        BUG();
+    }
+
+    return 0;
+}
+
 void arch_dump_domain_info(struct domain *d)
 {
+    struct vcpu *v;
+
+    for_each_vcpu ( d, v )
+    {
+        gic_dump_info(v);
+    }
+}
+
+
+long do_arm_vcpu_op(int cmd, int vcpuid, XEN_GUEST_HANDLE_PARAM(void) arg)
+{
+    switch ( cmd )
+    {
+        case VCPUOP_register_vcpu_info:
+        case VCPUOP_register_runstate_memory_area:
+            return do_vcpu_op(cmd, vcpuid, arg);
+        default:
+            return -EINVAL;
+    }
 }
 
 long arch_do_vcpu_op(int cmd, struct vcpu *v, XEN_GUEST_HANDLE_PARAM(void) arg)
@@ -536,13 +767,13 @@ void vcpu_mark_events_pending(struct vcpu *v)
     if ( already_pending )
         return;
 
-    vgic_vcpu_inject_irq(v, VGIC_IRQ_EVTCHN_CALLBACK, 1);
+    vgic_vcpu_inject_irq(v, v->domain->arch.evtchn_irq, 1);
 }
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

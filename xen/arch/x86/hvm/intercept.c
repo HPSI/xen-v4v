@@ -47,14 +47,24 @@ static int hvm_mmio_access(struct vcpu *v,
                            hvm_mmio_read_t read_handler,
                            hvm_mmio_write_t write_handler)
 {
+    struct hvm_vcpu_io *vio = &v->arch.hvm_vcpu.hvm_io;
     unsigned long data;
-    int rc = X86EMUL_OKAY, i, sign = p->df ? -1 : 1;
+    int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
 
     if ( !p->data_is_ptr )
     {
         if ( p->dir == IOREQ_READ )
         {
-            rc = read_handler(v, p->addr, p->size, &data);
+            if ( vio->mmio_retrying )
+            {
+                if ( vio->mmio_large_read_bytes != p->size )
+                    return X86EMUL_UNHANDLEABLE;
+                memcpy(&data, vio->mmio_large_read, p->size);
+                vio->mmio_large_read_bytes = 0;
+                vio->mmio_retrying = 0;
+            }
+            else
+                rc = read_handler(v, p->addr, p->size, &data);
             p->data = data;
         }
         else /* p->dir == IOREQ_WRITE */
@@ -66,43 +76,82 @@ static int hvm_mmio_access(struct vcpu *v,
     {
         for ( i = 0; i < p->count; i++ )
         {
-            int ret;
-
-            rc = read_handler(v, p->addr + (sign * i * p->size), p->size,
-                              &data);
-            if ( rc != X86EMUL_OKAY )
-                break;
-            ret = hvm_copy_to_guest_phys(p->data + (sign * i * p->size),
-                                         &data,
-                                         p->size);
-            if ( (ret == HVMCOPY_gfn_paged_out) || 
-                 (ret == HVMCOPY_gfn_shared) )
+            if ( vio->mmio_retrying )
             {
+                if ( vio->mmio_large_read_bytes != p->size )
+                    return X86EMUL_UNHANDLEABLE;
+                memcpy(&data, vio->mmio_large_read, p->size);
+                vio->mmio_large_read_bytes = 0;
+                vio->mmio_retrying = 0;
+            }
+            else
+            {
+                rc = read_handler(v, p->addr + step * i, p->size, &data);
+                if ( rc != X86EMUL_OKAY )
+                    break;
+            }
+            switch ( hvm_copy_to_guest_phys(p->data + step * i,
+                                            &data, p->size) )
+            {
+            case HVMCOPY_okay:
+                break;
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
                 rc = X86EMUL_RETRY;
                 break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                /* Drop the write as real hardware would. */
+                continue;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
             }
+            if ( rc != X86EMUL_OKAY)
+                break;
+        }
+
+        if ( rc == X86EMUL_RETRY )
+        {
+            vio->mmio_retry = 1;
+            vio->mmio_large_read_bytes = p->size;
+            memcpy(vio->mmio_large_read, &data, p->size);
         }
     }
     else
     {
         for ( i = 0; i < p->count; i++ )
         {
-            int ret;
-
-            ret = hvm_copy_from_guest_phys(&data,
-                                           p->data + (sign * i * p->size),
-                                           p->size);
-            if ( (ret == HVMCOPY_gfn_paged_out) || 
-                 (ret == HVMCOPY_gfn_shared) )
+            switch ( hvm_copy_from_guest_phys(&data, p->data + step * i,
+                                              p->size) )
             {
+            case HVMCOPY_okay:
+                break;
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
                 rc = X86EMUL_RETRY;
                 break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                data = ~0;
+                break;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
             }
-            rc = write_handler(v, p->addr + (sign * i * p->size), p->size,
-                               data);
+            if ( rc != X86EMUL_OKAY )
+                break;
+            rc = write_handler(v, p->addr + step * i, p->size, data);
             if ( rc != X86EMUL_OKAY )
                 break;
         }
+
+        if ( rc == X86EMUL_RETRY )
+            vio->mmio_retry = 1;
     }
 
     if ( i != 0 )
@@ -131,14 +180,24 @@ int hvm_mmio_intercept(ioreq_t *p)
 
 static int process_portio_intercept(portio_action_t action, ioreq_t *p)
 {
-    int rc = X86EMUL_OKAY, i, sign = p->df ? -1 : 1;
+    struct hvm_vcpu_io *vio = &current->arch.hvm_vcpu.hvm_io;
+    int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
     uint32_t data;
 
     if ( !p->data_is_ptr )
     {
         if ( p->dir == IOREQ_READ )
         {
-            rc = action(IOREQ_READ, p->addr, p->size, &data);
+            if ( vio->mmio_retrying )
+            {
+                if ( vio->mmio_large_read_bytes != p->size )
+                    return X86EMUL_UNHANDLEABLE;
+                memcpy(&data, vio->mmio_large_read, p->size);
+                vio->mmio_large_read_bytes = 0;
+                vio->mmio_retrying = 0;
+            }
+            else
+                rc = action(IOREQ_READ, p->addr, p->size, &data);
             p->data = data;
         }
         else
@@ -153,11 +212,48 @@ static int process_portio_intercept(portio_action_t action, ioreq_t *p)
     {
         for ( i = 0; i < p->count; i++ )
         {
-            rc = action(IOREQ_READ, p->addr, p->size, &data);
-            if ( rc != X86EMUL_OKAY )
+            if ( vio->mmio_retrying )
+            {
+                if ( vio->mmio_large_read_bytes != p->size )
+                    return X86EMUL_UNHANDLEABLE;
+                memcpy(&data, vio->mmio_large_read, p->size);
+                vio->mmio_large_read_bytes = 0;
+                vio->mmio_retrying = 0;
+            }
+            else
+            {
+                rc = action(IOREQ_READ, p->addr, p->size, &data);
+                if ( rc != X86EMUL_OKAY )
+                    break;
+            }
+            switch ( hvm_copy_to_guest_phys(p->data + step * i,
+                                            &data, p->size) )
+            {
+            case HVMCOPY_okay:
                 break;
-            (void)hvm_copy_to_guest_phys(p->data + sign*i*p->size,
-                                         &data, p->size);
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
+                rc = X86EMUL_RETRY;
+                break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                /* Drop the write as real hardware would. */
+                continue;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
+            }
+            if ( rc != X86EMUL_OKAY)
+                break;
+        }
+
+        if ( rc == X86EMUL_RETRY )
+        {
+            vio->mmio_retry = 1;
+            vio->mmio_large_read_bytes = p->size;
+            memcpy(vio->mmio_large_read, &data, p->size);
         }
     }
     else /* p->dir == IOREQ_WRITE */
@@ -165,12 +261,34 @@ static int process_portio_intercept(portio_action_t action, ioreq_t *p)
         for ( i = 0; i < p->count; i++ )
         {
             data = 0;
-            (void)hvm_copy_from_guest_phys(&data, p->data + sign*i*p->size,
-                                           p->size);
+            switch ( hvm_copy_from_guest_phys(&data, p->data + step * i,
+                                              p->size) )
+            {
+            case HVMCOPY_okay:
+                break;
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
+                rc = X86EMUL_RETRY;
+                break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                data = ~0;
+                break;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
+            }
+            if ( rc != X86EMUL_OKAY )
+                break;
             rc = action(IOREQ_WRITE, p->addr, p->size, &data);
             if ( rc != X86EMUL_OKAY )
                 break;
         }
+
+        if ( rc == X86EMUL_RETRY )
+            vio->mmio_retry = 1;
     }
 
     if ( i != 0 )
@@ -252,7 +370,7 @@ void relocate_io_handler(
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

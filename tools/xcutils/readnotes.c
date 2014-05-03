@@ -61,51 +61,56 @@ struct setup_header {
 } __attribute__((packed));
 
 static void print_string_note(const char *prefix, struct elf_binary *elf,
-			      const elf_note *note)
+			      ELF_HANDLE_DECL(elf_note) note)
 {
-	printf("%s: %s\n", prefix, (char*)elf_note_desc(elf, note));
+	printf("%s: %s\n", prefix, elf_strfmt(elf, elf_note_desc(elf, note)));
 }
 
 static void print_numeric_note(const char *prefix, struct elf_binary *elf,
-			       const elf_note *note)
+			       ELF_HANDLE_DECL(elf_note) note)
 {
 	uint64_t value = elf_note_numeric(elf, note);
-	int descsz = elf_uval(elf, note, descsz);
+	unsigned descsz = elf_uval(elf, note, descsz);
 
 	printf("%s: %#*" PRIx64 " (%d bytes)\n",
 	       prefix, 2+2*descsz, value, descsz);
 }
 
 static void print_l1_mfn_valid_note(const char *prefix, struct elf_binary *elf,
-				    const elf_note *note)
+				    ELF_HANDLE_DECL(elf_note) note)
 {
-	int descsz = elf_uval(elf, note, descsz);
-	const uint32_t *desc32 = elf_note_desc(elf, note);
-	const uint64_t *desc64 = elf_note_desc(elf, note);
+	unsigned descsz = elf_uval(elf, note, descsz);
+	elf_ptrval desc = elf_note_desc(elf, note);
 
 	/* XXX should be able to cope with a list of values. */
 	switch ( descsz / 2 )
 	{
 	case 8:
 		printf("%s: mask=%#"PRIx64" value=%#"PRIx64"\n", prefix,
-		       desc64[0], desc64[1]);
+		       elf_access_unsigned(elf, desc, 0, 8),
+		       elf_access_unsigned(elf, desc, 8, 8));
 		break;
 	case 4:
 		printf("%s: mask=%#"PRIx32" value=%#"PRIx32"\n", prefix,
-		       desc32[0],desc32[1]);
+		       (uint32_t)elf_access_unsigned(elf, desc, 0, 4),
+		       (uint32_t)elf_access_unsigned(elf, desc, 4, 4));
 		break;
 	}
 
 }
 
-static int print_notes(struct elf_binary *elf, const elf_note *start, const elf_note *end)
+static unsigned print_notes(struct elf_binary *elf, ELF_HANDLE_DECL(elf_note) start, ELF_HANDLE_DECL(elf_note) end)
 {
-	const elf_note *note;
-	int notes_found = 0;
+	ELF_HANDLE_DECL(elf_note) note;
+	unsigned notes_found = 0;
+	const char *this_note_name;
 
-	for ( note = start; note < end; note = elf_note_next(elf, note) )
+	for ( note = start; ELF_HANDLE_PTRVAL(note) < ELF_HANDLE_PTRVAL(end); note = elf_note_next(elf, note) )
 	{
-		if (0 != strcmp(elf_note_name(elf, note), "Xen"))
+		this_note_name = elf_note_name(elf, note);
+		if (NULL == this_note_name)
+			continue;
+		if (0 != strcmp(this_note_name, "Xen"))
 			continue;
 
 		notes_found++;
@@ -156,7 +161,7 @@ static int print_notes(struct elf_binary *elf, const elf_note *start, const elf_
 			break;
 		default:
 			printf("unknown note type %#x\n",
-			       (int)elf_uval(elf, note, type));
+			       (unsigned)elf_uval(elf, note, type));
 			break;
 		}
 	}
@@ -166,12 +171,13 @@ static int print_notes(struct elf_binary *elf, const elf_note *start, const elf_
 int main(int argc, char **argv)
 {
 	const char *f;
-	int fd,h,size,usize,count;
+	int fd;
+	unsigned h,size,usize,count;
 	void *image,*tmp;
 	struct stat st;
 	struct elf_binary elf;
-	const elf_shdr *shdr;
-	int notes_found = 0;
+	ELF_HANDLE_DECL(elf_shdr) shdr;
+	unsigned notes_found = 0;
 
 	struct setup_header *hdr;
 	uint64_t payload_offset, payload_length;
@@ -257,7 +263,7 @@ int main(int argc, char **argv)
 	count = elf_phdr_count(&elf);
 	for ( h=0; h < count; h++)
 	{
-		const elf_phdr *phdr;
+		ELF_HANDLE_DECL(elf_phdr) phdr;
 		phdr = elf_phdr_by_index(&elf, h);
 		if (elf_uval(&elf, phdr, p_type) != PT_NOTE)
 			continue;
@@ -269,8 +275,8 @@ int main(int argc, char **argv)
 			continue;
 
 		notes_found = print_notes(&elf,
-					  elf_segment_start(&elf, phdr),
-					  elf_segment_end(&elf, phdr));
+					  ELF_MAKE_HANDLE(elf_note, elf_segment_start(&elf, phdr)),
+					  ELF_MAKE_HANDLE(elf_note, elf_segment_end(&elf, phdr)));
 	}
 
 	if ( notes_found == 0 )
@@ -278,13 +284,13 @@ int main(int argc, char **argv)
 		count = elf_shdr_count(&elf);
 		for ( h=0; h < count; h++)
 		{
-			const elf_shdr *shdr;
+			ELF_HANDLE_DECL(elf_shdr) shdr;
 			shdr = elf_shdr_by_index(&elf, h);
 			if (elf_uval(&elf, shdr, sh_type) != SHT_NOTE)
 				continue;
 			notes_found = print_notes(&elf,
-						  elf_section_start(&elf, shdr),
-						  elf_section_end(&elf, shdr));
+						  ELF_MAKE_HANDLE(elf_note, elf_section_start(&elf, shdr)),
+						  ELF_MAKE_HANDLE(elf_note, elf_section_end(&elf, shdr)));
 			if ( notes_found )
 				fprintf(stderr, "using notes from SHT_NOTE section\n");
 
@@ -292,8 +298,12 @@ int main(int argc, char **argv)
 	}
 
 	shdr = elf_shdr_by_name(&elf, "__xen_guest");
-	if (shdr)
-		printf("__xen_guest: %s\n", (char*)elf_section_start(&elf, shdr));
+	if (ELF_HANDLE_VALID(shdr))
+		printf("__xen_guest: %s\n",
+                       elf_strfmt(&elf, elf_section_start(&elf, shdr)));
+
+	if (elf_check_broken(&elf))
+		printf("warning: broken ELF: %s\n", elf_check_broken(&elf));
 
 	return 0;
 }

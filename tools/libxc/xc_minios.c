@@ -29,7 +29,6 @@
 #include <mini-os/events.h>
 #include <mini-os/wait.h>
 #include <sys/mman.h>
-#include <errno.h>
 
 #include <xen/memory.h>
 #include <unistd.h>
@@ -350,7 +349,7 @@ static int minios_evtchn_unbind(xc_evtchn *xce, xc_osdep_handle h, evtchn_port_t
         }
     }
     printf("Warning: couldn't find port %"PRId32" for xc handle %x\n", port, fd);
-    errno = -EINVAL;
+    errno = EINVAL;
     return -1;
 }
 
@@ -543,7 +542,7 @@ xc_osdep_info_t xc_osdep_info = {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

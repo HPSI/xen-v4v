@@ -18,8 +18,8 @@ void free_consfront(struct consfront_dev *dev)
     char* err = NULL;
     XenbusState state;
 
-    char path[strlen(dev->backend) + 1 + 5 + 1];
-    char nodename[strlen(dev->nodename) + 1 + 5 + 1];
+    char path[strlen(dev->backend) + strlen("/state") + 1];
+    char nodename[strlen(dev->nodename) + strlen("/state") + 1];
 
     snprintf(path, sizeof(path), "%s/state", dev->backend);
     snprintf(nodename, sizeof(nodename), "%s/state", dev->nodename);
@@ -32,7 +32,7 @@ void free_consfront(struct consfront_dev *dev)
     state = xenbus_read_integer(path);
     while (err == NULL && state < XenbusStateClosing)
         err = xenbus_wait_for_state_change(path, &state, &dev->events);
-    if (err) free(err);
+    free(err);
 
     if ((err = xenbus_switch_state(XBT_NIL, nodename, XenbusStateClosed)) != NULL) {
         printk("free_consfront: error changing state to %d: %s\n",
@@ -41,8 +41,9 @@ void free_consfront(struct consfront_dev *dev)
     }
 
 close:
-    if (err) free(err);
-    xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
+    err = xenbus_unwatch_path_token(XBT_NIL, path, path);
+    free(err);
 
     mask_evtchn(dev->evtchn);
     unbind_evtchn(dev->evtchn);
@@ -58,7 +59,7 @@ close:
 struct consfront_dev *init_consfront(char *_nodename)
 {
     xenbus_transaction_t xbt;
-    char* err;
+    char* err = NULL;
     char* message=NULL;
     int retry=0;
     char* msg = NULL;
@@ -70,8 +71,10 @@ struct consfront_dev *init_consfront(char *_nodename)
 
     if (!_nodename)
         snprintf(nodename, sizeof(nodename), "device/console/%d", consfrontends);
-    else
-        strncpy(nodename, _nodename, sizeof(nodename));
+    else {
+        strncpy(nodename, _nodename, sizeof(nodename) - 1);
+        nodename[sizeof(nodename) - 1] = 0;
+    }
 
     printk("******************* CONSFRONT for %s **********\n\n\n", nodename);
 
@@ -85,7 +88,7 @@ struct consfront_dev *init_consfront(char *_nodename)
 
     snprintf(path, sizeof(path), "%s/backend-id", nodename);
     if ((res = xenbus_read_integer(path)) < 0) 
-        return NULL;
+        goto error;
     else
         dev->dom = res;
     evtchn_alloc_unbound(dev->dom, console_handle_input, dev, &dev->evtchn);
@@ -122,12 +125,6 @@ again:
         goto abort_transaction;
     }
 
-    err = xenbus_printf(xbt, nodename, "type", "%s", "ioemu");
-    if (err) {
-        message = "writing type";
-        goto abort_transaction;
-    }
-
     snprintf(path, sizeof(path), "%s/state", nodename);
     err = xenbus_switch_state(xbt, path, XenbusStateConnected);
     if (err) {
@@ -137,7 +134,7 @@ again:
 
 
     err = xenbus_transaction_end(xbt, 0, &retry);
-    if (err) free(err);
+    free(err);
     if (retry) {
             goto again;
         printk("completing transaction\n");
@@ -164,7 +161,7 @@ done:
 
     {
         XenbusState state;
-        char path[strlen(dev->backend) + 1 + 19 + 1];
+        char path[strlen(dev->backend) + strlen("/state") + 1];
         snprintf(path, sizeof(path), "%s/state", dev->backend);
         
 	xenbus_watch_path_token(XBT_NIL, path, path, &dev->events);
@@ -174,7 +171,7 @@ done:
             msg = xenbus_wait_for_state_change(path, &state, &dev->events);
         if (msg != NULL || state != XenbusStateConnected) {
             printk("backend not available, state=%d\n", state);
-            xenbus_unwatch_path_token(XBT_NIL, path, path);
+            err = xenbus_unwatch_path_token(XBT_NIL, path, path);
             goto error;
         }
     }

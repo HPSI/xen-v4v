@@ -124,10 +124,12 @@ void wake_up_all(struct waitqueue_head *wq)
 
 static void __prepare_to_wait(struct waitqueue_vcpu *wqv)
 {
-    char *cpu_info = (char *)get_cpu_info();
+    struct cpu_info *cpu_info = get_cpu_info();
     struct vcpu *curr = current;
     unsigned long dummy;
+    u32 entry_vector = cpu_info->guest_cpu_user_regs.entry_vector;
 
+    cpu_info->guest_cpu_user_regs.entry_vector &= ~TRAP_regs_partial;
     ASSERT(wqv->esp == 0);
 
     /* Save current VCPU affinity; force wakeup on *this* CPU only. */
@@ -143,7 +145,7 @@ static void __prepare_to_wait(struct waitqueue_vcpu *wqv)
         "push %%rax; push %%rbx; push %%rdx; "
         "push %%rbp; push %%r8; push %%r9; push %%r10; push %%r11; "
         "push %%r12; push %%r13; push %%r14; push %%r15; call 1f; "
-        "1: addq $2f-1b,(%%rsp); sub %%esp,%%ecx; cmp %3,%%ecx; jbe 3f; "
+        "1: addq $2f-1b,(%%rsp); sub %%esp,%%ecx; cmp %3,%%ecx; ja 3f; "
         "mov %%rsp,%%rsi; 2: rep movsb; mov %%rsp,%%rsi; 3: pop %%rax; "
         "pop %%r15; pop %%r14; pop %%r13; pop %%r12; "
         "pop %%r11; pop %%r10; pop %%r9; pop %%r8; "
@@ -157,6 +159,8 @@ static void __prepare_to_wait(struct waitqueue_vcpu *wqv)
         gdprintk(XENLOG_ERR, "Stack too large in %s\n", __FUNCTION__);
         domain_crash_synchronous();
     }
+
+    cpu_info->guest_cpu_user_regs.entry_vector = entry_vector;
 }
 
 static void __finish_wait(struct waitqueue_vcpu *wqv)
@@ -207,7 +211,7 @@ void prepare_to_wait(struct waitqueue_head *wq)
     struct vcpu *curr = current;
     struct waitqueue_vcpu *wqv = curr->waitqueue_vcpu;
 
-    ASSERT(!in_atomic());
+    ASSERT_NOT_IN_ATOMIC();
     __prepare_to_wait(wqv);
 
     ASSERT(list_empty(&wqv->list));

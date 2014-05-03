@@ -59,7 +59,7 @@ void serial_rx_interrupt(struct serial_port *port, struct cpu_user_regs *regs)
 
 void serial_tx_interrupt(struct serial_port *port, struct cpu_user_regs *regs)
 {
-    unsigned int i, n;
+    int i, n;
     unsigned long flags;
 
     local_irq_save(flags);
@@ -71,7 +71,7 @@ void serial_tx_interrupt(struct serial_port *port, struct cpu_user_regs *regs)
      */
     while ( !spin_trylock(&port->tx_lock) )
     {
-        if ( !port->driver->tx_ready(port) )
+        if ( port->driver->tx_ready(port) <= 0 )
             goto out;
         cpu_relax();
     }
@@ -111,15 +111,18 @@ static void __serial_putc(struct serial_port *port, char c)
             if ( port->tx_log_everything )
             {
                 /* Buffer is full: we spin waiting for space to appear. */
-                unsigned int n;
+                int n;
 
                 while ( (n = port->driver->tx_ready(port)) == 0 )
                     cpu_relax();
-                while ( n-- )
-                    port->driver->putc(
-                        port,
-                        port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
-                port->txbuf[mask_serial_txbuf_idx(port->txbufp++)] = c;
+                if ( n > 0 )
+                {
+                    while ( n-- )
+                        port->driver->putc(
+                            port,
+                            port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
+                    port->txbuf[mask_serial_txbuf_idx(port->txbufp++)] = c;
+                }
             }
             else
             {
@@ -130,9 +133,9 @@ static void __serial_putc(struct serial_port *port, char c)
         }
 
         if ( ((port->txbufp - port->txbufc) == 0) &&
-             port->driver->tx_ready(port) )
+             port->driver->tx_ready(port) > 0 )
         {
-            /* Buffer and UART FIFO are both empty. */
+            /* Buffer and UART FIFO are both empty, and port is available. */
             port->driver->putc(port, c);
         }
         else
@@ -143,10 +146,13 @@ static void __serial_putc(struct serial_port *port, char c)
     }
     else if ( port->driver->tx_ready )
     {
+        int n;
+
         /* Synchronous finite-capacity transmitter. */
-        while ( !port->driver->tx_ready(port) )
+        while ( !(n = port->driver->tx_ready(port)) )
             cpu_relax();
-        port->driver->putc(port, c);
+        if ( n > 0 )
+            port->driver->putc(port, c);
     }
     else
     {
@@ -271,6 +277,12 @@ int __init serial_parse_handle(char *conf)
         goto common;
     }
 
+    if ( !strncmp(conf, "dtuart", 5) )
+    {
+        handle = SERHND_DTUART;
+        goto common;
+    }
+
     if ( strncmp(conf, "com", 3) )
         goto fail;
 
@@ -384,8 +396,14 @@ void serial_start_sync(int handle)
     {
         while ( (port->txbufp - port->txbufc) != 0 )
         {
-            while ( !port->driver->tx_ready(port) )
+            int n;
+
+            while ( !(n = port->driver->tx_ready(port)) )
                 cpu_relax();
+            if ( n < 0 )
+                /* port is unavailable and might not come up until reenabled by
+                   dom0, we can't really do proper sync */
+                break;
             port->driver->putc(
                 port, port->txbuf[mask_serial_txbuf_idx(port->txbufc++)]);
         }
@@ -482,6 +500,24 @@ int __init serial_irq(int idx)
     return -1;
 }
 
+const struct dt_irq __init *serial_dt_irq(int idx)
+{
+    if ( (idx >= 0) && (idx < ARRAY_SIZE(com)) &&
+         com[idx].driver && com[idx].driver->dt_irq_get )
+        return com[idx].driver->dt_irq_get(&com[idx]);
+
+    return NULL;
+}
+
+const struct vuart_info *serial_vuart_info(int idx)
+{
+    if ( (idx >= 0) && (idx < ARRAY_SIZE(com)) &&
+         com[idx].driver && com[idx].driver->vuart_info )
+        return com[idx].driver->vuart_info(&com[idx]);
+
+    return NULL;
+}
+
 void serial_suspend(void)
 {
     int i;
@@ -522,7 +558,7 @@ void __init serial_async_transmit(struct serial_port *port)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

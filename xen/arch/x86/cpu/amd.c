@@ -30,8 +30,16 @@
  * "fam_10_rev_c"
  * "fam_11_rev_b"
  */
-static char opt_famrev[14];
+static char __initdata opt_famrev[14];
 string_param("cpuid_mask_cpu", opt_famrev);
+
+static unsigned int __initdata opt_cpuid_mask_l7s0_eax = ~0u;
+integer_param("cpuid_mask_l7s0_eax", opt_cpuid_mask_l7s0_eax);
+static unsigned int __initdata opt_cpuid_mask_l7s0_ebx = ~0u;
+integer_param("cpuid_mask_l7s0_ebx", opt_cpuid_mask_l7s0_ebx);
+
+static unsigned int __initdata opt_cpuid_mask_thermal_ecx = ~0u;
+integer_param("cpuid_mask_thermal_ecx", opt_cpuid_mask_thermal_ecx);
 
 /* 1 = allow, 0 = don't allow guest creation, -1 = don't allow boot */
 s8 __read_mostly opt_allow_unsafe;
@@ -83,6 +91,51 @@ static inline int wrmsr_amd_safe(unsigned int msr, unsigned int lo,
 	return err;
 }
 
+static const struct cpuidmask {
+	uint16_t fam;
+	char rev[2];
+	unsigned int ecx, edx, ext_ecx, ext_edx;
+} pre_canned[] __initconst = {
+#define CAN(fam, id, rev) { \
+		fam, #rev, \
+		AMD_FEATURES_##id##_REV_##rev##_ECX, \
+		AMD_FEATURES_##id##_REV_##rev##_EDX, \
+		AMD_EXTFEATURES_##id##_REV_##rev##_ECX, \
+		AMD_EXTFEATURES_##id##_REV_##rev##_EDX \
+	}
+#define CAN_FAM(fam, rev) CAN(0x##fam, FAM##fam##h, rev)
+#define CAN_K8(rev)       CAN(0x0f,    K8,          rev)
+	CAN_FAM(11, B),
+	CAN_FAM(10, C),
+	CAN_FAM(10, B),
+	CAN_K8(G),
+	CAN_K8(F),
+	CAN_K8(E),
+	CAN_K8(D),
+	CAN_K8(C)
+#undef CAN
+};
+
+static const struct cpuidmask *__init noinline get_cpuidmask(const char *opt)
+{
+	unsigned long fam;
+	char rev;
+	unsigned int i;
+
+	if (strncmp(opt, "fam_", 4))
+		return NULL;
+	fam = simple_strtoul(opt + 4, &opt, 16);
+	if (strncmp(opt, "_rev_", 5) || !opt[5] || opt[6])
+		return NULL;
+	rev = toupper(opt[5]);
+
+	for (i = 0; i < ARRAY_SIZE(pre_canned); ++i)
+		if (fam == pre_canned[i].fam && rev == *pre_canned[i].rev)
+			return &pre_canned[i];
+
+	return NULL;
+}
+
 /*
  * Mask the features and extended features returned by CPUID.  Parameters are
  * set from the boot line via two methods:
@@ -96,7 +149,11 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
 {
 	static unsigned int feat_ecx, feat_edx;
 	static unsigned int extfeat_ecx, extfeat_edx;
+	static unsigned int l7s0_eax, l7s0_ebx;
+	static unsigned int thermal_ecx;
+	static bool_t skip_l7s0_eax_ebx, skip_thermal_ecx;
 	static enum { not_parsed, no_mask, set_mask } status;
+	unsigned int eax, ebx, ecx, edx;
 
 	if (status == no_mask)
 		return;
@@ -104,61 +161,38 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
 	if (status == set_mask)
 		goto setmask;
 
-	ASSERT((status == not_parsed) && (smp_processor_id() == 0));
+	ASSERT((status == not_parsed) && (c == &boot_cpu_data));
 	status = no_mask;
 
+	/* Fam11 doesn't support masking at all. */
+	if (c->x86 == 0x11)
+		return;
+
 	if (~(opt_cpuid_mask_ecx & opt_cpuid_mask_edx &
-	      opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx)) {
+	      opt_cpuid_mask_ext_ecx & opt_cpuid_mask_ext_edx &
+	      opt_cpuid_mask_l7s0_eax & opt_cpuid_mask_l7s0_ebx &
+	      opt_cpuid_mask_thermal_ecx)) {
 		feat_ecx = opt_cpuid_mask_ecx;
 		feat_edx = opt_cpuid_mask_edx;
 		extfeat_ecx = opt_cpuid_mask_ext_ecx;
 		extfeat_edx = opt_cpuid_mask_ext_edx;
+		l7s0_eax = opt_cpuid_mask_l7s0_eax;
+		l7s0_ebx = opt_cpuid_mask_l7s0_ebx;
+		thermal_ecx = opt_cpuid_mask_thermal_ecx;
 	} else if (*opt_famrev == '\0') {
 		return;
-	} else if (!strcmp(opt_famrev, "fam_0f_rev_c")) {
-		feat_ecx = AMD_FEATURES_K8_REV_C_ECX;
-		feat_edx = AMD_FEATURES_K8_REV_C_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_K8_REV_C_ECX;
-		extfeat_edx = AMD_EXTFEATURES_K8_REV_C_EDX;
-	} else if (!strcmp(opt_famrev, "fam_0f_rev_d")) {
-		feat_ecx = AMD_FEATURES_K8_REV_D_ECX;
-		feat_edx = AMD_FEATURES_K8_REV_D_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_K8_REV_D_ECX;
-		extfeat_edx = AMD_EXTFEATURES_K8_REV_D_EDX;
-	} else if (!strcmp(opt_famrev, "fam_0f_rev_e")) {
-		feat_ecx = AMD_FEATURES_K8_REV_E_ECX;
-		feat_edx = AMD_FEATURES_K8_REV_E_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_K8_REV_E_ECX;
-		extfeat_edx = AMD_EXTFEATURES_K8_REV_E_EDX;
-	} else if (!strcmp(opt_famrev, "fam_0f_rev_f")) {
-		feat_ecx = AMD_FEATURES_K8_REV_F_ECX;
-		feat_edx = AMD_FEATURES_K8_REV_F_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_K8_REV_F_ECX;
-		extfeat_edx = AMD_EXTFEATURES_K8_REV_F_EDX;
-	} else if (!strcmp(opt_famrev, "fam_0f_rev_g")) {
-		feat_ecx = AMD_FEATURES_K8_REV_G_ECX;
-		feat_edx = AMD_FEATURES_K8_REV_G_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_K8_REV_G_ECX;
-		extfeat_edx = AMD_EXTFEATURES_K8_REV_G_EDX;
-	} else if (!strcmp(opt_famrev, "fam_10_rev_b")) {
-		feat_ecx = AMD_FEATURES_FAM10h_REV_B_ECX;
-		feat_edx = AMD_FEATURES_FAM10h_REV_B_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_FAM10h_REV_B_ECX;
-		extfeat_edx = AMD_EXTFEATURES_FAM10h_REV_B_EDX;
-	} else if (!strcmp(opt_famrev, "fam_10_rev_c")) {
-		feat_ecx = AMD_FEATURES_FAM10h_REV_C_ECX;
-		feat_edx = AMD_FEATURES_FAM10h_REV_C_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_FAM10h_REV_C_ECX;
-		extfeat_edx = AMD_EXTFEATURES_FAM10h_REV_C_EDX;
-	} else if (!strcmp(opt_famrev, "fam_11_rev_b")) {
-		feat_ecx = AMD_FEATURES_FAM11h_REV_B_ECX;
-		feat_edx = AMD_FEATURES_FAM11h_REV_B_EDX;
-		extfeat_ecx = AMD_EXTFEATURES_FAM11h_REV_B_ECX;
-		extfeat_edx = AMD_EXTFEATURES_FAM11h_REV_B_EDX;
 	} else {
-		printk("Invalid processor string: %s\n", opt_famrev);
-		printk("CPUID will not be masked\n");
-		return;
+		const struct cpuidmask *m = get_cpuidmask(opt_famrev);
+
+		if (!m) {
+			printk("Invalid processor string: %s\n", opt_famrev);
+			printk("CPUID will not be masked\n");
+			return;
+		}
+		feat_ecx = m->ecx;
+		feat_edx = m->edx;
+		extfeat_ecx = m->ext_ecx;
+		extfeat_edx = m->ext_edx;
 	}
 
         /* Setting bits in the CPUID mask MSR that are not set in the
@@ -175,12 +209,39 @@ static void __devinit set_cpuidmask(const struct cpuinfo_x86 *c)
 	printk("Writing CPUID extended feature mask ECX:EDX -> %08Xh:%08Xh\n", 
 	       extfeat_ecx, extfeat_edx);
 
+	if (c->cpuid_level >= 7)
+		cpuid_count(7, 0, &eax, &ebx, &ecx, &edx);
+	else
+		ebx = eax = 0;
+	if ((eax | ebx) && ~(l7s0_eax & l7s0_ebx)) {
+		if (l7s0_eax > eax)
+			l7s0_eax = eax;
+		l7s0_ebx &= ebx;
+		printk("Writing CPUID leaf 7 subleaf 0 feature mask EAX:EBX -> %08Xh:%08Xh\n",
+		       l7s0_eax, l7s0_ebx);
+	} else
+		skip_l7s0_eax_ebx = 1;
+
+	/* Only Fam15 has the respective MSR. */
+	ecx = c->x86 == 0x15 && c->cpuid_level >= 6 ? cpuid_ecx(6) : 0;
+	if (ecx && ~thermal_ecx) {
+		thermal_ecx &= ecx;
+		printk("Writing CPUID thermal/power feature mask ECX -> %08Xh\n",
+		       thermal_ecx);
+	} else
+		skip_thermal_ecx = 1;
+
  setmask:
-	/* FIXME check if processor supports CPUID masking */
 	/* AMD processors prior to family 10h required a 32-bit password */
 	if (c->x86 >= 0x10) {
 		wrmsr(MSR_K8_FEATURE_MASK, feat_edx, feat_ecx);
 		wrmsr(MSR_K8_EXT_FEATURE_MASK, extfeat_edx, extfeat_ecx);
+		if (!skip_l7s0_eax_ebx)
+			wrmsr(MSR_AMD_L7S0_FEATURE_MASK, l7s0_ebx, l7s0_eax);
+		if (!skip_thermal_ecx) {
+			rdmsr(MSR_AMD_THRM_FEATURE_MASK, eax, edx);
+			wrmsr(MSR_AMD_THRM_FEATURE_MASK, thermal_ecx, edx);
+		}
 	} else {
 		wrmsr_amd(MSR_K8_FEATURE_MASK, feat_edx, feat_ecx);
 		wrmsr_amd(MSR_K8_EXT_FEATURE_MASK, extfeat_edx, extfeat_ecx);
@@ -399,13 +460,9 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 		 * revision D (model = 0x14) and later actually support it.
 		 * (AMD Erratum #110, docId: 25759).
 		 */
-		unsigned int lo, hi;
-
 		clear_bit(X86_FEATURE_LAHF_LM, c->x86_capability);
-		if (!rdmsr_amd_safe(0xc001100d, &lo, &hi)) {
-			hi &= ~1;
-			wrmsr_amd_safe(0xc001100d, lo, hi);
-		}
+		if (!rdmsr_amd_safe(0xc001100d, &l, &h))
+			wrmsr_amd_safe(0xc001100d, l, h & ~1);
 	}
 
 	switch(c->x86)
@@ -419,11 +476,11 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 
 	display_cacheinfo(c);
 
-	if (cpuid_eax(0x80000000) >= 0x80000008) {
+	if (c->extended_cpuid_level >= 0x80000008) {
 		c->x86_max_cores = (cpuid_ecx(0x80000008) & 0xff) + 1;
 	}
 
-	if (cpuid_eax(0x80000000) >= 0x80000007) {
+	if (c->extended_cpuid_level >= 0x80000007) {
 		c->x86_power = cpuid_edx(0x80000007);
 		if (c->x86_power & (1<<8)) {
 			set_bit(X86_FEATURE_CONSTANT_TSC, c->x86_capability);
@@ -448,6 +505,14 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 		}
 	}
 
+	/*
+	 * The way access filter has a performance penalty on some workloads.
+	 * Disable it on the affected CPUs.
+	 */
+	if (c->x86 == 0x15 && c->x86_model >= 0x02 && c->x86_model < 0x20 &&
+	    !rdmsr_safe(MSR_AMD64_IC_CFG, value) && (value & 0x1e) != 0x1e)
+		wrmsr_safe(MSR_AMD64_IC_CFG, value | 0x1e);
+
         amd_get_topology(c);
 
 	/* Pointless to use MWAIT on Family10 as it does not deep sleep. */
@@ -457,7 +522,7 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 	if (!cpu_has_amd_erratum(c, AMD_ERRATUM_121))
 		opt_allow_unsafe = 1;
 	else if (opt_allow_unsafe < 0)
-		panic("Xen will not boot on this CPU for security reasons.\n"
+		panic("Xen will not boot on this CPU for security reasons"
 		      "Pass \"allow_unsafe\" if you're trusting all your"
 		      " (PV) guest kernels.\n");
 	else if (!opt_allow_unsafe && c == &boot_cpu_data)
@@ -468,6 +533,39 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 		       "*** Pass \"allow_unsafe\" if you're trusting"
 		       " all your (PV) guest kernels. ***\n");
 
+	if (c->x86 == 0x16 && c->x86_model <= 0xf) {
+		if (c == &boot_cpu_data) {
+			l = pci_conf_read32(0, 0, 0x18, 0x3, 0x58);
+			h = pci_conf_read32(0, 0, 0x18, 0x3, 0x5c);
+			if ((l & 0x1f) | (h & 0x1))
+				printk(KERN_WARNING
+				       "Applying workaround for erratum 792: %s%s%s\n",
+				       (l & 0x1f) ? "clearing D18F3x58[4:0]" : "",
+				       ((l & 0x1f) && (h & 0x1)) ? " and " : "",
+				       (h & 0x1) ? "clearing D18F3x5C[0]" : "");
+
+			if (l & 0x1f)
+				pci_conf_write32(0, 0, 0x18, 0x3, 0x58,
+						 l & ~0x1f);
+
+			if (h & 0x1)
+				pci_conf_write32(0, 0, 0x18, 0x3, 0x5c,
+						 h & ~0x1);
+		}
+
+		rdmsrl(MSR_AMD64_LS_CFG, value);
+		if (!(value & (1 << 15))) {
+			static bool_t warned;
+
+			if (c == &boot_cpu_data || opt_cpu_info ||
+			    !test_and_set_bool(warned))
+				printk(KERN_WARNING
+				       "CPU%u: Applying workaround for erratum 793\n",
+				       smp_processor_id());
+			wrmsrl(MSR_AMD64_LS_CFG, value | (1 << 15));
+		}
+	}
+
 	/* AMD CPUs do not support SYSENTER outside of legacy mode. */
 	clear_bit(X86_FEATURE_SEP, c->x86_capability);
 
@@ -477,13 +575,24 @@ static void __devinit init_amd(struct cpuinfo_x86 *c)
 			check_enable_amd_mmconf_dmi();
 
 		fam10h_check_enable_mmcfg();
+
+		/*
+		 * On family 10h BIOS may not have properly enabled WC+
+		 * support, causing it to be converted to CD memtype. This may
+		 * result in performance degradation for certain nested-paging
+		 * guests. Prevent this conversion by clearing bit 24 in
+		 * MSR_F10_BU_CFG2.
+		 */
+		rdmsrl(MSR_F10_BU_CFG2, value);
+		value &= ~(1ULL << 24);
+		wrmsrl(MSR_F10_BU_CFG2, value);
 	}
 
 	/*
 	 * Family 0x12 and above processors have APIC timer
 	 * running in deep C states.
 	 */
-	if (c->x86 > 0x11)
+	if ( opt_arat && c->x86 > 0x11 )
 		set_bit(X86_FEATURE_ARAT, c->x86_capability);
 
 	/*

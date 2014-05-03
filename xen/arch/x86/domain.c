@@ -71,8 +71,6 @@ void (*dead_idle) (void) __read_mostly = default_dead_idle;
 static void paravirt_ctxt_switch_from(struct vcpu *v);
 static void paravirt_ctxt_switch_to(struct vcpu *v);
 
-static void vcpu_destroy_pagetables(struct vcpu *v);
-
 static void default_idle(void)
 {
     local_irq_disable();
@@ -135,14 +133,15 @@ void startup_cpu_idle_loop(void)
     reset_stack_and_jump(idle_loop);
 }
 
-static void continue_idle_domain(struct vcpu *v)
+static void noreturn continue_idle_domain(struct vcpu *v)
 {
     reset_stack_and_jump(idle_loop);
 }
 
-static void continue_nonidle_domain(struct vcpu *v)
+static void noreturn continue_nonidle_domain(struct vcpu *v)
 {
     check_wakeup_from_wait();
+    mark_regs_dirty(guest_cpu_user_regs());
     reset_stack_and_jump(ret_from_intr);
 }
 
@@ -168,7 +167,7 @@ void dump_pageframe_info(struct domain *d)
         spin_unlock(&d->page_alloc_lock);
     }
 
-    if ( is_hvm_domain(d) )
+    if ( has_hvm_container_domain(d) )
         p2m_pod_dump_data(d);
 
     spin_lock(&d->page_alloc_lock);
@@ -181,6 +180,28 @@ void dump_pageframe_info(struct domain *d)
     spin_unlock(&d->page_alloc_lock);
 }
 
+/*
+ * The hole may be at or above the 44-bit boundary, so we need to determine
+ * the total bit count until reaching 32 significant (not squashed out) bits
+ * in PFN representations.
+ * Note that the way "bits" gets initialized/updated/bounds-checked guarantees
+ * that the function will never return zero, and hence will never be called
+ * more than once (which is important due to it being deliberately placed in
+ * .init.text).
+ */
+static unsigned int __init noinline _domain_struct_bits(void)
+{
+    unsigned int bits = 32 + PAGE_SHIFT;
+    unsigned int sig = hweight32(~pfn_hole_mask);
+    unsigned int mask = pfn_hole_mask >> 32;
+
+    for ( ; bits < BITS_PER_LONG && sig < 32; ++bits, mask >>= 1 )
+        if ( !(mask & 1) )
+            ++sig;
+
+    return bits;
+}
+
 struct domain *alloc_domain_struct(void)
 {
     struct domain *d;
@@ -188,7 +209,10 @@ struct domain *alloc_domain_struct(void)
      * We pack the PDX of the domain structure into a 32-bit field within
      * the page_info structure. Hence the MEMF_bits() restriction.
      */
-    unsigned int bits = 32 + PAGE_SHIFT + pfn_pdx_hole_shift;
+    static unsigned int __read_mostly bits;
+
+    if ( unlikely(!bits) )
+         bits = _domain_struct_bits();
 
     BUILD_BUG_ON(sizeof(*d) > PAGE_SIZE);
     d = alloc_xenheap_pages(0, MEMF_bits(bits));
@@ -288,14 +312,10 @@ static int setup_compat_l4(struct vcpu *v)
     /* This page needs to look like a pagetable so that it can be shadowed */
     pg->u.inuse.type_info = PGT_l4_page_table|PGT_validated|1;
 
-    l4tab = page_to_virt(pg);
-    copy_page(l4tab, idle_pg_table);
-    l4tab[0] = l4e_empty();
-    l4tab[l4_table_offset(LINEAR_PT_VIRT_START)] =
-        l4e_from_page(pg, __PAGE_HYPERVISOR);
-    l4tab[l4_table_offset(PERDOMAIN_VIRT_START)] =
-        l4e_from_paddr(__pa(v->domain->arch.mm_perdomain_l3),
-                       __PAGE_HYPERVISOR);
+    l4tab = __map_domain_page(pg);
+    clear_page(l4tab);
+    init_guest_l4_table(l4tab, v->domain);
+    unmap_domain_page(l4tab);
 
     v->arch.guest_table = pagetable_from_page(pg);
     v->arch.guest_table_user = v->arch.guest_table;
@@ -344,6 +364,14 @@ int switch_compat(struct domain *d)
 
     if ( d == NULL )
         return -EINVAL;
+
+    if ( is_pvh_domain(d) )
+    {
+        printk(XENLOG_G_INFO
+               "Xen currently does not support 32bit PVH guests\n");
+        return -EINVAL;
+    }
+
     if ( !may_switch_mode(d) )
         return -EACCES;
     if ( is_pv_32on64_domain(d) )
@@ -372,75 +400,53 @@ int switch_compat(struct domain *d)
     return -ENOMEM;
 }
 
-static inline bool_t standalone_trap_ctxt(struct vcpu *v)
-{
-    BUILD_BUG_ON(NR_VECTORS * sizeof(*v->arch.pv_vcpu.trap_ctxt) > PAGE_SIZE);
-    return NR_VECTORS * sizeof(*v->arch.pv_vcpu.trap_ctxt) + sizeof(*v)
-           > PAGE_SIZE;
-}
-
 int vcpu_initialise(struct vcpu *v)
 {
     struct domain *d = v->domain;
-    unsigned int idx;
     int rc;
 
     v->arch.flags = TF_kernel_mode;
 
-    idx = perdomain_pt_pgidx(v);
-    if ( !perdomain_pt_page(d, idx) )
-    {
-        struct page_info *pg;
-        pg = alloc_domheap_page(NULL, MEMF_node(vcpu_to_node(v)));
-        if ( !pg )
-            return -ENOMEM;
-        clear_page(page_to_virt(pg));
-        perdomain_pt_page(d, idx) = pg;
-        d->arch.mm_perdomain_l2[l2_table_offset(PERDOMAIN_VIRT_START)+idx]
-            = l2e_from_page(pg, __PAGE_HYPERVISOR);
-    }
+    rc = mapcache_vcpu_init(v);
+    if ( rc )
+        return rc;
 
     paging_vcpu_init(v);
-
-    v->arch.perdomain_ptes = perdomain_ptes(d, v);
 
     if ( (rc = vcpu_init_fpu(v)) != 0 )
         return rc;
 
     vmce_init_vcpu(v);
 
-    if ( is_hvm_domain(d) )
+    if ( has_hvm_container_domain(d) )
     {
         rc = hvm_vcpu_initialise(v);
         goto done;
     }
 
-    v->arch.pv_vcpu.vcpu_info_mfn = INVALID_MFN;
 
     spin_lock_init(&v->arch.pv_vcpu.shadow_ldt_lock);
 
     if ( !is_idle_domain(d) )
     {
-        if ( standalone_trap_ctxt(v) )
+        rc = create_perdomain_mapping(d, GDT_VIRT_START(v),
+                                      1 << GDT_LDT_VCPU_SHIFT,
+                                      d->arch.pv_domain.gdt_ldt_l1tab, NULL);
+        if ( rc )
+            goto done;
+
+        BUILD_BUG_ON(NR_VECTORS * sizeof(*v->arch.pv_vcpu.trap_ctxt) >
+                     PAGE_SIZE);
+        v->arch.pv_vcpu.trap_ctxt = xzalloc_array(struct trap_info,
+                                                  NR_VECTORS);
+        if ( !v->arch.pv_vcpu.trap_ctxt )
         {
-            v->arch.pv_vcpu.trap_ctxt = alloc_xenheap_page();
-            if ( !v->arch.pv_vcpu.trap_ctxt )
-            {
-                rc = -ENOMEM;
-                goto done;
-            }
-            clear_page(v->arch.pv_vcpu.trap_ctxt);
+            rc = -ENOMEM;
+            goto done;
         }
-        else
-            v->arch.pv_vcpu.trap_ctxt = (void *)v + PAGE_SIZE -
-                NR_VECTORS * sizeof(*v->arch.pv_vcpu.trap_ctxt);
 
         /* PV guests by default have a 100Hz ticker. */
         v->periodic_period = MILLISECS(10);
-
-        /* PV guests get an emulated PIT too for video BIOSes to use. */
-        if ( v->vcpu_id == 0 )
-            pit_init(v, cpu_khz);
     }
 
     v->arch.schedule_tail = continue_nonidle_domain;
@@ -461,8 +467,8 @@ int vcpu_initialise(struct vcpu *v)
     {
         vcpu_destroy_fpu(v);
 
-        if ( !is_hvm_domain(d) && standalone_trap_ctxt(v) )
-            free_xenheap_page(v->arch.pv_vcpu.trap_ctxt);
+        if ( is_pv_domain(d) )
+            xfree(v->arch.pv_vcpu.trap_ctxt);
     }
 
     return rc;
@@ -475,20 +481,19 @@ void vcpu_destroy(struct vcpu *v)
 
     vcpu_destroy_fpu(v);
 
-    if ( is_hvm_vcpu(v) )
+    if ( has_hvm_container_vcpu(v) )
         hvm_vcpu_destroy(v);
-    else if ( standalone_trap_ctxt(v) )
-        free_xenheap_page(v->arch.pv_vcpu.trap_ctxt);
+    else
+        xfree(v->arch.pv_vcpu.trap_ctxt);
 }
 
 int arch_domain_create(struct domain *d, unsigned int domcr_flags)
 {
-    struct page_info *pg;
     int i, paging_initialised = 0;
     int rc = -ENOMEM;
 
     d->arch.hvm_domain.hap_enabled =
-        is_hvm_domain(d) &&
+        has_hvm_container_domain(d) &&
         hvm_funcs.hap_supported &&
         (domcr_flags & DOMCRF_hap);
     d->arch.hvm_domain.mem_sharing_enabled = 0;
@@ -514,31 +519,29 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
                d->domain_id);
     }
 
-    BUILD_BUG_ON(PDPT_L2_ENTRIES * sizeof(*d->arch.mm_perdomain_pt_pages)
-                 != PAGE_SIZE);
-    pg = alloc_domheap_page(NULL, MEMF_node(domain_to_node(d)));
-    if ( !pg )
-        goto fail;
-    d->arch.mm_perdomain_pt_pages = page_to_virt(pg);
-    clear_page(d->arch.mm_perdomain_pt_pages);
+    if ( has_hvm_container_domain(d) )
+        rc = create_perdomain_mapping(d, PERDOMAIN_VIRT_START, 0, NULL, NULL);
+    else if ( is_idle_domain(d) )
+        rc = 0;
+    else
+    {
+        d->arch.pv_domain.gdt_ldt_l1tab =
+            alloc_xenheap_pages(0, MEMF_node(domain_to_node(d)));
+        if ( !d->arch.pv_domain.gdt_ldt_l1tab )
+            goto fail;
+        clear_page(d->arch.pv_domain.gdt_ldt_l1tab);
 
-    pg = alloc_domheap_page(NULL, MEMF_node(domain_to_node(d)));
-    if ( pg == NULL )
+        rc = create_perdomain_mapping(d, GDT_LDT_VIRT_START,
+                                      GDT_LDT_MBYTES << (20 - PAGE_SHIFT),
+                                      NULL, NULL);
+    }
+    if ( rc )
         goto fail;
-    d->arch.mm_perdomain_l2 = page_to_virt(pg);
-    clear_page(d->arch.mm_perdomain_l2);
 
-    pg = alloc_domheap_page(NULL, MEMF_node(domain_to_node(d)));
-    if ( pg == NULL )
-        goto fail;
-    d->arch.mm_perdomain_l3 = page_to_virt(pg);
-    clear_page(d->arch.mm_perdomain_l3);
-    d->arch.mm_perdomain_l3[l3_table_offset(PERDOMAIN_VIRT_START)] =
-        l3e_from_page(virt_to_page(d->arch.mm_perdomain_l2),
-                            __PAGE_HYPERVISOR);
+    mapcache_domain_init(d);
 
     HYPERVISOR_COMPAT_VIRT_START(d) =
-        is_hvm_domain(d) ? ~0u : __HYPERVISOR_COMPAT_VIRT_START;
+        is_pv_domain(d) ? __HYPERVISOR_COMPAT_VIRT_START : ~0u;
 
     if ( (rc = paging_domain_init(d, domcr_flags)) != 0 )
         goto fail;
@@ -579,8 +582,9 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
         if ( (rc = iommu_domain_init(d)) != 0 )
             goto fail;
     }
+    spin_lock_init(&d->arch.e820_lock);
 
-    if ( is_hvm_domain(d) )
+    if ( has_hvm_container_domain(d) )
     {
         if ( (rc = hvm_domain_initialise(d)) != 0 )
         {
@@ -589,16 +593,15 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
         }
     }
     else
-    {
         /* 64-bit PV guest by default. */
         d->arch.is_32bit_pv = d->arch.has_32bit_shinfo = 0;
-
-        spin_lock_init(&d->arch.pv_domain.e820_lock);
-    }
 
     /* initialize default tsc behavior in case tools don't */
     tsc_set_info(d, TSC_MODE_DEFAULT, 0UL, 0, 0);
     spin_lock_init(&d->arch.vtsc_lock);
+
+    /* PV/PVH guests get an emulated PIT too for video BIOSes to use. */
+    pit_init(d, cpu_khz);
 
     return 0;
 
@@ -608,23 +611,18 @@ int arch_domain_create(struct domain *d, unsigned int domcr_flags)
     free_xenheap_page(d->shared_info);
     if ( paging_initialised )
         paging_final_teardown(d);
-    if ( d->arch.mm_perdomain_l2 )
-        free_domheap_page(virt_to_page(d->arch.mm_perdomain_l2));
-    if ( d->arch.mm_perdomain_l3 )
-        free_domheap_page(virt_to_page(d->arch.mm_perdomain_l3));
-    if ( d->arch.mm_perdomain_pt_pages )
-        free_domheap_page(virt_to_page(d->arch.mm_perdomain_pt_pages));
+    free_perdomain_mappings(d);
+    if ( is_pv_domain(d) )
+        free_xenheap_page(d->arch.pv_domain.gdt_ldt_l1tab);
     return rc;
 }
 
 void arch_domain_destroy(struct domain *d)
 {
-    unsigned int i;
-
-    if ( is_hvm_domain(d) )
+    if ( has_hvm_container_domain(d) )
         hvm_domain_destroy(d);
-    else
-        xfree(d->arch.pv_domain.e820);
+
+    xfree(d->arch.e820);
 
     free_domain_pirqs(d);
     if ( !is_idle_domain(d) )
@@ -632,14 +630,9 @@ void arch_domain_destroy(struct domain *d)
 
     paging_final_teardown(d);
 
-    for ( i = 0; i < PDPT_L2_ENTRIES; ++i )
-    {
-        if ( perdomain_pt_page(d, i) )
-            free_domheap_page(perdomain_pt_page(d, i));
-    }
-    free_domheap_page(virt_to_page(d->arch.mm_perdomain_pt_pages));
-    free_domheap_page(virt_to_page(d->arch.mm_perdomain_l2));
-    free_domheap_page(virt_to_page(d->arch.mm_perdomain_l3));
+    free_perdomain_mappings(d);
+    if ( is_pv_domain(d) )
+        free_xenheap_page(d->arch.pv_domain.gdt_ldt_l1tab);
 
     free_xenheap_page(d->shared_info);
     cleanup_domain_irq_mapping(d);
@@ -654,13 +647,13 @@ unsigned long pv_guest_cr4_fixup(const struct vcpu *v, unsigned long guest_cr4)
         hv_cr4_mask &= ~X86_CR4_DE;
     if ( cpu_has_fsgsbase && !is_pv_32bit_domain(v->domain) )
         hv_cr4_mask &= ~X86_CR4_FSGSBASE;
-    if ( xsave_enabled(v) )
+    if ( cpu_has_xsave )
         hv_cr4_mask &= ~X86_CR4_OSXSAVE;
 
     if ( (guest_cr4 & hv_cr4_mask) != (hv_cr4 & hv_cr4_mask) )
-        gdprintk(XENLOG_WARNING,
-                 "Attempt to change CR4 flags %08lx -> %08lx\n",
-                 hv_cr4, guest_cr4);
+        printk(XENLOG_G_WARNING
+               "d%d attempted to change %pv's CR4 flags %08lx -> %08lx\n",
+               current->domain->domain_id, v, hv_cr4, guest_cr4);
 
     return (hv_cr4 & hv_cr4_mask) | (guest_cr4 & ~hv_cr4_mask);
 }
@@ -689,7 +682,7 @@ int arch_set_info_guest(
 #define c(fld) (compat ? (c.cmp->fld) : (c.nat->fld))
     flags = c(flags);
 
-    if ( !is_hvm_vcpu(v) )
+    if ( is_pv_vcpu(v) )
     {
         if ( !compat )
         {
@@ -710,12 +703,7 @@ int arch_set_info_guest(
                 fixup_guest_code_selector(d, c.nat->trap_ctxt[i].cs);
             }
 
-            /* LDT safety checks. */
-            if ( ((c.nat->ldt_base & (PAGE_SIZE-1)) != 0) ||
-                 (c.nat->ldt_ents > 8192) ||
-                 !array_access_ok(c.nat->ldt_base,
-                                  c.nat->ldt_ents,
-                                  LDT_ENTRY_SIZE) )
+            if ( !__addr_ok(c.nat->ldt_base) )
                 return -EINVAL;
         }
         else
@@ -728,30 +716,47 @@ int arch_set_info_guest(
 
             for ( i = 0; i < ARRAY_SIZE(c.cmp->trap_ctxt); i++ )
                 fixup_guest_code_selector(d, c.cmp->trap_ctxt[i].cs);
-
-            /* LDT safety checks. */
-            if ( ((c.cmp->ldt_base & (PAGE_SIZE-1)) != 0) ||
-                 (c.cmp->ldt_ents > 8192) ||
-                 !compat_array_access_ok(c.cmp->ldt_base,
-                                         c.cmp->ldt_ents,
-                                         LDT_ENTRY_SIZE) )
-                return -EINVAL;
         }
+
+        /* LDT safety checks. */
+        if ( ((c(ldt_base) & (PAGE_SIZE - 1)) != 0) ||
+             (c(ldt_ents) > 8192) )
+            return -EINVAL;
+    }
+    else if ( is_pvh_vcpu(v) )
+    {
+        /* PVH 32bitfixme */
+        ASSERT(!compat);
+
+        if ( c(ctrlreg[0]) || c(ctrlreg[1]) || c(ctrlreg[2]) ||
+             c(ctrlreg[4]) || c(ctrlreg[5]) || c(ctrlreg[6]) ||
+             c(ctrlreg[7]) ||  c(ldt_base) || c(ldt_ents) ||
+             c(user_regs.cs) || c(user_regs.ss) || c(user_regs.es) ||
+             c(user_regs.ds) || c(user_regs.fs) || c(user_regs.gs) ||
+             c(kernel_ss) || c(kernel_sp) || c.nat->gs_base_kernel ||
+             c.nat->gdt_ents || c.nat->fs_base || c.nat->gs_base_user )
+            return -EINVAL;
     }
 
     v->fpu_initialised = !!(flags & VGCF_I387_VALID);
 
     v->arch.flags &= ~TF_kernel_mode;
-    if ( (flags & VGCF_in_kernel) || is_hvm_vcpu(v)/*???*/ )
+    if ( (flags & VGCF_in_kernel) || has_hvm_container_vcpu(v)/*???*/ )
         v->arch.flags |= TF_kernel_mode;
 
     v->arch.vgc_flags = flags;
 
-    memcpy(v->arch.fpu_ctxt, &c.nat->fpu_ctxt, sizeof(c.nat->fpu_ctxt));
+    if ( flags & VGCF_I387_VALID )
+    {
+        memcpy(v->arch.fpu_ctxt, &c.nat->fpu_ctxt, sizeof(c.nat->fpu_ctxt));
+        if ( v->arch.xsave_area )
+             v->arch.xsave_area->xsave_hdr.xstate_bv = XSTATE_FP_SSE;
+    }
+
     if ( !compat )
     {
         memcpy(&v->arch.user_regs, &c.nat->user_regs, sizeof(c.nat->user_regs));
-        if ( !is_hvm_vcpu(v) )
+        if ( is_pv_vcpu(v) )
             memcpy(v->arch.pv_vcpu.trap_ctxt, c.nat->trap_ctxt,
                    sizeof(c.nat->trap_ctxt));
     }
@@ -762,15 +767,28 @@ int arch_set_info_guest(
             XLAT_trap_info(v->arch.pv_vcpu.trap_ctxt + i,
                            c.cmp->trap_ctxt + i);
     }
-    for ( i = 0; i < ARRAY_SIZE(v->arch.debugreg); ++i )
-        v->arch.debugreg[i] = c(debugreg[i]);
 
-    v->arch.user_regs.eflags |= 2;
-
-    if ( is_hvm_vcpu(v) )
+    if ( has_hvm_container_vcpu(v) )
     {
+        for ( i = 0; i < ARRAY_SIZE(v->arch.debugreg); ++i )
+            v->arch.debugreg[i] = c(debugreg[i]);
+
         hvm_set_info_guest(v);
-        goto out;
+
+        if ( is_hvm_vcpu(v) || v->is_initialised )
+            goto out;
+
+        /* NB: No need to use PV cr3 un-pickling macros */
+        cr3_gfn = c(ctrlreg[3]) >> PAGE_SHIFT;
+        cr3_page = get_page_from_gfn(d, cr3_gfn, NULL, P2M_ALLOC);
+
+        v->arch.cr3 = page_to_maddr(cr3_page);
+        v->arch.hvm_vcpu.guest_cr[3] = c.nat->ctrlreg[3];
+        v->arch.guest_table = pagetable_from_page(cr3_page);
+
+        ASSERT(paging_mode_enabled(d));
+
+        goto pvh_skip_pv_stuff;
     }
 
     init_int80_direct_trap(v);
@@ -784,6 +802,9 @@ int arch_set_info_guest(
 
     if ( !v->is_initialised )
     {
+        if ( !compat && !(flags & VGCF_in_kernel) && !c.nat->ctrlreg[1] )
+            return -EINVAL;
+
         v->arch.pv_vcpu.ldt_base = c(ldt_base);
         v->arch.pv_vcpu.ldt_ents = c(ldt_ents);
     }
@@ -803,9 +824,10 @@ int arch_set_info_guest(
                 fail |= xen_pfn_to_cr3(pfn) != c.nat->ctrlreg[1];
             }
         } else {
-            l4_pgentry_t *l4tab = __va(pfn_to_paddr(pfn));
+            l4_pgentry_t *l4tab = map_domain_page(pfn);
 
             pfn = l4e_get_pfn(*l4tab);
+            unmap_domain_page(l4tab);
             fail = compat_pfn_to_cr3(pfn) != c.cmp->ctrlreg[3];
         }
 
@@ -859,6 +881,10 @@ int arch_set_info_guest(
     if ( v->vcpu_id == 0 )
         d->vm_assist = c(vm_assist);
 
+    rc = put_old_guest_table(current);
+    if ( rc )
+        return rc;
+
     if ( !compat )
         rc = (int)set_gdt(v, c.nat->gdt_frames, c.nat->gdt_ents);
     else
@@ -875,80 +901,99 @@ int arch_set_info_guest(
     if ( rc != 0 )
         return rc;
 
+    set_bit(_VPF_in_reset, &v->pause_flags);
+
     if ( !compat )
-    {
         cr3_gfn = xen_cr3_to_pfn(c.nat->ctrlreg[3]);
-        cr3_page = get_page_from_gfn(d, cr3_gfn, NULL, P2M_ALLOC);
+    else
+        cr3_gfn = compat_cr3_to_pfn(c.cmp->ctrlreg[3]);
+    cr3_page = get_page_from_gfn(d, cr3_gfn, NULL, P2M_ALLOC);
 
-        if ( !cr3_page )
+    if ( !cr3_page )
+        rc = -EINVAL;
+    else if ( paging_mode_refcounts(d) )
+        /* nothing */;
+    else if ( cr3_page == v->arch.old_guest_table )
+    {
+        v->arch.old_guest_table = NULL;
+        put_page(cr3_page);
+    }
+    else
+    {
+        if ( !compat )
+            rc = put_old_guest_table(v);
+        if ( !rc )
+            rc = get_page_type_preemptible(cr3_page,
+                                           !compat ? PGT_root_page_table
+                                                   : PGT_l3_page_table);
+        switch ( rc )
         {
-            destroy_gdt(v);
-            return -EINVAL;
+        case -EINTR:
+            rc = -EAGAIN;
+        case -EAGAIN:
+        case 0:
+            break;
+        default:
+            if ( cr3_page == current->arch.old_guest_table )
+                cr3_page = NULL;
+            break;
         }
-        if ( !paging_mode_refcounts(d)
-             && !get_page_type(cr3_page, PGT_base_page_table) )
-        {
-            put_page(cr3_page);
-            destroy_gdt(v);
-            return -EINVAL;
-        }
-
+    }
+    if ( rc )
+        /* handled below */;
+    else if ( !compat )
+    {
         v->arch.guest_table = pagetable_from_page(cr3_page);
         if ( c.nat->ctrlreg[1] )
         {
             cr3_gfn = xen_cr3_to_pfn(c.nat->ctrlreg[1]);
             cr3_page = get_page_from_gfn(d, cr3_gfn, NULL, P2M_ALLOC);
 
-            if ( !cr3_page ||
-                 (!paging_mode_refcounts(d)
-                  && !get_page_type(cr3_page, PGT_base_page_table)) )
+            if ( !cr3_page )
+                rc = -EINVAL;
+            else if ( !paging_mode_refcounts(d) )
             {
-                if (cr3_page)
-                    put_page(cr3_page);
-                cr3_page = pagetable_get_page(v->arch.guest_table);
-                v->arch.guest_table = pagetable_null();
-                if ( paging_mode_refcounts(d) )
-                    put_page(cr3_page);
-                else
-                    put_page_and_type(cr3_page);
-                destroy_gdt(v);
-                return -EINVAL;
+                rc = get_page_type_preemptible(cr3_page, PGT_root_page_table);
+                switch ( rc )
+                {
+                case -EINTR:
+                    rc = -EAGAIN;
+                case -EAGAIN:
+                    v->arch.old_guest_table =
+                        pagetable_get_page(v->arch.guest_table);
+                    v->arch.guest_table = pagetable_null();
+                    break;
+                default:
+                    if ( cr3_page == current->arch.old_guest_table )
+                        cr3_page = NULL;
+                case 0:
+                    break;
+                }
             }
-
-            v->arch.guest_table_user = pagetable_from_page(cr3_page);
-        }
-        else if ( !(flags & VGCF_in_kernel) )
-        {
-            destroy_gdt(v);
-            return -EINVAL;
+            if ( !rc )
+               v->arch.guest_table_user = pagetable_from_page(cr3_page);
         }
     }
     else
     {
         l4_pgentry_t *l4tab;
 
-        cr3_gfn = compat_cr3_to_pfn(c.cmp->ctrlreg[3]);
-        cr3_page = get_page_from_gfn(d, cr3_gfn, NULL, P2M_ALLOC);
-
-        if ( !cr3_page)
-        {
-            destroy_gdt(v);
-            return -EINVAL;
-        }
-
-        if (!paging_mode_refcounts(d)
-            && !get_page_type(cr3_page, PGT_l3_page_table) )
-        {
-            put_page(cr3_page);
-            destroy_gdt(v);
-            return -EINVAL;
-        }
-
-        l4tab = __va(pagetable_get_paddr(v->arch.guest_table));
+        l4tab = map_domain_page(pagetable_get_pfn(v->arch.guest_table));
         *l4tab = l4e_from_pfn(page_to_mfn(cr3_page),
             _PAGE_PRESENT|_PAGE_RW|_PAGE_USER|_PAGE_ACCESSED);
+        unmap_domain_page(l4tab);
+    }
+    if ( rc )
+    {
+        if ( cr3_page )
+            put_page(cr3_page);
+        destroy_gdt(v);
+        return rc;
     }
 
+    clear_bit(_VPF_in_reset, &v->pause_flags);
+
+ pvh_skip_pv_stuff:
     if ( v->vcpu_id == 0 )
         update_domain_wallclock_time(d);
 
@@ -969,109 +1014,15 @@ int arch_set_info_guest(
 #undef c
 }
 
-void arch_vcpu_reset(struct vcpu *v)
+int arch_vcpu_reset(struct vcpu *v)
 {
-    if ( !is_hvm_vcpu(v) )
+    if ( is_pv_vcpu(v) )
     {
         destroy_gdt(v);
-        vcpu_destroy_pagetables(v);
-    }
-    else
-    {
-        vcpu_end_shutdown_deferral(v);
-    }
-}
-
-/* 
- * Unmap the vcpu info page if the guest decided to place it somewhere
- * else.  This is only used from arch_domain_destroy, so there's no
- * need to do anything clever.
- */
-static void
-unmap_vcpu_info(struct vcpu *v)
-{
-    unsigned long mfn;
-
-    if ( v->arch.pv_vcpu.vcpu_info_mfn == INVALID_MFN )
-        return;
-
-    mfn = v->arch.pv_vcpu.vcpu_info_mfn;
-    unmap_domain_page_global(v->vcpu_info);
-
-    v->vcpu_info = &dummy_vcpu_info;
-    v->arch.pv_vcpu.vcpu_info_mfn = INVALID_MFN;
-
-    put_page_and_type(mfn_to_page(mfn));
-}
-
-/* 
- * Map a guest page in and point the vcpu_info pointer at it.  This
- * makes sure that the vcpu_info is always pointing at a valid piece
- * of memory, and it sets a pending event to make sure that a pending
- * event doesn't get missed.
- */
-static int
-map_vcpu_info(struct vcpu *v, unsigned long gfn, unsigned offset)
-{
-    struct domain *d = v->domain;
-    void *mapping;
-    vcpu_info_t *new_info;
-    struct page_info *page;
-    int i;
-
-    if ( offset > (PAGE_SIZE - sizeof(vcpu_info_t)) )
-        return -EINVAL;
-
-    if ( v->arch.pv_vcpu.vcpu_info_mfn != INVALID_MFN )
-        return -EINVAL;
-
-    /* Run this command on yourself or on other offline VCPUS. */
-    if ( (v != current) && !test_bit(_VPF_down, &v->pause_flags) )
-        return -EINVAL;
-
-    page = get_page_from_gfn(d, gfn, NULL, P2M_ALLOC);
-    if ( !page )
-        return -EINVAL;
-
-    if ( !get_page_type(page, PGT_writable_page) )
-    {
-        put_page(page);
-        return -EINVAL;
+        return vcpu_destroy_pagetables(v);
     }
 
-    mapping = __map_domain_page_global(page);
-    if ( mapping == NULL )
-    {
-        put_page_and_type(page);
-        return -ENOMEM;
-    }
-
-    new_info = (vcpu_info_t *)(mapping + offset);
-
-    if ( v->vcpu_info == &dummy_vcpu_info )
-    {
-        memset(new_info, 0, sizeof(*new_info));
-        __vcpu_info(v, new_info, evtchn_upcall_mask) = 1;
-    }
-    else
-    {
-        memcpy(new_info, v->vcpu_info, sizeof(*new_info));
-    }
-
-    v->vcpu_info = new_info;
-    v->arch.pv_vcpu.vcpu_info_mfn = page_to_mfn(page);
-
-    /* Set new vcpu_info pointer /before/ setting pending flags. */
-    wmb();
-
-    /*
-     * Mark everything as being pending just to make sure nothing gets
-     * lost.  The domain will get a spurious event, but it can cope.
-     */
-    vcpu_info(v, evtchn_upcall_pending) = 1;
-    for ( i = 0; i < BITS_PER_EVTCHN_WORD(d); i++ )
-        set_bit(i, &vcpu_info(v, evtchn_pending_sel));
-
+    vcpu_end_shutdown_deferral(v);
     return 0;
 }
 
@@ -1083,55 +1034,6 @@ arch_do_vcpu_op(
 
     switch ( cmd )
     {
-    case VCPUOP_register_runstate_memory_area:
-    {
-        struct vcpu_register_runstate_memory_area area;
-        struct vcpu_runstate_info runstate;
-
-        rc = -EFAULT;
-        if ( copy_from_guest(&area, arg, 1) )
-            break;
-
-        if ( !guest_handle_okay(area.addr.h, 1) )
-            break;
-
-        rc = 0;
-        runstate_guest(v) = area.addr.h;
-
-        if ( v == current )
-        {
-            __copy_to_guest(runstate_guest(v), &v->runstate, 1);
-        }
-        else
-        {
-            vcpu_runstate_get(v, &runstate);
-            __copy_to_guest(runstate_guest(v), &runstate, 1);
-        }
-
-        break;
-    }
-
-    case VCPUOP_register_vcpu_info:
-    {
-        struct domain *d = v->domain;
-        struct vcpu_register_vcpu_info info;
-
-        rc = -EFAULT;
-        if ( copy_from_guest(&info, arg, 1) )
-            break;
-
-        domain_lock(d);
-        rc = map_vcpu_info(v, info.mfn, info.offset);
-        domain_unlock(d);
-
-        break;
-    }
-
-    /*
-     * XXX Disable for 4.0.0: __update_vcpu_system_time() writes to the given
-     * virtual address even when running in another domain's address space.
-     */
-#if 0
     case VCPUOP_register_vcpu_time_memory_area:
     {
         struct vcpu_register_time_memory_area area;
@@ -1150,7 +1052,6 @@ arch_do_vcpu_op(
 
         break;
     }
-#endif
 
     case VCPUOP_get_physid:
     {
@@ -1248,7 +1149,7 @@ static void load_segments(struct vcpu *n)
     {
         /* This can only be non-zero if selector is NULL. */
         if ( n->arch.pv_vcpu.fs_base )
-            wrmsrl(MSR_FS_BASE, n->arch.pv_vcpu.fs_base);
+            wrfsbase(n->arch.pv_vcpu.fs_base);
 
         /* Most kernels have non-zero GS base, so don't bother testing. */
         /* (This is also a serialising instruction, avoiding AMD erratum #88.) */
@@ -1256,7 +1157,7 @@ static void load_segments(struct vcpu *n)
 
         /* This can only be non-zero if selector is NULL. */
         if ( n->arch.pv_vcpu.gs_base_user )
-            wrmsrl(MSR_GS_BASE, n->arch.pv_vcpu.gs_base_user);
+            wrgsbase(n->arch.pv_vcpu.gs_base_user);
 
         /* If in kernel mode then switch the GS bases around. */
         if ( (n->arch.flags & TF_kernel_mode) )
@@ -1312,7 +1213,7 @@ static void load_segments(struct vcpu *n)
             if ( test_bit(_VGCF_failsafe_disables_events, &n->arch.vgc_flags) )
                 vcpu_info(n, evtchn_upcall_mask) = 1;
 
-            regs->entry_vector  = TRAP_syscall;
+            regs->entry_vector |= TRAP_syscall;
             regs->_eflags      &= 0xFFFCBEFFUL;
             regs->ss            = FLAT_COMPAT_KERNEL_SS;
             regs->_esp          = (unsigned long)(esp-7);
@@ -1354,7 +1255,7 @@ static void load_segments(struct vcpu *n)
         if ( test_bit(_VGCF_failsafe_disables_events, &n->arch.vgc_flags) )
             vcpu_info(n, evtchn_upcall_mask) = 1;
 
-        regs->entry_vector  = TRAP_syscall;
+        regs->entry_vector |= TRAP_syscall;
         regs->rflags       &= ~(X86_EFLAGS_AC|X86_EFLAGS_VM|X86_EFLAGS_RF|
                                 X86_EFLAGS_NT|X86_EFLAGS_TF);
         regs->ss            = FLAT_KERNEL_SS;
@@ -1373,6 +1274,15 @@ static void save_segments(struct vcpu *v)
     regs->es = read_segment_register(es);
     regs->fs = read_segment_register(fs);
     regs->gs = read_segment_register(gs);
+
+    if ( cpu_has_fsgsbase && !is_pv_32bit_vcpu(v) )
+    {
+        v->arch.pv_vcpu.fs_base = __rdfsbase();
+        if ( v->arch.flags & TF_kernel_mode )
+            v->arch.pv_vcpu.gs_base_kernel = __rdgsbase();
+        else
+            v->arch.pv_vcpu.gs_base_user = __rdgsbase();
+    }
 
     if ( regs->ds )
         dirty_segment_mask |= DIRTY_DS;
@@ -1431,14 +1341,7 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
         write_cr4(cr4);
 
     if ( unlikely(v->arch.debugreg[7] & DR7_ACTIVE_MASK) )
-    {
-        write_debugreg(0, v->arch.debugreg[0]);
-        write_debugreg(1, v->arch.debugreg[1]);
-        write_debugreg(2, v->arch.debugreg[2]);
-        write_debugreg(3, v->arch.debugreg[3]);
-        write_debugreg(6, v->arch.debugreg[6]);
-        write_debugreg(7, v->arch.debugreg[7]);
-    }
+        activate_debugregs(v);
 
     if ( (v->domain->arch.tsc_mode ==  TSC_MODE_PVRDTSCP) &&
          boot_cpu_has(X86_FEATURE_RDTSCP) )
@@ -1446,10 +1349,10 @@ static void paravirt_ctxt_switch_to(struct vcpu *v)
 }
 
 /* Update per-VCPU guest runstate shared memory area (if registered). */
-static void update_runstate_area(struct vcpu *v)
+bool_t update_runstate_area(const struct vcpu *v)
 {
     if ( guest_handle_is_null(runstate_guest(v)) )
-        return;
+        return 1;
 
     if ( has_32bit_shinfo(v->domain) )
     {
@@ -1457,15 +1360,23 @@ static void update_runstate_area(struct vcpu *v)
 
         XLAT_vcpu_runstate_info(&info, &v->runstate);
         __copy_to_guest(v->runstate_guest.compat, &info, 1);
-        return;
+        return 1;
     }
 
-    __copy_to_guest(runstate_guest(v), &v->runstate, 1);
+    return __copy_to_guest(runstate_guest(v), &v->runstate, 1) !=
+           sizeof(v->runstate);
+}
+
+static void _update_runstate_area(struct vcpu *v)
+{
+    if ( !update_runstate_area(v) && is_pv_vcpu(v) &&
+         !(v->arch.flags & TF_kernel_mode) )
+        v->arch.pv_vcpu.need_update_runstate_area = 1;
 }
 
 static inline int need_full_gdt(struct vcpu *v)
 {
-    return (!is_hvm_vcpu(v) && !is_idle_vcpu(v));
+    return (is_pv_vcpu(v) && !is_idle_vcpu(v));
 }
 
 static void __context_switch(void)
@@ -1499,8 +1410,13 @@ static void __context_switch(void)
     if ( !is_idle_vcpu(n) )
     {
         memcpy(stack_regs, &n->arch.user_regs, CTXT_SWITCH_STACK_BYTES);
-        if ( xsave_enabled(n) && n->arch.xcr0 != get_xcr0() )
-            set_xcr0(n->arch.xcr0);
+        if ( cpu_has_xsave )
+        {
+            u64 xcr0 = n->arch.xcr0 ?: XSTATE_FP_SSE;
+
+            if ( xcr0 != get_xcr0() && !set_xcr0(xcr0) )
+                BUG();
+        }
         vcpu_restore_fpu_eager(n);
         n->arch.ctxt_switch_to(n);
     }
@@ -1509,12 +1425,13 @@ static void __context_switch(void)
                                   per_cpu(compat_gdt_table, cpu);
     if ( need_full_gdt(n) )
     {
-        struct page_info *page = virt_to_page(gdt);
+        unsigned long mfn = virt_to_mfn(gdt);
+        l1_pgentry_t *pl1e = gdt_ldt_ptes(n->domain, n);
         unsigned int i;
+
         for ( i = 0; i < NR_RESERVED_GDT_PAGES; i++ )
-            l1e_write(n->arch.perdomain_ptes +
-                      FIRST_RESERVED_GDT_PAGE + i,
-                      l1e_from_page(page + i, __PAGE_HYPERVISOR));
+            l1e_write(pl1e + FIRST_RESERVED_GDT_PAGE + i,
+                      l1e_from_pfn(mfn + i, __PAGE_HYPERVISOR));
     }
 
     if ( need_full_gdt(p) &&
@@ -1560,11 +1477,17 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
         flush_tlb_mask(&dirty_mask);
     }
 
-    if (prev != next)
-        update_runstate_area(prev);
+    if ( prev != next )
+        _update_runstate_area(prev);
 
-    if ( is_hvm_vcpu(prev) && !list_empty(&prev->arch.hvm_vcpu.tm_list) )
-        pt_save_timer(prev);
+    if ( is_hvm_vcpu(prev) )
+    {
+        if (prev != next)
+            vpmu_save(prev);
+
+        if ( !list_empty(&prev->arch.hvm_vcpu.tm_list) )
+            pt_save_timer(prev);
+    }
 
     local_irq_disable();
 
@@ -1579,9 +1502,9 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
     {
         __context_switch();
 
-        if ( !is_hvm_vcpu(next) &&
+        if ( is_pv_vcpu(next) &&
              (is_idle_vcpu(prev) ||
-              is_hvm_vcpu(prev) ||
+              has_hvm_container_vcpu(prev) ||
               is_pv_32on64_vcpu(prev) != is_pv_32on64_vcpu(next)) )
         {
             uint64_t efer = read_efer();
@@ -1592,29 +1515,35 @@ void context_switch(struct vcpu *prev, struct vcpu *next)
         /* Re-enable interrupts before restoring state which may fault. */
         local_irq_enable();
 
-        if ( !is_hvm_vcpu(next) )
+        if ( is_pv_vcpu(next) )
         {
             load_LDT(next);
             load_segments(next);
         }
 
-        set_cpuid_faulting(!is_hvm_vcpu(next) &&
-                           (next->domain->domain_id != 0));
+        set_cpuid_faulting(is_pv_vcpu(next) &&
+                           !is_control_domain(next->domain) &&
+                           !is_hardware_domain(next->domain));
     }
+
+    if (is_hvm_vcpu(next) && (prev != next) )
+        /* Must be done with interrupts enabled */
+        vpmu_load(next);
 
     context_saved(prev);
 
-    if (prev != next)
-        update_runstate_area(next);
+    if ( prev != next )
+        _update_runstate_area(next);
+
+    /* Ensure that the vcpu has an up-to-date time base. */
+    update_vcpu_system_time(next);
 
     schedule_tail(next);
-    BUG();
 }
 
 void continue_running(struct vcpu *same)
 {
     schedule_tail(same);
-    BUG();
 }
 
 int __sync_local_execstate(void)
@@ -1674,7 +1603,7 @@ void hypercall_cancel_continuation(void)
     }
     else
     {
-        if ( !is_hvm_vcpu(current) )
+        if ( is_pv_vcpu(current) )
             regs->eip += 2; /* skip re-execute 'syscall' / 'int $xx' */
         else
             current->arch.hvm_vcpu.hcall_preempted = 0;
@@ -1711,12 +1640,12 @@ unsigned long hypercall_create_continuation(
         regs->eax  = op;
 
         /* Ensure the hypercall trap instruction is re-executed. */
-        if ( !is_hvm_vcpu(current) )
+        if ( is_pv_vcpu(current) )
             regs->eip -= 2;  /* re-execute 'syscall' / 'int $xx' */
         else
             current->arch.hvm_vcpu.hcall_preempted = 1;
 
-        if ( !is_hvm_vcpu(current) ?
+        if ( is_pv_vcpu(current) ?
              !is_pv_32on64_vcpu(current) :
              (hvm_guest_x86_mode(current) == 8) )
         {
@@ -1777,7 +1706,11 @@ int hypercall_xlat_continuation(unsigned int *id, unsigned int mask, ...)
     if ( test_bit(_MCSF_in_multicall, &mcs->flags) )
     {
         if ( !test_bit(_MCSF_call_preempted, &mcs->flags) )
+        {
+            va_end(args);
             return 0;
+        }
+
         for ( i = 0; i < 6; ++i, mask >>= 1 )
         {
             if ( mask & 1 )
@@ -1870,7 +1803,7 @@ static int relinquish_memory(
         }
 
         if ( test_and_clear_bit(_PGT_pinned, &page->u.inuse.type_info) )
-            ret = put_page_and_type_preemptible(page, 1);
+            ret = put_page_and_type_preemptible(page);
         switch ( ret )
         {
         case 0:
@@ -1961,59 +1894,6 @@ static int relinquish_memory(
     return ret;
 }
 
-static void vcpu_destroy_pagetables(struct vcpu *v)
-{
-    struct domain *d = v->domain;
-    unsigned long pfn;
-
-    if ( is_pv_32on64_vcpu(v) )
-    {
-        pfn = l4e_get_pfn(*(l4_pgentry_t *)
-                          __va(pagetable_get_paddr(v->arch.guest_table)));
-
-        if ( pfn != 0 )
-        {
-            if ( paging_mode_refcounts(d) )
-                put_page(mfn_to_page(pfn));
-            else
-                put_page_and_type(mfn_to_page(pfn));
-        }
-
-        l4e_write(
-            (l4_pgentry_t *)__va(pagetable_get_paddr(v->arch.guest_table)),
-            l4e_empty());
-
-        v->arch.cr3 = 0;
-        return;
-    }
-
-    pfn = pagetable_get_pfn(v->arch.guest_table);
-    if ( pfn != 0 )
-    {
-        if ( paging_mode_refcounts(d) )
-            put_page(mfn_to_page(pfn));
-        else
-            put_page_and_type(mfn_to_page(pfn));
-        v->arch.guest_table = pagetable_null();
-    }
-
-    /* Drop ref to guest_table_user (from MMUEXT_NEW_USER_BASEPTR) */
-    pfn = pagetable_get_pfn(v->arch.guest_table_user);
-    if ( pfn != 0 )
-    {
-        if ( !is_pv_32bit_vcpu(v) )
-        {
-            if ( paging_mode_refcounts(d) )
-                put_page(mfn_to_page(pfn));
-            else
-                put_page_and_type(mfn_to_page(pfn));
-        }
-        v->arch.guest_table_user = pagetable_null();
-    }
-
-    v->arch.cr3 = 0;
-}
-
 int domain_relinquish_resources(struct domain *d)
 {
     int ret;
@@ -2031,9 +1911,13 @@ int domain_relinquish_resources(struct domain *d)
 
         /* Drop the in-use references to page-table bases. */
         for_each_vcpu ( d, v )
-            vcpu_destroy_pagetables(v);
+        {
+            ret = vcpu_destroy_pagetables(v);
+            if ( ret )
+                return ret;
+        }
 
-        if ( !is_hvm_domain(d) )
+        if ( is_pv_domain(d) )
         {
             for_each_vcpu ( d, v )
             {
@@ -2043,18 +1927,15 @@ int domain_relinquish_resources(struct domain *d)
                  * mappings.
                  */
                 destroy_gdt(v);
-
-                unmap_vcpu_info(v);
             }
+        }
 
-            if ( d->arch.pv_domain.pirq_eoi_map != NULL )
-            {
-                unmap_domain_page_global(d->arch.pv_domain.pirq_eoi_map);
-                put_page_and_type(
-                    mfn_to_page(d->arch.pv_domain.pirq_eoi_map_mfn));
-                d->arch.pv_domain.pirq_eoi_map = NULL;
-                d->arch.pv_domain.auto_unmask = 0;
-            }
+        if ( d->arch.pirq_eoi_map != NULL )
+        {
+            unmap_domain_page_global(d->arch.pirq_eoi_map);
+            put_page_and_type(mfn_to_page(d->arch.pirq_eoi_map_mfn));
+            d->arch.pirq_eoi_map = NULL;
+            d->arch.auto_unmask = 0;
         }
 
         d->arch.relmem = RELMEM_shared;
@@ -2072,6 +1953,12 @@ int domain_relinquish_resources(struct domain *d)
         }
 
         d->arch.relmem = RELMEM_xen;
+
+        spin_lock(&d->page_alloc_lock);
+        page_list_splice(&d->arch.relmem_list, &d->page_list);
+        INIT_PAGE_LIST_HEAD(&d->arch.relmem_list);
+        spin_unlock(&d->page_alloc_lock);
+
         /* Fallthrough. Relinquish every page of memory. */
     case RELMEM_xen:
         ret = relinquish_memory(d, &d->xenpage_list, ~0UL);
@@ -2108,7 +1995,9 @@ int domain_relinquish_resources(struct domain *d)
         BUG();
     }
 
-    if ( is_hvm_domain(d) )
+    pit_deinit(d);
+
+    if ( has_hvm_container_domain(d) )
         hvm_domain_relinquish_resources(d);
 
     return 0;
@@ -2122,6 +2011,9 @@ void arch_dump_domain_info(struct domain *d)
 void arch_dump_vcpu_info(struct vcpu *v)
 {
     paging_dump_vcpu_info(v);
+
+    if ( is_hvm_vcpu(v) )
+        vpmu_dump(v);
 }
 
 void domain_cpuid(
@@ -2189,7 +2081,7 @@ void vcpu_mark_events_pending(struct vcpu *v)
     if ( already_pending )
         return;
 
-    if ( is_hvm_vcpu(v) )
+    if ( has_hvm_container_vcpu(v) )
         hvm_assert_evtchn_irq(v);
     else
         vcpu_kick(v);
@@ -2215,7 +2107,7 @@ __initcall(init_vcpu_kick_softirq);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

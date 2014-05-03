@@ -69,14 +69,16 @@
 #define __force
 #define __bitwise
 
+#define MB(_mb)     (_AC(_mb, UL) << 20)
+#define GB(_gb)     (_AC(_gb, UL) << 30)
+
 #ifndef __ASSEMBLY__
 
-int current_domain_id(void);
 #define dprintk(_l, _f, _a...)                              \
     printk(_l "%s:%d: " _f, __FILE__ , __LINE__ , ## _a )
 #define gdprintk(_l, _f, _a...)                             \
-    printk(XENLOG_GUEST _l "%s:%d:d%d " _f, __FILE__,       \
-           __LINE__, current_domain_id() , ## _a )
+    printk(XENLOG_GUEST _l "%s:%d:%pv " _f, __FILE__,       \
+           __LINE__, current, ## _a )
 
 #endif /* !__ASSEMBLY__ */
 
@@ -95,5 +97,15 @@ int current_domain_id(void);
 #define fastcall
 #define __cpuinitdata
 #define __cpuinit
+
+#ifdef FLASK_ENABLE
+#define XSM_MAGIC 0xf97cff8c
+/* Enable permissive mode (xl setenforce or flask_enforcing parameter) */
+#define FLASK_DEVELOP 1
+/* Allow runtime disabling of FLASK via the flask_enable parameter */
+#define FLASK_BOOTPARAM 1
+/* Maintain statistics on the access vector cache */
+#define FLASK_AVC_STATS 1
+#endif
 
 #endif /* __XEN_CONFIG_H__ */

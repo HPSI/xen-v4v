@@ -14,15 +14,13 @@
 
 ENTRY(compat_hypercall)
         pushq $0
-        movl  $TRAP_syscall,4(%rsp)
-        SAVE_ALL
+        SAVE_VOLATILE type=TRAP_syscall compat=1
 
         cmpb  $0,untrusted_msi(%rip)
 UNLIKELY_START(ne, msi_check)
         movl  $HYPERCALL_VECTOR,%edi
         call  check_for_unexpected_msi
-        RESTORE_ALL
-        SAVE_ALL
+        LOAD_C_CLOBBERED
 UNLIKELY_END(msi_check)
 
         GET_CURRENT(%rbx)
@@ -94,13 +92,14 @@ compat_skip_clobber:
 
 /* %rbx: struct vcpu */
 ENTRY(compat_test_all_events)
+        ASSERT_NOT_IN_ATOMIC
         cli                             # tests must not race interrupts
 /*compat_test_softirqs:*/
         movl  VCPU_processor(%rbx),%eax
-        shlq  $IRQSTAT_shift,%rax
-        leaq  irq_stat(%rip),%rcx
-        testl $~0,(%rcx,%rax,1)
-        jnz   compat_process_softirqs
+        shll  $IRQSTAT_shift,%eax
+        leaq  irq_stat+IRQSTAT_softirq_pending(%rip),%rcx
+        cmpl  $0,(%rcx,%rax,1)
+        jne   compat_process_softirqs
         testb $1,VCPU_mce_pending(%rbx)
         jnz   compat_process_mce
 .Lcompat_test_guest_nmi:
@@ -127,6 +126,7 @@ compat_test_guest_events:
 /* %rbx: struct vcpu */
 compat_process_softirqs:
         sti
+        andl  $~TRAP_regs_partial,UREGS_entry_vector(%rsp)
         call  do_softirq
         jmp   compat_test_all_events
 
@@ -171,10 +171,9 @@ compat_bad_hypercall:
         jmp  compat_test_all_events
 
 /* %rbx: struct vcpu, interrupts disabled */
-compat_restore_all_guest:
+ENTRY(compat_restore_all_guest)
         ASSERT_INTERRUPTS_DISABLED
-        RESTORE_ALL
-        addq  $8,%rsp
+        RESTORE_ALL adj=8 compat=1
 .Lft0:  iretq
 
 .section .fixup,"ax"
@@ -245,7 +244,7 @@ UNLIKELY_END(compat_syscall_gpf)
 
 ENTRY(compat_sysenter)
         movq  VCPU_trap_ctxt(%rbx),%rcx
-        cmpl  $TRAP_gp_fault,UREGS_entry_vector(%rsp)
+        cmpb  $TRAP_gp_fault,UREGS_entry_vector(%rsp)
         movzwl VCPU_sysenter_sel(%rbx),%eax
         movzwl TRAP_gp_fault * TRAPINFO_sizeof + TRAPINFO_cs(%rcx),%ecx
         cmovel %ecx,%eax
@@ -330,7 +329,10 @@ UNLIKELY_END(compat_bounce_failsafe)
         movzwl TRAPBOUNCE_cs(%rdx),%eax
         /* Null selectors (0-3) are not allowed. */
         testl $~3,%eax
-        jz    domain_crash_synchronous
+UNLIKELY_START(z, compat_bounce_null_selector)
+        lea   UNLIKELY_DISPATCH_LABEL(compat_bounce_null_selector)(%rip), %rdi
+        jmp   asm_domain_crash_synchronous  /* Does not return */
+__UNLIKELY_END(compat_bounce_null_selector)
         movl  %eax,UREGS_cs+8(%rsp)
         movl  TRAPBOUNCE_eip(%rdx),%eax
         movl  %eax,UREGS_rip+8(%rsp)
@@ -340,10 +342,10 @@ UNLIKELY_END(compat_bounce_failsafe)
         xorl  %edi,%edi
         jmp   .Lft13
 .previous
-        _ASM_EXTABLE(.Lft1,  domain_crash_synchronous)
+        _ASM_EXTABLE(.Lft1,  dom_crash_sync_extable)
         _ASM_EXTABLE(.Lft2,  compat_crash_page_fault)
         _ASM_EXTABLE(.Lft3,  compat_crash_page_fault_4)
-        _ASM_EXTABLE(.Lft4,  domain_crash_synchronous)
+        _ASM_EXTABLE(.Lft4,  dom_crash_sync_extable)
         _ASM_EXTABLE(.Lft5,  compat_crash_page_fault_4)
         _ASM_EXTABLE(.Lft6,  compat_crash_page_fault_8)
         _ASM_EXTABLE(.Lft7,  compat_crash_page_fault)
@@ -364,7 +366,7 @@ compat_crash_page_fault:
 .Lft14: mov   %edi,%fs
         movl  %esi,%edi
         call  show_page_walk
-        jmp   domain_crash_synchronous
+        jmp   dom_crash_sync_extable
 .section .fixup,"ax"
 .Lfx14:
         xorl  %edi,%edi
@@ -402,7 +404,7 @@ ENTRY(compat_hypercall_table)
         .quad compat_vcpu_op
         .quad compat_ni_hypercall       /* 25 */
         .quad compat_mmuext_op
-        .quad do_xsm_op
+        .quad compat_xsm_op
         .quad compat_nmi_op
         .quad compat_sched_op
         .quad compat_callback_op        /* 30 */

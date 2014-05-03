@@ -8,24 +8,19 @@
 #include <xen/config.h>
 #include <xen/perfc.h>
 #include <xen/sched.h>
+#include <xen/bitops.h>
 #include <compat/xen.h>
 #include <asm/fixmap.h>
 #include <asm/hardirq.h>
 #include <xen/multiboot.h>
 
-#define DEFINE(_sym, _val) \
-    __asm__ __volatile__ ( "\n->" #_sym " %0 " #_val : : "i" (_val) )
-#define BLANK() \
-    __asm__ __volatile__ ( "\n->" : : )
-#define OFFSET(_sym, _str, _mem) \
+#define DEFINE(_sym, _val)                                                 \
+    asm volatile ("\n.ascii\"==>#define " #_sym " %0 /* " #_val " */<==\"" \
+                  : : "i" (_val) )
+#define BLANK()                                                            \
+    asm volatile ( "\n.ascii\"==><==\"" : : )
+#define OFFSET(_sym, _str, _mem)                                           \
     DEFINE(_sym, offsetof(_str, _mem));
-
-/* base-2 logarithm */
-#define __L2(_x)  (((_x) & 0x00000002) ?   1 : 0)
-#define __L4(_x)  (((_x) & 0x0000000c) ? ( 2 + __L2( (_x)>> 2)) : __L2( _x))
-#define __L8(_x)  (((_x) & 0x000000f0) ? ( 4 + __L4( (_x)>> 4)) : __L4( _x))
-#define __L16(_x) (((_x) & 0x0000ff00) ? ( 8 + __L8( (_x)>> 8)) : __L8( _x))
-#define LOG_2(_x) (((_x) & 0xffff0000) ? (16 + __L16((_x)>>16)) : __L16(_x))
 
 void __dummy__(void)
 {
@@ -162,6 +157,7 @@ void __dummy__(void)
 #endif
 
     DEFINE(IRQSTAT_shift, LOG_2(sizeof(irq_cpustat_t)));
+    OFFSET(IRQSTAT_softirq_pending, irq_cpustat_t, __softirq_pending);
     BLANK();
 
     OFFSET(CPUINFO86_ext_features, struct cpuinfo_x86, x86_capability[1]);

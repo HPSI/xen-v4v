@@ -30,9 +30,22 @@ int xc_get_max_cpus(xc_interface *xch)
         return max_cpus;
 
     if ( !xc_physinfo(xch, &physinfo) )
+    {
         max_cpus = physinfo.max_cpu_id + 1;
+        return max_cpus;
+    }
 
-    return max_cpus;
+    return -1;
+}
+
+int xc_get_online_cpus(xc_interface *xch)
+{
+    xc_physinfo_t physinfo;
+
+    if ( !xc_physinfo(xch, &physinfo) )
+        return physinfo.nr_cpus;
+
+    return -1;
 }
 
 int xc_get_max_nodes(xc_interface *xch)
@@ -44,14 +57,30 @@ int xc_get_max_nodes(xc_interface *xch)
         return max_nodes;
 
     if ( !xc_physinfo(xch, &physinfo) )
+    {
         max_nodes = physinfo.max_node_id + 1;
+        return max_nodes;
+    }
 
-    return max_nodes;
+    return -1;
 }
 
 int xc_get_cpumap_size(xc_interface *xch)
 {
-    return (xc_get_max_cpus(xch) + 7) / 8;
+    int max_cpus = xc_get_max_cpus(xch);
+
+    if ( max_cpus < 0 )
+        return -1;
+    return (max_cpus + 7) / 8;
+}
+
+int xc_get_nodemap_size(xc_interface *xch)
+{
+    int max_nodes = xc_get_max_nodes(xch);
+
+    if ( max_nodes < 0 )
+        return -1;
+    return (max_nodes + 7) / 8;
 }
 
 xc_cpumap_t xc_cpumap_alloc(xc_interface *xch)
@@ -59,7 +88,17 @@ xc_cpumap_t xc_cpumap_alloc(xc_interface *xch)
     int sz;
 
     sz = xc_get_cpumap_size(xch);
-    if (sz == 0)
+    if (sz <= 0)
+        return NULL;
+    return calloc(1, sz);
+}
+
+xc_nodemap_t xc_nodemap_alloc(xc_interface *xch)
+{
+    int sz;
+
+    sz = xc_get_nodemap_size(xch);
+    if (sz <= 0)
         return NULL;
     return calloc(1, sz);
 }
@@ -554,67 +593,6 @@ int xc_hvm_set_mem_type(
     return rc;
 }
 
-int xc_hvm_set_mem_access(
-    xc_interface *xch, domid_t dom, hvmmem_access_t mem_access, uint64_t first_pfn, uint64_t nr)
-{
-    DECLARE_HYPERCALL;
-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_set_mem_access, arg);
-    int rc;
-
-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
-    if ( arg == NULL )
-    {
-        PERROR("Could not allocate memory for xc_hvm_set_mem_access hypercall");
-        return -1;
-    }
-
-    arg->domid         = dom;
-    arg->hvmmem_access = mem_access;
-    arg->first_pfn     = first_pfn;
-    arg->nr            = nr;
-
-    hypercall.op     = __HYPERVISOR_hvm_op;
-    hypercall.arg[0] = HVMOP_set_mem_access;
-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
-
-    rc = do_xen_hypercall(xch, &hypercall);
-
-    xc_hypercall_buffer_free(xch, arg);
-
-    return rc;
-}
-
-int xc_hvm_get_mem_access(
-    xc_interface *xch, domid_t dom, uint64_t pfn, hvmmem_access_t* mem_access)
-{
-    DECLARE_HYPERCALL;
-    DECLARE_HYPERCALL_BUFFER(struct xen_hvm_get_mem_access, arg);
-    int rc;
-
-    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
-    if ( arg == NULL )
-    {
-        PERROR("Could not allocate memory for xc_hvm_get_mem_access hypercall");
-        return -1;
-    }
-
-    arg->domid       = dom;
-    arg->pfn         = pfn;
-
-    hypercall.op     = __HYPERVISOR_hvm_op;
-    hypercall.arg[0] = HVMOP_get_mem_access;
-    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
-
-    rc = do_xen_hypercall(xch, &hypercall);
-
-    if ( !rc )
-        *mem_access = arg->hvmmem_access;
-
-    xc_hypercall_buffer_free(xch, arg);
-
-    return rc;
-}
-
 int xc_hvm_inject_trap(
     xc_interface *xch, domid_t dom, int vcpu, uint32_t vector,
     uint32_t type, uint32_t error_code, uint32_t insn_len,
@@ -653,7 +631,7 @@ int xc_hvm_inject_trap(
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

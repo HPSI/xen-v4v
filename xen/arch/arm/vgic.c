@@ -17,6 +17,7 @@
  * GNU General Public License for more details.
  */
 
+#include <xen/bitops.h>
 #include <xen/config.h>
 #include <xen/lib.h>
 #include <xen/init.h>
@@ -27,9 +28,7 @@
 #include <asm/current.h>
 
 #include "io.h"
-#include "gic.h"
-
-#define VGIC_DISTR_BASE_ADDRESS 0x000000002c001000
+#include <asm/gic.h>
 
 #define REG(n) (n/4)
 
@@ -47,6 +46,7 @@ static inline int REG_RANK_NR(int b, uint32_t n)
     case 8: return n >> 3;
     case 4: return n >> 2;
     case 2: return n >> 1;
+    case 1: return n;
     default: BUG();
     }
 }
@@ -78,11 +78,28 @@ int domain_vgic_init(struct domain *d)
     int i;
 
     d->arch.vgic.ctlr = 0;
-    d->arch.vgic.nr_lines = 32;
+
+    /* Currently nr_lines in vgic and gic doesn't have the same meanings
+     * Here nr_lines = number of SPIs
+     */
+    if ( is_hardware_domain(d) )
+        d->arch.vgic.nr_lines = gic_number_lines() - 32;
+    else
+        d->arch.vgic.nr_lines = 0; /* We don't need SPIs for the guest */
+
     d->arch.vgic.shared_irqs =
-        xmalloc_array(struct vgic_irq_rank, DOMAIN_NR_RANKS(d));
+        xzalloc_array(struct vgic_irq_rank, DOMAIN_NR_RANKS(d));
+    if ( d->arch.vgic.shared_irqs == NULL )
+        return -ENOMEM;
+
     d->arch.vgic.pending_irqs =
         xzalloc_array(struct pending_irq, d->arch.vgic.nr_lines);
+    if ( d->arch.vgic.pending_irqs == NULL )
+    {
+        xfree(d->arch.vgic.shared_irqs);
+        return -ENOMEM;
+    }
+
     for (i=0; i<d->arch.vgic.nr_lines; i++)
     {
         INIT_LIST_HEAD(&d->arch.vgic.pending_irqs[i].inflight);
@@ -159,9 +176,9 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 {
     struct hsr_dabt dabt = info->dabt;
     struct cpu_user_regs *regs = guest_cpu_user_regs();
-    uint32_t *r = &regs->r0 + dabt.reg;
+    register_t *r = select_user_reg(regs, dabt.reg);
     struct vgic_irq_rank *rank;
-    int offset = (int)(info->gpa - VGIC_DISTR_BASE_ADDRESS);
+    int offset = (int)(info->gpa - v->domain->arch.vgic.dbase);
     int gicd_reg = REG(offset);
 
     switch ( gicd_reg )
@@ -199,7 +216,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ISENABLER ... GICD_ISENABLERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ISENABLER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ISENABLER);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = rank->ienable;
@@ -208,7 +225,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ICENABLER ... GICD_ICENABLERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ICENABLER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ICENABLER);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = rank->ienable;
@@ -217,7 +234,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ISPENDR ... GICD_ISPENDRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ISPENDR);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ISPENDR);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = byte_read(rank->ipend, dabt.sign, offset);
@@ -226,7 +243,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ICPENDR ... GICD_ICPENDRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ICPENDR);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ICPENDR);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = byte_read(rank->ipend, dabt.sign, offset);
@@ -235,7 +252,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ISACTIVER ... GICD_ISACTIVERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ISACTIVER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ISACTIVER);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = rank->iactive;
@@ -244,7 +261,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ICACTIVER ... GICD_ICACTIVERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ICACTIVER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ICACTIVER);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = rank->iactive;
@@ -285,7 +302,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
         return 1;
 
     case GICD_NSACR ... GICD_NSACRN:
-        /* We do not implement securty extensions for guests, read zero */
+        /* We do not implement security extensions for guests, read zero */
         goto read_as_zero;
 
     case GICD_SGIR:
@@ -296,7 +313,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_CPENDSGIR ... GICD_CPENDSGIRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_CPENDSGIR);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_CPENDSGIR);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = byte_read(rank->pendsgi, dabt.sign, offset);
@@ -305,7 +322,7 @@ static int vgic_distr_mmio_read(struct vcpu *v, mmio_info_t *info)
 
     case GICD_SPENDSGIR ... GICD_SPENDSGIRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_SPENDSGIR);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_SPENDSGIR);
         if ( rank == NULL) goto read_as_zero;
         vgic_lock_rank(v, rank);
         *r = byte_read(rank->pendsgi, dabt.sign, offset);
@@ -352,28 +369,115 @@ read_as_zero:
     return 1;
 }
 
-static void vgic_enable_irqs(struct vcpu *v, uint32_t r, int n)
+static void vgic_disable_irqs(struct vcpu *v, uint32_t r, int n)
 {
+    const unsigned long mask = r;
     struct pending_irq *p;
     unsigned int irq;
     int i = 0;
 
-    while ( (i = find_next_bit((const long unsigned int *) &r, 32, i)) < 32 ) {
+    while ( (i = find_next_bit(&mask, 32, i)) < 32 ) {
         irq = i + (32 * n);
         p = irq_to_pending(v, irq);
-        if ( !list_empty(&p->inflight) )
-            gic_set_guest_irq(v, irq, GICH_LR_PENDING, p->priority);
+        clear_bit(GIC_IRQ_GUEST_ENABLED, &p->status);
+        gic_remove_from_queues(v, irq);
+        if ( p->desc != NULL )
+            p->desc->handler->disable(p->desc);
         i++;
     }
+}
+
+static void vgic_enable_irqs(struct vcpu *v, uint32_t r, int n)
+{
+    const unsigned long mask = r;
+    struct pending_irq *p;
+    unsigned int irq;
+    int i = 0;
+
+    while ( (i = find_next_bit(&mask, 32, i)) < 32 ) {
+        irq = i + (32 * n);
+        p = irq_to_pending(v, irq);
+        set_bit(GIC_IRQ_GUEST_ENABLED, &p->status);
+        if ( !list_empty(&p->inflight) && !test_bit(GIC_IRQ_GUEST_VISIBLE, &p->status) )
+            gic_set_guest_irq(v, irq, GICH_LR_PENDING, p->priority);
+        if ( p->desc != NULL )
+            p->desc->handler->enable(p->desc);
+        i++;
+    }
+}
+
+static inline int is_vcpu_running(struct domain *d, int vcpuid)
+{
+    struct vcpu *v;
+
+    if ( vcpuid >= d->max_vcpus )
+        return 0;
+
+    v = d->vcpu[vcpuid];
+    if ( v == NULL )
+        return 0;
+    if (test_bit(_VPF_down, &v->pause_flags) )
+        return 0;
+
+    return 1;
+}
+
+static int vgic_to_sgi(struct vcpu *v, register_t sgir)
+{
+    struct domain *d = v->domain;
+    int virtual_irq;
+    int filter;
+    int vcpuid;
+    int i;
+    unsigned long vcpu_mask = 0;
+
+    ASSERT(d->max_vcpus < 8*sizeof(vcpu_mask));
+
+    filter = (sgir & GICD_SGI_TARGET_LIST_MASK);
+    virtual_irq = (sgir & GICD_SGI_INTID_MASK);
+    ASSERT( virtual_irq < 16 );
+
+    switch ( filter )
+    {
+        case GICD_SGI_TARGET_LIST:
+            vcpu_mask = (sgir & GICD_SGI_TARGET_MASK) >> GICD_SGI_TARGET_SHIFT;
+            break;
+        case GICD_SGI_TARGET_OTHERS:
+            for ( i = 0; i < d->max_vcpus; i++ )
+            {
+                if ( i != current->vcpu_id && is_vcpu_running(d, i) )
+                    set_bit(i, &vcpu_mask);
+            }
+            break;
+        case GICD_SGI_TARGET_SELF:
+            set_bit(current->vcpu_id, &vcpu_mask);
+            break;
+        default:
+            gdprintk(XENLOG_WARNING, "vGICD: unhandled GICD_SGIR write %"PRIregister" with wrong TargetListFilter field\n",
+                     sgir);
+            return 0;
+    }
+
+    for_each_set_bit( vcpuid, &vcpu_mask, d->max_vcpus )
+    {
+        if ( !is_vcpu_running(d, vcpuid) )
+        {
+            gdprintk(XENLOG_WARNING, "vGICD: GICD_SGIR write r=%"PRIregister" vcpu_mask=%lx, wrong CPUTargetList\n",
+                     sgir, vcpu_mask);
+            continue;
+        }
+        vgic_vcpu_inject_irq(d->vcpu[vcpuid], virtual_irq, 1);
+    }
+    return 1;
 }
 
 static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
 {
     struct hsr_dabt dabt = info->dabt;
     struct cpu_user_regs *regs = guest_cpu_user_regs();
-    uint32_t *r = &regs->r0 + dabt.reg;
+    register_t *r = select_user_reg(regs, dabt.reg);
     struct vgic_irq_rank *rank;
-    int offset = (int)(info->gpa - VGIC_DISTR_BASE_ADDRESS);
+    int offset = (int)(info->gpa - v->domain->arch.vgic.dbase);
     int gicd_reg = REG(offset);
     uint32_t tr;
 
@@ -395,12 +499,12 @@ static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
         goto write_ignore;
 
     case GICD_IGROUPR ... GICD_IGROUPRN:
-        /* We do not implement securty extensions for guests, write ignore */
+        /* We do not implement security extensions for guests, write ignore */
         goto write_ignore;
 
     case GICD_ISENABLER ... GICD_ISENABLERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ISENABLER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ISENABLER);
         if ( rank == NULL) goto write_ignore;
         vgic_lock_rank(v, rank);
         tr = rank->ienable;
@@ -411,28 +515,30 @@ static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ICENABLER ... GICD_ICENABLERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ICENABLER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ICENABLER);
         if ( rank == NULL) goto write_ignore;
         vgic_lock_rank(v, rank);
+        tr = rank->ienable;
         rank->ienable &= ~*r;
         vgic_unlock_rank(v, rank);
+        vgic_disable_irqs(v, (*r) & tr, gicd_reg - GICD_ICENABLER);
         return 1;
 
     case GICD_ISPENDR ... GICD_ISPENDRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        printk("vGICD: unhandled %s write %#"PRIx32" to ISPENDR%d\n",
+        printk("vGICD: unhandled %s write %#"PRIregister" to ISPENDR%d\n",
                dabt.size ? "word" : "byte", *r, gicd_reg - GICD_ISPENDR);
         return 0;
 
     case GICD_ICPENDR ... GICD_ICPENDRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        printk("vGICD: unhandled %s write %#"PRIx32" to ICPENDR%d\n",
+        printk("vGICD: unhandled %s write %#"PRIregister" to ICPENDR%d\n",
                dabt.size ? "word" : "byte", *r, gicd_reg - GICD_ICPENDR);
         return 0;
 
     case GICD_ISACTIVER ... GICD_ISACTIVERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ISACTIVER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ISACTIVER);
         if ( rank == NULL) goto write_ignore;
         vgic_lock_rank(v, rank);
         rank->iactive &= ~*r;
@@ -441,7 +547,7 @@ static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
 
     case GICD_ICACTIVER ... GICD_ICACTIVERN:
         if ( dabt.size != 2 ) goto bad_width;
-        rank = vgic_irq_rank(v, 8, gicd_reg - GICD_ICACTIVER);
+        rank = vgic_irq_rank(v, 1, gicd_reg - GICD_ICACTIVER);
         if ( rank == NULL) goto write_ignore;
         vgic_lock_rank(v, rank);
         rank->iactive &= ~*r;
@@ -486,31 +592,30 @@ static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
     case GICD_ICFGR + 2 ... GICD_ICFGRN: /* SPIs */
         if ( dabt.size != 2 ) goto bad_width;
         rank = vgic_irq_rank(v, 2, gicd_reg - GICD_ICFGR);
-        vgic_lock_rank(v, rank);
         if ( rank == NULL) goto write_ignore;
+        vgic_lock_rank(v, rank);
         rank->icfg[REG_RANK_INDEX(2, gicd_reg - GICD_ICFGR)] = *r;
         vgic_unlock_rank(v, rank);
         return 1;
 
     case GICD_NSACR ... GICD_NSACRN:
-        /* We do not implement securty extensions for guests, write ignore */
+        /* We do not implement security extensions for guests, write ignore */
         goto write_ignore;
 
     case GICD_SGIR:
-        if ( dabt.size != 2 ) goto bad_width;
-        printk("vGICD: unhandled write %#"PRIx32" to ICFGR%d\n",
-               *r, gicd_reg - GICD_ICFGR);
-        return 0;
+        if ( dabt.size != 2 )
+            goto bad_width;
+        return vgic_to_sgi(v, *r);
 
     case GICD_CPENDSGIR ... GICD_CPENDSGIRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        printk("vGICD: unhandled %s write %#"PRIx32" to ICPENDSGIR%d\n",
+        printk("vGICD: unhandled %s write %#"PRIregister" to ICPENDSGIR%d\n",
                dabt.size ? "word" : "byte", *r, gicd_reg - GICD_CPENDSGIR);
         return 0;
 
     case GICD_SPENDSGIR ... GICD_SPENDSGIRN:
         if ( dabt.size != 0 && dabt.size != 2 ) goto bad_width;
-        printk("vGICD: unhandled %s write %#"PRIx32" to ISPENDSGIR%d\n",
+        printk("vGICD: unhandled %s write %#"PRIregister" to ISPENDSGIR%d\n",
                dabt.size ? "word" : "byte", *r, gicd_reg - GICD_SPENDSGIR);
         return 0;
 
@@ -536,25 +641,27 @@ static int vgic_distr_mmio_write(struct vcpu *v, mmio_info_t *info)
         goto write_ignore;
 
     default:
-        printk("vGICD: unhandled write r%d=%"PRIx32" offset %#08x\n",
+        printk("vGICD: unhandled write r%d=%"PRIregister" offset %#08x\n",
                dabt.reg, *r, offset);
         return 0;
     }
 
 bad_width:
-    printk("vGICD: bad write width %d r%d=%"PRIx32" offset %#08x\n",
+    printk("vGICD: bad write width %d r%d=%"PRIregister" offset %#08x\n",
            dabt.size, dabt.reg, *r, offset);
     domain_crash_synchronous();
     return 0;
 
 write_ignore:
     if ( dabt.size != 2 ) goto bad_width;
-    return 0;
+    return 1;
 }
 
 static int vgic_distr_mmio_check(struct vcpu *v, paddr_t addr)
 {
-    return addr >= VGIC_DISTR_BASE_ADDRESS && addr < (VGIC_DISTR_BASE_ADDRESS+PAGE_SIZE);
+    struct domain *d = v->domain;
+
+    return (addr >= (d->arch.vgic.dbase)) && (addr < (d->arch.vgic.dbase + PAGE_SIZE));
 }
 
 const struct mmio_handler vgic_distr_mmio_handler = {
@@ -575,6 +682,18 @@ struct pending_irq *irq_to_pending(struct vcpu *v, unsigned int irq)
     return n;
 }
 
+void vgic_clear_pending_irqs(struct vcpu *v)
+{
+    struct pending_irq *p, *t;
+    unsigned long flags;
+
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
+    list_for_each_entry_safe ( p, t, &v->arch.vgic.inflight_irqs, inflight )
+        list_del_init(&p->inflight);
+    gic_clear_pending_irqs(v);
+    spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
+}
+
 void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int irq, int virtual)
 {
     int idx = irq >> 2, byte = irq & 0x3;
@@ -582,43 +701,58 @@ void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int irq, int virtual)
     struct vgic_irq_rank *rank = vgic_irq_rank(v, 8, idx);
     struct pending_irq *iter, *n = irq_to_pending(v, irq);
     unsigned long flags;
+    bool_t running;
 
-    /* irq still pending */
-    if (!list_empty(&n->inflight))
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
+
+    if ( !list_empty(&n->inflight) )
+    {
+        if ( (irq != current->domain->arch.evtchn_irq) ||
+             (!test_bit(GIC_IRQ_GUEST_VISIBLE, &n->status)) )
+            set_bit(GIC_IRQ_GUEST_PENDING, &n->status);
+        spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
         return;
+    }
+
+    /* vcpu offline */
+    if ( test_bit(_VPF_down, &v->pause_flags) )
+    {
+        spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
+        return;
+    }
 
     priority = byte_read(rank->ipriority[REG_RANK_INDEX(8, idx)], 0, byte);
 
     n->irq = irq;
+    set_bit(GIC_IRQ_GUEST_PENDING, &n->status);
     n->priority = priority;
-    if (!virtual)
-        n->desc = irq_to_desc(irq);
-    else
-        n->desc = NULL;
 
     /* the irq is enabled */
-    if ( rank->ienable & (1 << (irq % 32)) )
+    if ( test_bit(GIC_IRQ_GUEST_ENABLED, &n->status) )
         gic_set_guest_irq(v, irq, GICH_LR_PENDING, priority);
 
-    spin_lock_irqsave(&v->arch.vgic.lock, flags);
     list_for_each_entry ( iter, &v->arch.vgic.inflight_irqs, inflight )
     {
         if ( iter->priority > priority )
         {
             list_add_tail(&n->inflight, &iter->inflight);
-            spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
-            return;
+            goto out;
         }
     }
     list_add_tail(&n->inflight, &v->arch.vgic.inflight_irqs);
+out:
     spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
     /* we have a new higher priority irq, inject it into the guest */
+    running = v->is_running;
+    vcpu_unblock(v);
+    if ( running && v != current )
+        smp_send_event_check_mask(cpumask_of(v->processor));
 }
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

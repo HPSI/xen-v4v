@@ -164,7 +164,7 @@ void paging_free_log_dirty_bitmap(struct domain *d)
     paging_unlock(d);
 }
 
-int paging_log_dirty_enable(struct domain *d)
+int paging_log_dirty_enable(struct domain *d, bool_t log_global)
 {
     int ret;
 
@@ -172,7 +172,7 @@ int paging_log_dirty_enable(struct domain *d)
         return -EINVAL;
 
     domain_pause(d);
-    ret = d->arch.paging.log_dirty.enable_log_dirty(d);
+    ret = d->arch.paging.log_dirty.enable_log_dirty(d, log_global);
     domain_unpause(d);
 
     return ret;
@@ -330,8 +330,8 @@ int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc)
 {
     int rv = 0, clean = 0, peek = 1;
     unsigned long pages = 0;
-    mfn_t *l4, *l3, *l2;
-    unsigned long *l1;
+    mfn_t *l4 = NULL, *l3 = NULL, *l2 = NULL;
+    unsigned long *l1 = NULL;
     int i4, i3, i2;
 
     domain_pause(d);
@@ -434,160 +434,51 @@ int paging_log_dirty_op(struct domain *d, struct xen_domctl_shadow_op *sc)
  out:
     paging_unlock(d);
     domain_unpause(d);
-    return rv;
-}
 
-int paging_log_dirty_range(struct domain *d,
-                            unsigned long begin_pfn,
-                            unsigned long nr,
-                            XEN_GUEST_HANDLE_64(uint8) dirty_bitmap)
-{
-    int rv = 0;
-    unsigned long pages = 0;
-    mfn_t *l4, *l3, *l2;
-    unsigned long *l1;
-    int b1, b2, b3, b4;
-    int i2, i3, i4;
-
-    d->arch.paging.log_dirty.clean_dirty_bitmap(d);
-    paging_lock(d);
-
-    PAGING_DEBUG(LOGDIRTY, "log-dirty-range: dom %u faults=%u dirty=%u\n",
-                 d->domain_id,
-                 d->arch.paging.log_dirty.fault_count,
-                 d->arch.paging.log_dirty.dirty_count);
-
-    if ( unlikely(d->arch.paging.log_dirty.failed_allocs) ) {
-        printk("%s: %d failed page allocs while logging dirty pages\n",
-               __FUNCTION__, d->arch.paging.log_dirty.failed_allocs);
-        rv = -ENOMEM;
-        goto out;
-    }
-
-    if ( !d->arch.paging.log_dirty.fault_count &&
-         !d->arch.paging.log_dirty.dirty_count ) {
-        unsigned int size = BITS_TO_LONGS(nr);
-
-        if ( clear_guest(dirty_bitmap, size * BYTES_PER_LONG) != 0 )
-            rv = -EFAULT;
-        goto out;
-    }
-    d->arch.paging.log_dirty.fault_count = 0;
-    d->arch.paging.log_dirty.dirty_count = 0;
-
-    b1 = L1_LOGDIRTY_IDX(begin_pfn);
-    b2 = L2_LOGDIRTY_IDX(begin_pfn);
-    b3 = L3_LOGDIRTY_IDX(begin_pfn);
-    b4 = L4_LOGDIRTY_IDX(begin_pfn);
-    l4 = paging_map_log_dirty_bitmap(d);
-
-    for ( i4 = b4;
-          (pages < nr) && (i4 < LOGDIRTY_NODE_ENTRIES);
-          i4++ )
-    {
-        l3 = (l4 && mfn_valid(l4[i4])) ? map_domain_page(mfn_x(l4[i4])) : NULL;
-        for ( i3 = b3;
-              (pages < nr) && (i3 < LOGDIRTY_NODE_ENTRIES);
-              i3++ )
-        {
-            l2 = ((l3 && mfn_valid(l3[i3])) ?
-                  map_domain_page(mfn_x(l3[i3])) : NULL);
-            for ( i2 = b2;
-                  (pages < nr) && (i2 < LOGDIRTY_NODE_ENTRIES);
-                  i2++ )
-            {
-                unsigned int bytes = PAGE_SIZE;
-                uint8_t *s;
-                l1 = ((l2 && mfn_valid(l2[i2])) ?
-                      map_domain_page(mfn_x(l2[i2])) : NULL);
-
-                s = ((uint8_t*)l1) + (b1 >> 3);
-                bytes -= b1 >> 3;
-
-                if ( likely(((nr - pages + 7) >> 3) < bytes) )
-                    bytes = (unsigned int)((nr - pages + 7) >> 3);
-
-                if ( !l1 )
-                {
-                    if ( clear_guest_offset(dirty_bitmap, pages >> 3,
-                                            bytes) != 0 )
-                    {
-                        rv = -EFAULT;
-                        goto out;
-                    }
-                }
-                /* begin_pfn is not 32K aligned, hence we have to bit
-                 * shift the bitmap */
-                else if ( b1 & 0x7 )
-                {
-                    int i, j;
-                    uint32_t *l = (uint32_t*) s;
-                    int bits = b1 & 0x7;
-                    int bitmask = (1 << bits) - 1;
-                    int size = (bytes + BYTES_PER_LONG - 1) / BYTES_PER_LONG;
-                    unsigned long bitmap[size];
-                    static unsigned long printed = 0;
-
-                    if ( printed != begin_pfn )
-                    {
-                        dprintk(XENLOG_DEBUG, "%s: begin_pfn %lx is not 32K aligned!\n",
-                                __FUNCTION__, begin_pfn);
-                        printed = begin_pfn;
-                    }
-
-                    for ( i = 0; i < size - 1; i++, l++ ) {
-                        bitmap[i] = ((*l) >> bits) |
-                            (((*((uint8_t*)(l + 1))) & bitmask) << (sizeof(*l) * 8 - bits));
-                    }
-                    s = (uint8_t*) l;
-                    size = BYTES_PER_LONG - ((b1 >> 3) & 0x3);
-                    bitmap[i] = 0;
-                    for ( j = 0; j < size; j++, s++ )
-                        bitmap[i] |= (*s) << (j * 8);
-                    bitmap[i] = (bitmap[i] >> bits) | (bitmask << (size * 8 - bits));
-                    if ( copy_to_guest_offset(dirty_bitmap, (pages >> 3),
-                                (uint8_t*) bitmap, bytes) != 0 )
-                    {
-                        rv = -EFAULT;
-                        goto out;
-                    }
-                }
-                else
-                {
-                    if ( copy_to_guest_offset(dirty_bitmap, pages >> 3,
-                                              s, bytes) != 0 )
-                    {
-                        rv = -EFAULT;
-                        goto out;
-                    }
-                }
-
-                pages += bytes << 3;
-                if ( l1 )
-                {
-                    clear_page(l1);
-                    unmap_domain_page(l1);
-                }
-                b1 = b1 & 0x7;
-            }
-            b2 = 0;
-            if ( l2 )
-                unmap_domain_page(l2);
-        }
-        b3 = 0;
-        if ( l3 )
-            unmap_domain_page(l3);
-    }
+    if ( l1 )
+        unmap_domain_page(l1);
+    if ( l2 )
+        unmap_domain_page(l2);
+    if ( l3 )
+        unmap_domain_page(l3);
     if ( l4 )
         unmap_domain_page(l4);
 
-    paging_unlock(d);
-
     return rv;
+}
 
- out:
-    paging_unlock(d);
-    return rv;
+void paging_log_dirty_range(struct domain *d,
+                           unsigned long begin_pfn,
+                           unsigned long nr,
+                           uint8_t *dirty_bitmap)
+{
+    struct p2m_domain *p2m = p2m_get_hostp2m(d);
+    int i;
+    unsigned long pfn;
+
+    /*
+     * Set l1e entries of P2M table to be read-only.
+     *
+     * On first write, it page faults, its entry is changed to read-write,
+     * and on retry the write succeeds.
+     *
+     * We populate dirty_bitmap by looking for entries that have been
+     * switched to read-write.
+     */
+
+    p2m_lock(p2m);
+
+    for ( i = 0, pfn = begin_pfn; pfn < begin_pfn + nr; i++, pfn++ )
+    {
+        p2m_type_t pt;
+        pt = p2m_change_type(d, pfn, p2m_ram_rw, p2m_ram_logdirty);
+        if ( pt == p2m_ram_rw )
+            dirty_bitmap[i >> 3] |= (1 << (i & 7));
+    }
+
+    p2m_unlock(p2m);
+
+    flush_tlb_mask(d->domain_dirty_cpumask);
 }
 
 /* Note that this function takes three function pointers. Callers must supply
@@ -598,7 +489,8 @@ int paging_log_dirty_range(struct domain *d,
  * These function pointers must not be followed with the log-dirty lock held.
  */
 void paging_log_dirty_init(struct domain *d,
-                           int    (*enable_log_dirty)(struct domain *d),
+                           int    (*enable_log_dirty)(struct domain *d,
+                                                      bool_t log_global),
                            int    (*disable_log_dirty)(struct domain *d),
                            void   (*clean_dirty_bitmap)(struct domain *d))
 {
@@ -678,7 +570,7 @@ int paging_domctl(struct domain *d, xen_domctl_shadow_op_t *sc,
         return -EINVAL;
     }
 
-    rc = xsm_shadow_control(d, sc->op);
+    rc = xsm_shadow_control(XSM_HOOK, d, sc->op);
     if ( rc )
         return rc;
 
@@ -699,7 +591,7 @@ int paging_domctl(struct domain *d, xen_domctl_shadow_op_t *sc,
     case XEN_DOMCTL_SHADOW_OP_ENABLE_LOGDIRTY:
         if ( hap_enabled(d) )
             hap_logdirty_init(d);
-        return paging_log_dirty_enable(d);
+        return paging_log_dirty_enable(d, 1);
 
     case XEN_DOMCTL_SHADOW_OP_OFF:
         if ( paging_mode_log_dirty(d) )
@@ -828,21 +720,19 @@ void paging_update_nestedmode(struct vcpu *v)
     else
         /* TODO: shadow-on-shadow */
         v->arch.paging.nestedmode = NULL;
+    hvm_asid_flush_vcpu(v);
 }
 
 void paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
-                            l1_pgentry_t *p, mfn_t table_mfn,
-                            l1_pgentry_t new, unsigned int level)
+                            l1_pgentry_t *p, l1_pgentry_t new,
+                            unsigned int level)
 {
     struct domain *d = p2m->domain;
     struct vcpu *v = current;
     if ( v->domain != d )
         v = d->vcpu ? d->vcpu[0] : NULL;
     if ( likely(v && paging_mode_enabled(d) && paging_get_hostmode(v) != NULL) )
-    {
-        return paging_get_hostmode(v)->write_p2m_entry(v, gfn, p, table_mfn,
-                                                       new, level);
-    }
+        paging_get_hostmode(v)->write_p2m_entry(d, gfn, p, new, level);
     else
         safe_write_pte(p, new);
 }
@@ -850,7 +740,7 @@ void paging_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

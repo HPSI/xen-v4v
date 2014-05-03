@@ -24,41 +24,6 @@
 #include <xenguest.h>
 #include <xen/hvm/hvm_info_table.h>
 
-void libxl_domain_config_init(libxl_domain_config *d_config)
-{
-    memset(d_config, 0, sizeof(*d_config));
-    libxl_domain_create_info_init(&d_config->c_info);
-    libxl_domain_build_info_init(&d_config->b_info);
-}
-
-void libxl_domain_config_dispose(libxl_domain_config *d_config)
-{
-    int i;
-
-    for (i=0; i<d_config->num_disks; i++)
-        libxl_device_disk_dispose(&d_config->disks[i]);
-    free(d_config->disks);
-
-    for (i=0; i<d_config->num_nics; i++)
-        libxl_device_nic_dispose(&d_config->nics[i]);
-    free(d_config->nics);
-
-    for (i=0; i<d_config->num_pcidevs; i++)
-        libxl_device_pci_dispose(&d_config->pcidevs[i]);
-    free(d_config->pcidevs);
-
-    for (i=0; i<d_config->num_vfbs; i++)
-        libxl_device_vfb_dispose(&d_config->vfbs[i]);
-    free(d_config->vfbs);
-
-    for (i=0; i<d_config->num_vkbs; i++)
-        libxl_device_vkb_dispose(&d_config->vkbs[i]);
-    free(d_config->vkbs);
-
-    libxl_domain_create_info_dispose(&d_config->c_info);
-    libxl_domain_build_info_dispose(&d_config->b_info);
-}
-
 int libxl__domain_create_info_setdefault(libxl__gc *gc,
                                          libxl_domain_create_info *c_info)
 {
@@ -68,9 +33,13 @@ int libxl__domain_create_info_setdefault(libxl__gc *gc,
     if (c_info->type == LIBXL_DOMAIN_TYPE_HVM) {
         libxl_defbool_setdefault(&c_info->hap, true);
         libxl_defbool_setdefault(&c_info->oos, true);
+    } else {
+        libxl_defbool_setdefault(&c_info->pvh, false);
+        libxl_defbool_setdefault(&c_info->hap, libxl_defbool_val(c_info->pvh));
     }
 
     libxl_defbool_setdefault(&c_info->run_hotplug_scripts, true);
+    libxl_defbool_setdefault(&c_info->driver_domain, false);
 
     return 0;
 }
@@ -140,22 +109,29 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
     libxl_defbool_setdefault(&b_info->device_model_stubdomain, false);
 
     if (!b_info->device_model_version) {
-        if (b_info->type == LIBXL_DOMAIN_TYPE_HVM)
+        if (b_info->type == LIBXL_DOMAIN_TYPE_HVM) {
+            if (libxl_defbool_val(b_info->device_model_stubdomain)) {
+                b_info->device_model_version =
+                    LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL;
+            } else {
+                b_info->device_model_version = libxl__default_device_model(gc);
+            }
+        } else {
             b_info->device_model_version =
-                LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL;
-        else {
+                LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN;
+        }
+        if (b_info->device_model_version
+                == LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN) {
             const char *dm;
             int rc;
 
-            b_info->device_model_version =
-                LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN;
             dm = libxl__domain_device_model(gc, b_info);
             rc = access(dm, X_OK);
             if (rc < 0) {
                 /* qemu-xen unavailable, use qemu-xen-traditional */
                 if (errno == ENOENT) {
                     LIBXL__LOG_ERRNO(CTX, XTL_VERBOSE, "qemu-xen is unavailable"
-                            ", use qemu-xen-traditional instead");
+                                     ", use qemu-xen-traditional instead");
                     b_info->device_model_version =
                         LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL;
                 } else {
@@ -219,21 +195,86 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
 
     libxl_defbool_setdefault(&b_info->numa_placement, true);
 
+    if (!b_info->nodemap.size) {
+        if (libxl_node_bitmap_alloc(CTX, &b_info->nodemap, 0))
+            return ERROR_FAIL;
+        libxl_bitmap_set_any(&b_info->nodemap);
+    }
+
     if (b_info->max_memkb == LIBXL_MEMKB_DEFAULT)
         b_info->max_memkb = 32 * 1024;
     if (b_info->target_memkb == LIBXL_MEMKB_DEFAULT)
         b_info->target_memkb = b_info->max_memkb;
 
+    libxl_defbool_setdefault(&b_info->claim_mode, false);
+
     libxl_defbool_setdefault(&b_info->localtime, false);
 
     libxl_defbool_setdefault(&b_info->disable_migrate, false);
+
+    if (!b_info->event_channels)
+        b_info->event_channels = 1023;
 
     switch (b_info->type) {
     case LIBXL_DOMAIN_TYPE_HVM:
         if (b_info->shadow_memkb == LIBXL_MEMKB_DEFAULT)
             b_info->shadow_memkb = 0;
-        if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
-            b_info->video_memkb = 8 * 1024;
+
+        if (!b_info->u.hvm.vga.kind)
+            b_info->u.hvm.vga.kind = LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
+
+        switch (b_info->device_model_version) {
+        case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL:
+            switch (b_info->u.hvm.vga.kind) {
+            case LIBXL_VGA_INTERFACE_TYPE_NONE:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 0;
+                break;
+            case LIBXL_VGA_INTERFACE_TYPE_STD:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 8 * 1024;
+                if (b_info->video_memkb < 8 * 1024) {
+                    LOG(ERROR, "videoram must be at least 8 MB for STDVGA on QEMU_XEN_TRADITIONAL");
+                    return ERROR_INVAL;
+                }
+                break;
+            case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
+            default:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 4 * 1024;
+                if (b_info->video_memkb != 4 * 1024)
+                    LOG(WARN, "ignoring videoram other than 4 MB for CIRRUS on QEMU_XEN_TRADITIONAL");
+                break;
+            }
+            break;
+        case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
+        default:
+            switch (b_info->u.hvm.vga.kind) {
+            case LIBXL_VGA_INTERFACE_TYPE_NONE:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 0;
+                break;
+            case LIBXL_VGA_INTERFACE_TYPE_STD:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 16 * 1024;
+                if (b_info->video_memkb < 16 * 1024) {
+                    LOG(ERROR, "videoram must be at least 16 MB for STDVGA on QEMU_XEN");
+                    return ERROR_INVAL;
+                }
+                break;
+            case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
+            default:
+                if (b_info->video_memkb == LIBXL_MEMKB_DEFAULT)
+                    b_info->video_memkb = 8 * 1024;
+                if (b_info->video_memkb < 8 * 1024) {
+                    LOG(ERROR, "videoram must be at least 8 MB for CIRRUS on QEMU_XEN");
+                    return ERROR_INVAL;
+                }
+                break;
+            }
+            break;
+        }
+
         if (b_info->u.hvm.timer_mode == LIBXL_TIMER_MODE_DEFAULT)
             b_info->u.hvm.timer_mode =
                 LIBXL_TIMER_MODE_NO_DELAY_FOR_MISSED_TICKS;
@@ -251,13 +292,24 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
         libxl_defbool_setdefault(&b_info->u.hvm.usb,                false);
         libxl_defbool_setdefault(&b_info->u.hvm.xen_platform_pci,   true);
 
+        if (!b_info->u.hvm.usbversion &&
+            (b_info->u.hvm.spice.usbredirection > 0) )
+            b_info->u.hvm.usbversion = 2;
+
+        if ((b_info->u.hvm.usbversion || b_info->u.hvm.spice.usbredirection) &&
+            ( libxl_defbool_val(b_info->u.hvm.usb)
+            || b_info->u.hvm.usbdevice_list
+            || b_info->u.hvm.usbdevice) ){
+            LOG(ERROR,"usbversion and/or usbredirection cannot be "
+            "enabled with usb and/or usbdevice parameters.");
+            return ERROR_INVAL;
+        }
+
         if (!b_info->u.hvm.boot) {
             b_info->u.hvm.boot = strdup("cda");
             if (!b_info->u.hvm.boot) return ERROR_NOMEM;
         }
 
-        if (!b_info->u.hvm.vga.kind)
-            b_info->u.hvm.vga.kind = LIBXL_VGA_INTERFACE_TYPE_CIRRUS;
         libxl_defbool_setdefault(&b_info->u.hvm.vnc.enable, true);
         if (libxl_defbool_val(b_info->u.hvm.vnc.enable)) {
             libxl_defbool_setdefault(&b_info->u.hvm.vnc.findunused, true);
@@ -277,6 +329,9 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
             libxl_defbool_setdefault(&b_info->u.hvm.spice.disable_ticketing,
                                      false);
             libxl_defbool_setdefault(&b_info->u.hvm.spice.agent_mouse, true);
+            libxl_defbool_setdefault(&b_info->u.hvm.spice.vdagent, false);
+            libxl_defbool_setdefault(&b_info->u.hvm.spice.clipboard_sharing,
+                                     false);
         }
 
         libxl_defbool_setdefault(&b_info->u.hvm.nographic, false);
@@ -312,15 +367,16 @@ static int init_console_info(libxl__device_console *console, int dev_num)
 }
 
 int libxl__domain_build(libxl__gc *gc,
-                        libxl_domain_build_info *info,
+                        libxl_domain_config *d_config,
                         uint32_t domid,
                         libxl__domain_build_state *state)
 {
+    libxl_domain_build_info *const info = &d_config->b_info;
     char **vments = NULL, **localents = NULL;
     struct timeval start_time;
     int i, ret;
 
-    ret = libxl__build_pre(gc, domid, info, state);
+    ret = libxl__build_pre(gc, domid, d_config, state);
     if (ret)
         goto out;
 
@@ -350,6 +406,8 @@ int libxl__domain_build(libxl__gc *gc,
 
         break;
     case LIBXL_DOMAIN_TYPE_PV:
+        state->pvh_enabled = libxl_defbool_val(d_config->c_info.pvh);
+
         ret = libxl__build_pv(gc, domid, info, state);
         if (ret)
             goto out;
@@ -409,6 +467,14 @@ int libxl__domain_make(libxl__gc *gc, libxl_domain_create_info *info,
         flags |= XEN_DOMCTL_CDF_hvm_guest;
         flags |= libxl_defbool_val(info->hap) ? XEN_DOMCTL_CDF_hap : 0;
         flags |= libxl_defbool_val(info->oos) ? 0 : XEN_DOMCTL_CDF_oos_off;
+    } else if (libxl_defbool_val(info->pvh)) {
+        flags |= XEN_DOMCTL_CDF_pvh_guest;
+        if (!libxl_defbool_val(info->hap)) {
+            LOG(ERROR, "HAP must be on for PVH");
+            rc = ERROR_INVAL;
+            goto out;
+        }
+        flags |= XEN_DOMCTL_CDF_hap;
     }
     *domid = -1;
 
@@ -502,6 +568,22 @@ retry_transaction:
     libxl__xs_mkdir(gc, t,
                     libxl__sprintf(gc, "%s/data", dom_path),
                     rwperm, ARRAY_SIZE(rwperm));
+
+    if (libxl_defbool_val(info->driver_domain)) {
+        /*
+         * Create a local "libxl" directory for each guest, since we might want
+         * to use libxl from inside the guest
+         */
+        libxl__xs_mkdir(gc, t, GCSPRINTF("%s/libxl", dom_path), rwperm,
+                        ARRAY_SIZE(rwperm));
+        /*
+         * Create a local "device-model" directory for each guest, since we
+         * might want to use Qemu from inside the guest
+         */
+        libxl__xs_mkdir(gc, t, GCSPRINTF("%s/device-model", dom_path), rwperm,
+                        ARRAY_SIZE(rwperm));
+    }
+
     if (info->type == LIBXL_DOMAIN_TYPE_HVM)
         libxl__xs_mkdir(gc, t,
             libxl__sprintf(gc, "%s/hvmloader/generation-id-address", dom_path),
@@ -601,6 +683,8 @@ static void domcreate_bootloader_done(libxl__egc *egc,
 static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *aodevs,
                                 int ret);
 
+static void domcreate_attach_vtpms(libxl__egc *egc, libxl__multidev *multidev,
+                                   int ret);
 static void domcreate_attach_pci(libxl__egc *egc, libxl__multidev *aodevs,
                                  int ret);
 
@@ -630,6 +714,8 @@ static void initiate_domain_create(libxl__egc *egc,
     libxl_ctx *ctx = libxl__gc_owner(gc);
     uint32_t domid;
     int i, ret;
+    size_t last_devid = -1;
+    bool pod_enabled = false;
 
     /* convenience aliases */
     libxl_domain_config *const d_config = dcs->guest_config;
@@ -637,6 +723,25 @@ static void initiate_domain_create(libxl__egc *egc,
     memset(&dcs->build_state, 0, sizeof(dcs->build_state));
 
     domid = 0;
+
+    /* If target_memkb is smaller than max_memkb, the subsequent call
+     * to libxc when building HVM domain will enable PoD mode.
+     */
+    pod_enabled = (d_config->c_info.type == LIBXL_DOMAIN_TYPE_HVM) &&
+        (d_config->b_info.target_memkb < d_config->b_info.max_memkb);
+
+    /* We cannot have PoD and PCI device assignment at the same time
+     * for HVM guest. It was reported that IOMMU cannot work with PoD
+     * enabled because it needs to populated entire page table for
+     * guest. To stay on the safe side, we disable PCI device
+     * assignment when PoD is enabled.
+     */
+    if (d_config->c_info.type == LIBXL_DOMAIN_TYPE_HVM &&
+        d_config->num_pcidevs && pod_enabled) {
+        ret = ERROR_INVAL;
+        LOG(ERROR, "PCI device assignment for HVM guest failed due to PoD enabled");
+        goto error_out;
+    }
 
     ret = libxl__domain_create_info_setdefault(gc, &d_config->c_info);
     if (ret) goto error_out;
@@ -669,6 +774,29 @@ static void initiate_domain_create(libxl__egc *egc,
     dcs->bl.ao = ao;
     libxl_device_disk *bootdisk =
         d_config->num_disks > 0 ? &d_config->disks[0] : NULL;
+
+    /*
+     * The devid has to be set before launching the device model. For the
+     * hotplug case this is done in libxl_device_nic_add but on domain
+     * creation this is called too late.
+     * Make two runs over configured NICs in order to avoid duplicate IDs
+     * in case the caller partially assigned IDs.
+     */
+    for (i = 0; i < d_config->num_nics; i++) {
+        /* We have to init the nic here, because we still haven't
+         * called libxl_device_nic_add when domcreate_launch_dm gets called,
+         * but qemu needs the nic information to be complete.
+         */
+        ret = libxl__device_nic_setdefault(gc, &d_config->nics[i], domid);
+        if (ret) goto error_out;
+
+        if (d_config->nics[i].devid > last_devid)
+            last_devid = d_config->nics[i].devid;
+    }
+    for (i = 0; i < d_config->num_nics; i++) {
+        if (d_config->nics[i].devid < 0)
+            d_config->nics[i].devid = ++last_devid;
+    }
 
     if (restore_fd >= 0) {
         LOG(DEBUG, "restoring, not running bootloader\n");
@@ -745,14 +873,14 @@ static void domcreate_bootloader_done(libxl__egc *egc,
     dcs->dmss.callback = domcreate_devmodel_started;
 
     if ( restore_fd < 0 ) {
-        rc = libxl__domain_build(gc, &d_config->b_info, domid, state);
+        rc = libxl__domain_build(gc, d_config, domid, state);
         domcreate_rebuild_done(egc, dcs, rc);
         return;
     }
 
     /* Restore */
 
-    rc = libxl__build_pre(gc, domid, info, state);
+    rc = libxl__build_pre(gc, domid, d_config, state);
     if (rc)
         goto out;
 
@@ -952,14 +1080,16 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
     }
 
     for (i = 0; i < d_config->b_info.num_irqs; i++) {
-        uint32_t irq = d_config->b_info.irqs[i];
+        int irq = d_config->b_info.irqs[i];
 
-        LOG(DEBUG, "dom%d irq %"PRIx32, domid, irq);
+        LOG(DEBUG, "dom%d irq %d", domid, irq);
 
-        ret = xc_domain_irq_permission(CTX->xch, domid, irq, 1);
+        ret = irq >= 0 ? xc_physdev_map_pirq(CTX->xch, domid, irq, &irq)
+                       : -EOVERFLOW;
+        if (!ret)
+            ret = xc_domain_irq_permission(CTX->xch, domid, irq, 1);
         if (ret < 0) {
-            LOGE(ERROR,
-                 "failed give dom%d access to irq %"PRId32, domid, irq);
+            LOGE(ERROR, "failed give dom%d access to irq %d", domid, irq);
             ret = ERROR_FAIL;
         }
     }
@@ -980,17 +1110,6 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
         }
     }
 
-
-
-    for (i = 0; i < d_config->num_nics; i++) {
-        /* We have to init the nic here, because we still haven't
-         * called libxl_device_nic_add at this point, but qemu needs
-         * the nic information to be complete.
-         */
-        ret = libxl__device_nic_setdefault(gc, &d_config->nics[i], domid);
-        if (ret)
-            goto error_out;
-    }
     switch (d_config->c_info.type) {
     case LIBXL_DOMAIN_TYPE_HVM:
     {
@@ -1000,6 +1119,7 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
         ret = init_console_info(&console, 0);
         if ( ret )
             goto error_out;
+        console.backend_domid = state->console_domid;
         libxl__device_console_add(gc, domid, &console, state);
         libxl__device_console_dispose(&console);
 
@@ -1032,6 +1152,7 @@ static void domcreate_launch_dm(libxl__egc *egc, libxl__multidev *multidev,
                 d_config->num_vfbs, d_config->vfbs,
                 d_config->num_disks, &d_config->disks[0]);
 
+        console.backend_domid = state->console_domid;
         libxl__device_console_add(gc, domid, &console, state);
         libxl__device_console_dispose(&console);
 
@@ -1085,18 +1206,51 @@ static void domcreate_devmodel_started(libxl__egc *egc,
     if (d_config->num_nics > 0) {
         /* Attach nics */
         libxl__multidev_begin(ao, &dcs->multidev);
-        dcs->multidev.callback = domcreate_attach_pci;
+        dcs->multidev.callback = domcreate_attach_vtpms;
         libxl__add_nics(egc, ao, domid, d_config, &dcs->multidev);
         libxl__multidev_prepared(egc, &dcs->multidev, 0);
         return;
     }
 
-    domcreate_attach_pci(egc, &dcs->multidev, 0);
+    domcreate_attach_vtpms(egc, &dcs->multidev, 0);
     return;
 
 error_out:
     assert(ret);
     domcreate_complete(egc, dcs, ret);
+}
+
+static void domcreate_attach_vtpms(libxl__egc *egc,
+                                   libxl__multidev *multidev,
+                                   int ret)
+{
+   libxl__domain_create_state *dcs = CONTAINER_OF(multidev, *dcs, multidev);
+   STATE_AO_GC(dcs->ao);
+   int domid = dcs->guest_domid;
+
+   libxl_domain_config* const d_config = dcs->guest_config;
+
+   if(ret) {
+       LOG(ERROR, "unable to add nic devices");
+       goto error_out;
+   }
+
+    /* Plug vtpm devices */
+   if (d_config->num_vtpms > 0) {
+       /* Attach vtpms */
+       libxl__multidev_begin(ao, &dcs->multidev);
+       dcs->multidev.callback = domcreate_attach_pci;
+       libxl__add_vtpms(egc, ao, domid, d_config, &dcs->multidev);
+       libxl__multidev_prepared(egc, &dcs->multidev, 0);
+       return;
+   }
+
+   domcreate_attach_pci(egc, multidev, 0);
+   return;
+
+error_out:
+   assert(ret);
+   domcreate_complete(egc, dcs, ret);
 }
 
 static void domcreate_attach_pci(libxl__egc *egc, libxl__multidev *multidev,
@@ -1112,12 +1266,18 @@ static void domcreate_attach_pci(libxl__egc *egc, libxl__multidev *multidev,
     libxl_domain_config *const d_config = dcs->guest_config;
 
     if (ret) {
-        LOG(ERROR, "unable to add nic devices");
+        LOG(ERROR, "unable to add vtpm devices");
         goto error_out;
     }
 
-    for (i = 0; i < d_config->num_pcidevs; i++)
-        libxl__device_pci_add(gc, domid, &d_config->pcidevs[i], 1);
+    for (i = 0; i < d_config->num_pcidevs; i++) {
+        ret = libxl__device_pci_add(gc, domid, &d_config->pcidevs[i], 1);
+        if (ret < 0) {
+            LIBXL__LOG(ctx, LIBXL__LOG_ERROR,
+                       "libxl_device_pci_add failed: %d", ret);
+            goto error_out;
+        }
+    }
 
     if (d_config->num_pcidevs > 0) {
         ret = libxl__create_pci_backend(gc, domid, d_config->pcidevs,
@@ -1129,7 +1289,6 @@ static void domcreate_attach_pci(libxl__egc *egc, libxl__multidev *multidev,
         }
     }
 
-    libxl__arch_domain_create(gc, d_config, domid);
     domcreate_console_available(egc, dcs);
 
     domcreate_complete(egc, dcs, 0);
@@ -1145,6 +1304,10 @@ static void domcreate_complete(libxl__egc *egc,
                                int rc)
 {
     STATE_AO_GC(dcs->ao);
+    libxl_domain_config *const d_config = dcs->guest_config;
+
+    if (!rc && d_config->b_info.exec_ssidref)
+        rc = xc_flask_relabel_domain(CTX->xch, dcs->guest_domid, d_config->b_info.exec_ssidref);
 
     if (rc) {
         if (dcs->guest_domid) {
@@ -1186,7 +1349,8 @@ static void domain_create_cb(libxl__egc *egc,
 
 static int do_domain_create(libxl_ctx *ctx, libxl_domain_config *d_config,
                             uint32_t *domid,
-                            int restore_fd, const libxl_asyncop_how *ao_how,
+                            int restore_fd, int checkpointed_stream,
+                            const libxl_asyncop_how *ao_how,
                             const libxl_asyncprogress_how *aop_console_how)
 {
     AO_CREATE(ctx, 0, ao_how);
@@ -1197,6 +1361,7 @@ static int do_domain_create(libxl_ctx *ctx, libxl_domain_config *d_config,
     cdcs->dcs.guest_config = d_config;
     cdcs->dcs.restore_fd = restore_fd;
     cdcs->dcs.callback = domain_create_cb;
+    cdcs->dcs.checkpointed_stream = checkpointed_stream;
     libxl__ao_progress_gethow(&cdcs->dcs.aop_console_how, aop_console_how);
     cdcs->domid_out = domid;
 
@@ -1223,17 +1388,18 @@ int libxl_domain_create_new(libxl_ctx *ctx, libxl_domain_config *d_config,
                             const libxl_asyncop_how *ao_how,
                             const libxl_asyncprogress_how *aop_console_how)
 {
-    return do_domain_create(ctx, d_config, domid, -1,
+    return do_domain_create(ctx, d_config, domid, -1, 0,
                             ao_how, aop_console_how);
 }
 
 int libxl_domain_create_restore(libxl_ctx *ctx, libxl_domain_config *d_config,
                                 uint32_t *domid, int restore_fd,
+                                const libxl_domain_restore_params *params,
                                 const libxl_asyncop_how *ao_how,
-                            const libxl_asyncprogress_how *aop_console_how)
+                                const libxl_asyncprogress_how *aop_console_how)
 {
     return do_domain_create(ctx, d_config, domid, restore_fd,
-                            ao_how, aop_console_how);
+                            params->checkpointed_stream, ao_how, aop_console_how);
 }
 
 /*

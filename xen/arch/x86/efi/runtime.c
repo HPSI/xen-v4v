@@ -28,6 +28,10 @@ UINTN __read_mostly efi_memmap_size;
 UINTN __read_mostly efi_mdesc_size;
 void *__read_mostly efi_memmap;
 
+UINT64 __read_mostly efi_boot_max_var_store_size;
+UINT64 __read_mostly efi_boot_remain_var_store_size;
+UINT64 __read_mostly efi_boot_max_var_size;
+
 struct efi __read_mostly efi = {
 	.acpi   = EFI_INVALID_TABLE_ADDR,
 	.acpi20 = EFI_INVALID_TABLE_ADDR,
@@ -36,6 +40,8 @@ struct efi __read_mostly efi = {
 };
 
 l4_pgentry_t *__read_mostly efi_l4_pgtable;
+
+const struct efi_pci_rom *__read_mostly efi_pci_roms;
 
 unsigned long efi_rs_enter(void)
 {
@@ -46,7 +52,7 @@ unsigned long efi_rs_enter(void)
     /* prevent fixup_page_fault() from doing anything */
     irq_enter();
 
-    if ( !is_hvm_vcpu(current) && !is_idle_vcpu(current) )
+    if ( is_pv_vcpu(current) && !is_idle_vcpu(current) )
     {
         struct desc_ptr gdt_desc = {
             .limit = LAST_RESERVED_GDT_BYTE,
@@ -65,7 +71,7 @@ unsigned long efi_rs_enter(void)
 void efi_rs_leave(unsigned long cr3)
 {
     write_cr3(cr3);
-    if ( !is_hvm_vcpu(current) && !is_idle_vcpu(current) )
+    if ( is_pv_vcpu(current) && !is_idle_vcpu(current) )
     {
         struct desc_ptr gdt_desc = {
             .limit = LAST_RESERVED_GDT_BYTE,
@@ -177,6 +183,22 @@ int efi_get_info(uint32_t idx, union xenpf_efi_info *info)
             }
         }
         return -ESRCH;
+    case XEN_FW_EFI_PCI_ROM: {
+        const struct efi_pci_rom *ent;
+
+        for ( ent = efi_pci_roms; ent; ent = ent->next )
+            if ( info->pci_rom.segment == ent->segment &&
+                 info->pci_rom.bus == ent->bus &&
+                 info->pci_rom.devfn == ent->devfn &&
+                 info->pci_rom.vendor == ent->vendor &&
+                 info->pci_rom.devid == ent->devid )
+            {
+                info->pci_rom.address = __pa(ent->data);
+                info->pci_rom.size = ent->size;
+                return 0;
+            }
+        return -ESRCH;
+    }
     default:
         return -EINVAL;
     }
@@ -380,9 +402,6 @@ int efi_runtime_call(struct xenpf_efi_runtime_call *op)
         long len;
         unsigned char *data;
 
-        if ( op->misc )
-            return -EINVAL;
-
         len = gwstrlen(guest_handle_cast(op->u.set_variable.name, CHAR16));
         if ( len < 0 )
             return len;
@@ -449,6 +468,35 @@ int efi_runtime_call(struct xenpf_efi_runtime_call *op)
     break;
 
     case XEN_EFI_query_variable_info:
+        if ( op->misc & ~XEN_EFI_VARINFO_BOOT_SNAPSHOT )
+            return -EINVAL;
+
+        if ( op->misc & XEN_EFI_VARINFO_BOOT_SNAPSHOT )
+        {
+            if ( (op->u.query_variable_info.attr
+                  & ~EFI_VARIABLE_APPEND_WRITE) !=
+                 (EFI_VARIABLE_NON_VOLATILE |
+                  EFI_VARIABLE_BOOTSERVICE_ACCESS |
+                  EFI_VARIABLE_RUNTIME_ACCESS) )
+                return -EINVAL;
+
+            op->u.query_variable_info.max_store_size =
+                efi_boot_max_var_store_size;
+            op->u.query_variable_info.remain_store_size =
+                efi_boot_remain_var_store_size;
+            if ( efi_boot_max_var_store_size )
+            {
+                op->u.query_variable_info.max_size = efi_boot_max_var_size;
+                status = EFI_SUCCESS;
+            }
+            else
+            {
+                op->u.query_variable_info.max_size = 0;
+                status = efi_boot_max_var_size;
+            }
+            break;
+        }
+
         cr3 = efi_rs_enter();
         if ( (efi_rs->Hdr.Revision >> 16) < 2 )
         {
@@ -465,6 +513,9 @@ int efi_runtime_call(struct xenpf_efi_runtime_call *op)
 
     case XEN_EFI_query_capsule_capabilities:
     case XEN_EFI_update_capsule:
+        if ( op->misc )
+            return -EINVAL;
+
         cr3 = efi_rs_enter();
         if ( (efi_rs->Hdr.Revision >> 16) < 2 )
         {
@@ -480,7 +531,7 @@ int efi_runtime_call(struct xenpf_efi_runtime_call *op)
 #ifndef COMPAT
     op->status = status;
 #else
-    op->status = (status & 0x3fffffff) | (status >> 62);
+    op->status = (status & 0x3fffffff) | ((status >> 32) & 0xc0000000);
 #endif
 
     return rc;

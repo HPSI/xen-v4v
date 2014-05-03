@@ -1,68 +1,66 @@
-#!/usr/bin/make -f
-
 XEN_ROOT=$(CURDIR)/..
 include $(XEN_ROOT)/Config.mk
-include $(XEN_ROOT)/docs/Docs.mk
+-include $(XEN_ROOT)/config/Docs.mk
 
-VERSION		= xen-unstable
+VERSION		:= $(shell $(MAKE) -C $(XEN_ROOT)/xen --no-print-directory xenversion)
 
-DOC_MAN5SRC	:= $(wildcard man/*.pod.5)
-DOC_MAN1SRC	:= $(wildcard man/*.pod.1)
-DOC_MAN1	:= $(patsubst man/%.pod.1,man1/%.1,$(DOC_MAN1SRC))
-DOC_MAN5	:= $(patsubst man/%.pod.5,man5/%.5,$(DOC_MAN5SRC))
-DOC_MARKDOWN	:= $(wildcard misc/*.markdown)
-DOC_HTML	:= $(patsubst %.markdown,html/%.html,$(DOC_MARKDOWN)) \
-		   $(patsubst man/%.pod.1,html/man/%.1.html,$(DOC_MAN1SRC)) \
-		   $(patsubst man/%.pod.5,html/man/%.5.html,$(DOC_MAN5SRC)) \
-		   $(patsubst %.txt,html/%.txt,$(wildcard misc/*.txt)) \
-		   html/hypercall/index.html
-DOC_TXT         := $(patsubst %.txt,txt/%.txt,$(wildcard misc/*.txt)) \
-		   $(patsubst %.markdown,txt/%.txt,$(DOC_MARKDOWN)) \
-		   $(patsubst man/%.pod.1,txt/man/%.1.txt,$(DOC_MAN1SRC)) \
-		   $(patsubst man/%.pod.5,txt/man/%.5.txt,$(DOC_MAN5SRC))
+DOC_ARCHES      := arm x86_32 x86_64
+
+# Documentation sources to build
+MAN1SRC-y := $(wildcard man/xl*.pod.1)
+MAN1SRC-y += $(wildcard man/xenstore*.pod.1)
+
+MAN5SRC-y := $(wildcard man/xl*.pod.5)
+
+MARKDOWNSRC-y := $(wildcard misc/*.markdown)
+
+TXTSRC-y := $(wildcard misc/*.txt)
+
+
+DOC_MAN1 := $(patsubst man/%.pod.1,man1/%.1,$(MAN1SRC-y))
+DOC_MAN5 := $(patsubst man/%.pod.5,man5/%.5,$(MAN5SRC-y))
+DOC_HTML := $(patsubst %.markdown,html/%.html,$(MARKDOWNSRC-y)) \
+            $(patsubst man/%.pod.1,html/man/%.1.html,$(MAN1SRC-y)) \
+            $(patsubst man/%.pod.5,html/man/%.5.html,$(MAN5SRC-y)) \
+            $(patsubst %.txt,html/%.txt,$(TXTSRC-y)) \
+            $(patsubst %,html/hypercall/%/index.html,$(DOC_ARCHES))
+DOC_TXT  := $(patsubst %.txt,txt/%.txt,$(TXTSRC-y)) \
+            $(patsubst %.markdown,txt/%.txt,$(MARKDOWNSRC-y)) \
+            $(patsubst man/%.pod.1,txt/man/%.1.txt,$(MAN1SRC-y)) \
+            $(patsubst man/%.pod.5,txt/man/%.5.txt,$(MAN5SRC-y))
 
 .PHONY: all
 all: build
 
 .PHONY: build
 build: html txt man-pages figs
-	@if which $(DOT) 1>/dev/null 2>/dev/null ; then              \
-	$(MAKE) -C xen-api build ; else                              \
-        echo "Graphviz (dot) not installed; skipping xen-api." ; fi
-	rm -f *.aux *.dvi *.bbl *.blg *.glo *.idx *.ilg *.log *.ind *.toc
-
-.PHONY: dev-docs
-dev-docs: python-dev-docs
 
 .PHONY: html
 html: $(DOC_HTML) html/index.html
 
 .PHONY: txt
 txt:
-	@if which $(POD2TEXT) 1>/dev/null 2>/dev/null; then \
-	$(MAKE) $(DOC_TXT); else              \
-	echo "pod2text not installed; skipping text outputs."; fi
+ifdef POD2TEXT
+	$(MAKE) $(DOC_TXT)
+else
+	@echo "pod2text not installed; skipping text outputs."
+endif
 
 .PHONY: figs
 figs:
-	@set -e ; if which $(FIG2DEV) 1>/dev/null 2>/dev/null; then \
-	set -x; $(MAKE) -C figs ; else                   \
-	echo "fig2dev (transfig) not installed; skipping figs."; fi
-
-.PHONY: python-dev-docs
-python-dev-docs:
-	@mkdir -v -p api/tools/python
-	@set -e ; if which $(DOXYGEN) 1>/dev/null 2>/dev/null; then \
-        echo "Running doxygen to generate Python tools APIs ... "; \
-	$(DOXYGEN) Doxyfile;                                       \
-	$(MAKE) -C api/tools/python/latex ; else                   \
-        echo "Doxygen not installed; skipping python-dev-docs."; fi
+ifdef FIG2DEV
+	set -x; $(MAKE) -C figs
+else
+	@echo "fig2dev (transfig) not installed; skipping figs."
+endif
 
 .PHONY: man-pages
 man-pages:
-	@if which $(POD2MAN) 1>/dev/null 2>/dev/null; then \
-	$(MAKE) $(DOC_MAN1) $(DOC_MAN5); else              \
-	echo "pod2man not installed; skipping man-pages."; fi
+ifdef POD2MAN
+	$(MAKE) $(DOC_MAN1) $(DOC_MAN5)
+else
+	@echo "pod2man not installed; skipping man-pages."
+endif
 
 man1/%.1: man/%.pod.1 Makefile
 	$(INSTALL_DIR) $(@D)
@@ -76,64 +74,81 @@ man5/%.5: man/%.pod.5 Makefile
 
 .PHONY: clean
 clean:
-	$(MAKE) -C xen-api clean
 	$(MAKE) -C figs clean
 	rm -rf .word_count *.aux *.dvi *.bbl *.blg *.glo *.idx *~ 
-	rm -rf *.ilg *.log *.ind *.toc *.bak core
+	rm -rf *.ilg *.log *.ind *.toc *.bak *.tmp core
 	rm -rf html txt
-	rm -rf api
 	rm -rf man5
 	rm -rf man1
 
 .PHONY: distclean
 distclean: clean
+	rm -rf $(XEN_ROOT)/config/Docs.mk config.log config.status config.cache \
+		autom4te.cache
+
+.PHONY: install-man-pages
+install-man-pages: man-pages
+	$(INSTALL_DIR) $(DESTDIR)$(MANDIR)
+	cp -R man1 $(DESTDIR)$(MANDIR)
+	cp -R man5 $(DESTDIR)$(MANDIR)
+
+.PHONY: install-html
+install-html: html txt figs
+	$(INSTALL_DIR) $(DESTDIR)$(DOCDIR)
+	[ ! -d html ] || cp -R html $(DESTDIR)$(DOCDIR)
 
 .PHONY: install
-install: all
-	rm -rf $(DESTDIR)$(DOCDIR)
-	$(INSTALL_DIR) $(DESTDIR)$(DOCDIR)
+install: install-man-pages install-html
 
-	$(MAKE) -C xen-api install
-
-	$(INSTALL_DIR) $(DESTDIR)$(MANDIR)
-	cp -dR man1 $(DESTDIR)$(MANDIR)
-	cp -dR man5 $(DESTDIR)$(MANDIR)
-	[ ! -d html ] || cp -dR html $(DESTDIR)$(DOCDIR)
-
-html/index.html: $(DOC_HTML) ./gen-html-index INDEX
-	perl -w -- ./gen-html-index -i INDEX html $(DOC_HTML)
+html/index.html: $(DOC_HTML) $(CURDIR)/gen-html-index INDEX
+	$(PERL) -w -- $(CURDIR)/gen-html-index -i INDEX html $(DOC_HTML)
 
 html/%.html: %.markdown
-	@$(INSTALL_DIR) $(@D)
-	@set -e ; if which $(MARKDOWN) 1>/dev/null 2>/dev/null; then \
-	echo "Running markdown to generate $*.html ... "; \
+	$(INSTALL_DIR) $(@D)
+ifdef MARKDOWN
+	@echo "Running markdown to generate $*.html ... "
 	$(MARKDOWN) $< > $@.tmp ; \
-	$(call move-if-changed,$@.tmp,$@) ; else \
-	echo "markdown not installed; skipping $*.html."; fi
+	$(call move-if-changed,$@.tmp,$@)
+else
+	@echo "markdown not installed; skipping $*.html."
+endif
 
 html/%.txt: %.txt
-	@$(INSTALL_DIR) $(@D)
+	$(INSTALL_DIR) $(@D)
 	cp $< $@
 
 html/man/%.1.html: man/%.pod.1 Makefile
 	$(INSTALL_DIR) $(@D)
+ifdef POD2HTML
 	$(POD2HTML) --infile=$< --outfile=$@.tmp
 	$(call move-if-changed,$@.tmp,$@)
+else
+	@echo "pod2html not installed; skipping $<."
+endif
 
 html/man/%.5.html: man/%.pod.5 Makefile
 	$(INSTALL_DIR) $(@D)
+ifdef POD2HTML
 	$(POD2HTML) --infile=$< --outfile=$@.tmp
 	$(call move-if-changed,$@.tmp,$@)
+else
+	@echo "pod2html not installed; skipping $<."
+endif
 
-html/hypercall/index.html: ./xen-headers
+# For non-x86 arches exclude the subarch whole x86 arch.
+$(foreach i,$(filter-out x86_32 x86_64,$(DOC_ARCHES)),html/hypercall/$(i)/index.html): EXTRA_EXCLUDE := -X arch-x86
+
+html/hypercall/%/index.html: $(CURDIR)/xen-headers Makefile
 	rm -rf $(@D)
-	@$(INSTALL_DIR) $(@D)
-	./xen-headers -O $(@D) \
-		-T 'arch-x86_64 - Xen public headers' \
-		-X arch-ia64 -X arch-x86_32 -X xen-x86_32 -X arch-arm \
-		../xen include/public include/xen/errno.h
+	$(INSTALL_DIR) $(@D)
+	$(PERL) -w $(CURDIR)/xen-headers -O $(@D) \
+		-T 'arch-$* - Xen public headers' \
+		$(patsubst %,-X arch-%,$(filter-out $*,$(DOC_ARCHES))) \
+		$(patsubst %,-X xen-%,$(filter-out $*,$(DOC_ARCHES))) \
+		$(EXTRA_EXCLUDE) \
+		$(XEN_ROOT)/xen include/public include/xen/errno.h
 
--include html/hypercall/.deps
+-include $(wildcard html/hypercall/*/.deps)
 
 txt/%.txt: %.txt
 	$(INSTALL_DIR) $(@D)
@@ -147,11 +162,23 @@ txt/%.txt: %.markdown
 
 txt/man/%.1.txt: man/%.pod.1 Makefile
 	$(INSTALL_DIR) $(@D)
+ifdef POD2TEXT
 	$(POD2TEXT) $< $@.tmp
 	$(call move-if-changed,$@.tmp,$@)
+else
+	@echo "pod2text not installed; skipping $<."
+endif
 
 txt/man/%.5.txt: man/%.pod.5 Makefile
 	$(INSTALL_DIR) $(@D)
+ifdef POD2TEXT
 	$(POD2TEXT) $< $@.tmp
 	$(call move-if-changed,$@.tmp,$@)
+else
+	@echo "pod2text not installed; skipping $<."
+endif
 
+ifeq (,$(findstring clean,$(MAKECMDGOALS)))
+$(XEN_ROOT)/config/Docs.mk:
+	$(error You have to run ./configure before building docs)
+endif

@@ -449,8 +449,6 @@ DEFINE_XEN_GUEST_HANDLE(gnttab_transfer_t);
 #define GNTCOPY_source_gref       (1<<_GNTCOPY_source_gref)
 #define _GNTCOPY_dest_gref        (1)
 #define GNTCOPY_dest_gref         (1<<_GNTCOPY_dest_gref)
-#define _GNTCOPY_can_fail         (2)
-#define GNTCOPY_can_fail          (1<<_GNTCOPY_can_fail)
 
 struct gnttab_copy {
     /* IN parameters. */
@@ -656,7 +654,7 @@ DEFINE_XEN_GUEST_HANDLE(gnttab_swap_grant_ref_t);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

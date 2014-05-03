@@ -21,11 +21,12 @@
 
 #include <xen/lib.h>
 #include <asm/processor.h>
+#include <asm/regs.h>
 
 typedef struct
 {
     struct hsr_dabt dabt;
-    uint32_t gva;
+    vaddr_t gva;
     paddr_t gpa;
 } mmio_info_t;
 
@@ -40,7 +41,7 @@ struct mmio_handler {
 };
 
 extern const struct mmio_handler vgic_distr_mmio_handler;
-extern const struct mmio_handler uart0_mmio_handler;
+extern const struct mmio_handler vuart_mmio_handler;
 
 extern int handle_mmio(mmio_info_t *info);
 
@@ -49,7 +50,7 @@ extern int handle_mmio(mmio_info_t *info);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

@@ -19,6 +19,7 @@ obj-bin-y += dmi_scan.init.o
 obj-y += domctl.o
 obj-y += domain.o
 obj-bin-y += domain_build.init.o
+obj-y += domain_page.o
 obj-y += e820.o
 obj-y += extable.o
 obj-y += flushtlb.o
@@ -165,7 +166,7 @@ efi/mkreloc: efi/mkreloc.c
 
 .PHONY: clean
 clean::
-	rm -f asm-offsets.s xen.lds boot/*.o boot/*~ boot/core boot/mkelf32
+	rm -f asm-offsets.s *.lds boot/*.o boot/*~ boot/core boot/mkelf32
 	rm -f $(BASEDIR)/.xen-syms.[0-9]* boot/.*.d
-	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.o efi/mkreloc efi/.*.d
+	rm -f $(BASEDIR)/.xen.efi.[0-9]* efi/*.o efi/.*.d efi/*.efi efi/disabled efi/mkreloc
 	rm -f boot/reloc.S boot/reloc.lnk boot/reloc.bin

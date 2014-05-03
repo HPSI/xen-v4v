@@ -82,10 +82,9 @@ int vmce_restore_vcpu(struct vcpu *v, const struct hvm_vmce_vcpu *ctxt)
     if ( ctxt->caps & ~guest_mcg_cap & ~MCG_CAP_COUNT & ~MCG_CTL_P )
     {
         dprintk(XENLOG_G_ERR, "%s restore: unsupported MCA capabilities"
-                " %#" PRIx64 " for d%d:v%u (supported: %#Lx)\n",
-                is_hvm_vcpu(v) ? "HVM" : "PV", ctxt->caps,
-                v->domain->domain_id, v->vcpu_id,
-                guest_mcg_cap & ~MCG_CAP_COUNT);
+                " %#" PRIx64 " for %pv (supported: %#Lx)\n",
+                has_hvm_container_vcpu(v) ? "HVM" : "PV", ctxt->caps,
+                v, guest_mcg_cap & ~MCG_CAP_COUNT);
         return -EPERM;
     }
 
@@ -107,7 +106,7 @@ static int bank_mce_rdmsr(const struct vcpu *v, uint32_t msr, uint64_t *val)
 
     *val = 0;
 
-    switch ( msr & (MSR_IA32_MC0_CTL | 3) )
+    switch ( msr & (-MSR_IA32_MC0_CTL | 3) )
     {
     case MSR_IA32_MC0_CTL:
         /* stick all 1's to MCi_CTL */
@@ -210,7 +209,7 @@ static int bank_mce_wrmsr(struct vcpu *v, uint32_t msr, uint64_t val)
     int ret = 1;
     unsigned int bank = (msr - MSR_IA32_MC0_CTL) / 4;
 
-    switch ( msr & (MSR_IA32_MC0_CTL | 3) )
+    switch ( msr & (-MSR_IA32_MC0_CTL | 3) )
     {
     case MSR_IA32_MC0_CTL:
         /*
@@ -357,19 +356,17 @@ int inject_vmce(struct domain *d, int vcpu)
         if ( vcpu != VMCE_INJECT_BROADCAST && vcpu != v->vcpu_id )
             continue;
 
-        if ( (is_hvm_domain(d) ||
+        if ( (has_hvm_container_domain(d) ||
               guest_has_trap_callback(d, v->vcpu_id, TRAP_machine_check)) &&
              !test_and_set_bool(v->mce_pending) )
         {
-            mce_printk(MCE_VERBOSE, "MCE: inject vMCE to d%d:v%d\n",
-                       d->domain_id, v->vcpu_id);
+            mce_printk(MCE_VERBOSE, "MCE: inject vMCE to %pv\n", v);
             vcpu_kick(v);
             ret = 0;
         }
         else
         {
-            mce_printk(MCE_QUIET, "Failed to inject vMCE to d%d:v%d\n",
-                       d->domain_id, v->vcpu_id);
+            mce_printk(MCE_QUIET, "Failed to inject vMCE to %pv\n", v);
             ret = -EBUSY;
             break;
         }
@@ -413,74 +410,6 @@ int fill_vmsr_data(struct mcinfo_bank *mc_bank, struct domain *d,
     return 0;
 }
 
-static int is_hvm_vmce_ready(struct mcinfo_bank *bank, struct domain *d)
-{
-    struct vcpu *v;
-    int no_vmce = 0, i;
-
-    if (!is_hvm_domain(d))
-        return 0;
-
-    /* kill guest if not enabled vMCE */
-    for_each_vcpu(d, v)
-    {
-        if (!(v->arch.hvm_vcpu.guest_cr[4] & X86_CR4_MCE))
-        {
-            no_vmce = 1;
-            break;
-        }
-
-        if (!mce_broadcast)
-            break;
-    }
-
-    if (no_vmce)
-        return 0;
-
-    /* Guest has virtualized family/model information */
-    for ( i = 0; i < MAX_CPUID_INPUT; i++ )
-    {
-        if (d->arch.cpuids[i].input[0] == 0x1)
-        {
-            uint32_t veax = d->arch.cpuids[i].eax, vfam, vmod;
-
-			vfam = (veax >> 8) & 15;
-			vmod = (veax >> 4) & 15;
-
-            if (vfam == 0x6 || vfam == 0xf)
-                vmod += ((veax >> 16) & 0xF) << 4;
-			if (vfam == 0xf)
-				vfam += (veax >> 20) & 0xff;
-
-            if ( ( vfam != boot_cpu_data.x86 ) ||
-                 (vmod != boot_cpu_data.x86_model) )
-            {
-                dprintk(XENLOG_WARNING,
-                    "No vmce for different virtual family/model cpuid\n");
-                no_vmce = 1;
-            }
-            break;
-        }
-    }
-
-    if (no_vmce)
-        return 0;
-
-    return 1;
-}
-
-int is_vmce_ready(struct mcinfo_bank *bank, struct domain *d)
-{
-    if ( d == dom0)
-        return dom0_vmce_enabled();
-
-    /* No vMCE to HVM guest now */
-    if ( is_hvm_domain(d) )
-        return is_hvm_vmce_ready(bank, d);
-
-    return 0;
-}
-
 /* It's said some ram is setup as mmio_direct for UC cache attribute */
 #define P2M_UNMAP_TYPES (p2m_to_mask(p2m_ram_rw) \
                                 | p2m_to_mask(p2m_ram_logdirty) \
@@ -501,13 +430,13 @@ int unmmap_broken_page(struct domain *d, mfn_t mfn, unsigned long gfn)
     int rc;
 
     /* Always trust dom0's MCE handler will prevent future access */
-    if ( d == dom0 )
+    if ( is_hardware_domain(d) )
         return 0;
 
     if (!mfn_valid(mfn_x(mfn)))
         return -EINVAL;
 
-    if ( !is_hvm_domain(d) || !paging_mode_hap(d) )
+    if ( !has_hvm_container_domain(d) || !paging_mode_hap(d) )
         return -ENOSYS;
 
     rc = -1;

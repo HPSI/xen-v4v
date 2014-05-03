@@ -133,15 +133,13 @@ static void seabios_setup_e820(void)
     dump_e820_table(e820, info->e820_nr);
 }
 
-//BUILD_BUG_ON(sizeof(seabios) > (0x00100000U - SEABIOS_PHYSICAL_ADDRESS));
-
 struct bios_config seabios_config = {
     .name = "SeaBIOS",
 
     .image = seabios,
     .image_size = sizeof(seabios),
 
-    .bios_address = SEABIOS_PHYSICAL_ADDRESS,
+    .bios_address = 0x100000 - sizeof(seabios),
 
     .load_roms = NULL,
 
@@ -161,7 +159,7 @@ struct bios_config seabios_config = {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -33,7 +33,9 @@
 #include <inttypes.h>
 
 #include "xg_private.h"
-#include "xc_dom.h"
+#include "xc_dom_decompress.h"
+
+#ifndef __MINIOS__
 
 #if defined(HAVE_BZLIB)
 
@@ -47,12 +49,18 @@ static int xc_try_bzip2_decode(
     char *out_buf;
     char *tmp_buf;
     int retval = -1;
-    int outsize;
+    unsigned int outsize;
     uint64_t total;
 
     stream.bzalloc = NULL;
     stream.bzfree = NULL;
     stream.opaque = NULL;
+
+    if ( dom->kernel_size == 0)
+    {
+        DOMPRINTF("BZIP2: Input is 0 size");
+        return -1;
+    }
 
     ret = BZ2_bzDecompressInit(&stream, 0, 0);
     if ( ret != BZ_OK )
@@ -66,6 +74,17 @@ static int xc_try_bzip2_decode(
      * the input buffer to start, and we'll realloc as needed.
      */
     outsize = dom->kernel_size;
+
+    /*
+     * stream.avail_in and outsize are unsigned int, while kernel_size
+     * is a size_t. Check we aren't overflowing.
+     */
+    if ( outsize != dom->kernel_size )
+    {
+        DOMPRINTF("BZIP2: Input too large");
+        goto bzip2_cleanup;
+    }
+
     out_buf = malloc(outsize);
     if ( out_buf == NULL )
     {
@@ -98,9 +117,16 @@ static int xc_try_bzip2_decode(
         if ( stream.avail_out == 0 )
         {
             /* Protect against output buffer overflow */
-            if ( outsize > INT_MAX / 2 )
+            if ( outsize > UINT_MAX / 2 )
             {
                 DOMPRINTF("BZIP2: output buffer overflow");
+                free(out_buf);
+                goto bzip2_cleanup;
+            }
+
+            if ( xc_dom_kernel_check_size(dom, outsize * 2) )
+            {
+                DOMPRINTF("BZIP2: output too large");
                 free(out_buf);
                 goto bzip2_cleanup;
             }
@@ -172,8 +198,14 @@ static int _xc_try_lzma_decode(
     unsigned char *out_buf;
     unsigned char *tmp_buf;
     int retval = -1;
-    int outsize;
+    size_t outsize;
     const char *msg;
+
+    if ( dom->kernel_size == 0)
+    {
+        DOMPRINTF("%s: Input is 0 size", what);
+        return -1;
+    }
 
     /* sigh.  We don't know up-front how much memory we are going to need
      * for the output buffer.  Allocate the output buffer to be equal
@@ -244,9 +276,16 @@ static int _xc_try_lzma_decode(
         if ( stream->avail_out == 0 )
         {
             /* Protect against output buffer overflow */
-            if ( outsize > INT_MAX / 2 )
+            if ( outsize > SIZE_MAX / 2 )
             {
                 DOMPRINTF("%s: output buffer overflow", what);
+                free(out_buf);
+                goto lzma_cleanup;
+            }
+
+            if ( xc_dom_kernel_check_size(dom, outsize * 2) )
+            {
+                DOMPRINTF("%s: output too large", what);
                 free(out_buf);
                 goto lzma_cleanup;
             }
@@ -359,6 +398,12 @@ static int xc_try_lzo1x_decode(
         0x89, 0x4c, 0x5a, 0x4f, 0x00, 0x0d, 0x0a, 0x1a, 0x0a
     };
 
+    /*
+     * lzo_uint should match size_t. Check that this is the case to be
+     * sure we won't overflow various lzo_uint fields.
+     */
+    XC_BUILD_BUG_ON(sizeof(lzo_uint) != sizeof(size_t));
+
     ret = lzo_init();
     if ( ret != LZO_E_OK )
     {
@@ -438,6 +483,14 @@ static int xc_try_lzo1x_decode(
         if ( src_len <= 0 || src_len > dst_len || src_len > left )
             break;
 
+        msg = "Output buffer overflow";
+        if ( *size > SIZE_MAX - dst_len )
+            break;
+
+        msg = "Decompressed image too large";
+        if ( xc_dom_kernel_check_size(dom, *size + dst_len) )
+            break;
+
         msg = "Failed to (re)alloc memory";
         tmp_buf = realloc(out_buf, *size + dst_len);
         if ( tmp_buf == NULL )
@@ -510,6 +563,15 @@ static int xc_try_lzo1x_decode(
 }
 
 #endif
+
+#else /* __MINIOS__ */
+
+int xc_try_bzip2_decode(struct xc_dom_image *dom, void **blob, size_t *size);
+int xc_try_lzma_decode(struct xc_dom_image *dom, void **blob, size_t *size);
+int xc_try_lzo1x_decode(struct xc_dom_image *dom, void **blob, size_t *size);
+int xc_try_xz_decode(struct xc_dom_image *dom, void **blob, size_t *size);
+
+#endif /* !__MINIOS__ */
 
 struct setup_header {
     uint8_t  _pad0[0x1f1];  /* skip uninteresting stuff */
@@ -671,6 +733,17 @@ static int xc_dom_probe_bzimage_kernel(struct xc_dom_image *dom)
             return -EINVAL;
         }
     }
+    else if ( check_magic(dom, "\x02\x21", 2) )
+    {
+        ret = xc_try_lz4_decode(dom, &dom->kernel_blob, &dom->kernel_size);
+        if ( ret < 0 )
+        {
+            xc_dom_panic(dom->xch, XC_INVALID_KERNEL,
+                         "%s unable to LZ4 decompress kernel\n",
+                         __FUNCTION__);
+            return -EINVAL;
+        }
+    }
     else
     {
         xc_dom_panic(dom->xch, XC_INVALID_KERNEL,
@@ -706,7 +779,7 @@ static void __init register_loader(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

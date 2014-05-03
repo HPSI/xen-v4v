@@ -151,21 +151,22 @@ DEFINE_XEN_GUEST_HANDLE(physdev_irq_t);
 #define MAP_PIRQ_TYPE_GSI               0x1
 #define MAP_PIRQ_TYPE_UNKNOWN           0x2
 #define MAP_PIRQ_TYPE_MSI_SEG           0x3
+#define MAP_PIRQ_TYPE_MULTI_MSI         0x4
 
 #define PHYSDEVOP_map_pirq               13
 struct physdev_map_pirq {
     domid_t domid;
     /* IN */
     int type;
-    /* IN */
+    /* IN (ignored for ..._MULTI_MSI) */
     int index;
     /* IN or OUT */
     int pirq;
-    /* IN - high 16 bits hold segment for MAP_PIRQ_TYPE_MSI_SEG */
+    /* IN - high 16 bits hold segment for ..._MSI_SEG and ..._MULTI_MSI */
     int bus;
     /* IN */
     int devfn;
-    /* IN */
+    /* IN (also OUT for ..._MULTI_MSI) */
     int entry_nr;
     /* IN */
     uint64_t table_base;
@@ -303,6 +304,12 @@ DEFINE_XEN_GUEST_HANDLE(physdev_pci_device_add_t);
 
 #define PHYSDEVOP_pci_device_remove     26
 #define PHYSDEVOP_restore_msi_ext       27
+/*
+ * Dom0 should use these two to announce MMIO resources assigned to
+ * MSI-X capable devices won't (prepare) or may (release) change.
+ */
+#define PHYSDEVOP_prepare_msix          30
+#define PHYSDEVOP_release_msix          31
 struct physdev_pci_device {
     /* IN */
     uint16_t seg;
@@ -362,7 +369,7 @@ DEFINE_XEN_GUEST_HANDLE(physdev_dbgp_op_t);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

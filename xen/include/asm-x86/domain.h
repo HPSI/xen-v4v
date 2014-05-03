@@ -16,7 +16,7 @@
 #define is_pv_32on64_domain(d) (is_pv_32bit_domain(d))
 #define is_pv_32on64_vcpu(v)   (is_pv_32on64_domain((v)->domain))
 
-#define is_hvm_pv_evtchn_domain(d) (is_hvm_domain(d) && \
+#define is_hvm_pv_evtchn_domain(d) (has_hvm_container_domain(d) && \
         d->arch.hvm_domain.irq.callback_via_type == HVMIRQ_callback_vector)
 #define is_hvm_pv_evtchn_vcpu(v) (is_hvm_pv_evtchn_domain(v->domain))
 
@@ -39,7 +39,7 @@ struct trap_bounce {
 
 #define MAPHASH_ENTRIES 8
 #define MAPHASH_HASHFN(pfn) ((pfn) & (MAPHASH_ENTRIES-1))
-#define MAPHASHENT_NOTINUSE ((u16)~0U)
+#define MAPHASHENT_NOTINUSE ((u32)~0U)
 struct mapcache_vcpu {
     /* Shadow of mapcache_domain.epoch. */
     unsigned int shadow_epoch;
@@ -47,16 +47,14 @@ struct mapcache_vcpu {
     /* Lock-free per-VCPU hash of recently-used mappings. */
     struct vcpu_maphash_entry {
         unsigned long mfn;
-        uint16_t      idx;
-        uint16_t      refcnt;
+        uint32_t      idx;
+        uint32_t      refcnt;
     } hash[MAPHASH_ENTRIES];
 };
 
-#define MAPCACHE_ORDER   10
-#define MAPCACHE_ENTRIES (1 << MAPCACHE_ORDER)
 struct mapcache_domain {
-    /* The PTEs that provide the mappings, and a cursor into the array. */
-    l1_pgentry_t *l1tab;
+    /* The number of array entries, and a cursor into the array. */
+    unsigned int entries;
     unsigned int cursor;
 
     /* Protects map_domain_page(). */
@@ -67,12 +65,13 @@ struct mapcache_domain {
     u32 tlbflush_timestamp;
 
     /* Which mappings are in use, and which are garbage to reap next epoch? */
-    unsigned long inuse[BITS_TO_LONGS(MAPCACHE_ENTRIES)];
-    unsigned long garbage[BITS_TO_LONGS(MAPCACHE_ENTRIES)];
+    unsigned long *inuse;
+    unsigned long *garbage;
 };
 
-void mapcache_domain_init(struct domain *);
-void mapcache_vcpu_init(struct vcpu *);
+int mapcache_domain_init(struct domain *);
+int mapcache_vcpu_init(struct vcpu *);
+void mapcache_override_current(struct vcpu *);
 
 /* x86/64: toggle guest between kernel and user modes. */
 void toggle_guest_mode(struct vcpu *);
@@ -99,23 +98,23 @@ struct shadow_domain {
     /* 1-to-1 map for use when HVM vcpus have paging disabled */
     pagetable_t unpaged_pagetable;
 
+    /* reflect guest table dirty status, incremented by write
+     * emulation and remove write permission */
+    atomic_t gtable_dirty_version;
+
     /* Shadow hashtable */
     struct page_info **hash_table;
-    int hash_walking;  /* Some function is walking the hash table */
+    bool_t hash_walking;  /* Some function is walking the hash table */
 
     /* Fast MMIO path heuristic */
-    int has_fast_mmio_entries;
-
-    /* reflect guest table dirty status, incremented by write
-     * emulation and remove write permission
-     */
-    atomic_t          gtable_dirty_version;
+    bool_t has_fast_mmio_entries;
 
     /* OOS */
-    int oos_active;
-    int oos_off;
+    bool_t oos_active;
+    bool_t oos_off;
 
-    int pagetable_dying_op;
+    /* Has this domain ever used HVMOP_pagetable_dying? */
+    bool_t pagetable_dying_op;
 };
 
 struct shadow_vcpu {
@@ -143,7 +142,7 @@ struct shadow_vcpu {
         unsigned long off[SHADOW_OOS_FIXUPS];
     } oos_fixup[SHADOW_OOS_PAGES];
 
-    int pagetable_dying;
+    bool_t pagetable_dying;
 };
 
 /************************************************/
@@ -170,7 +169,7 @@ struct log_dirty_domain {
     unsigned int   dirty_count;
 
     /* functions which are paging mode specific */
-    int            (*enable_log_dirty   )(struct domain *d);
+    int            (*enable_log_dirty   )(struct domain *d, bool_t log_global);
     int            (*disable_log_dirty  )(struct domain *d);
     void           (*clean_dirty_bitmap )(struct domain *d);
 };
@@ -191,6 +190,8 @@ struct paging_domain {
      * (used by p2m and log-dirty code for their tries) */
     struct page_info * (*alloc_page)(struct domain *d);
     void (*free_page)(struct domain *d, struct page_info *pg);
+    /* Has that pool ever run out of memory? */
+    bool_t p2m_alloc_failed;
 };
 
 struct paging_vcpu {
@@ -222,24 +223,15 @@ struct time_scale {
 
 struct pv_domain
 {
-    /* Shared page for notifying that explicit PIRQ EOI is required. */
-    unsigned long *pirq_eoi_map;
-    unsigned long pirq_eoi_map_mfn;
-    /* set auto_unmask to 1 if you want PHYSDEVOP_eoi to automatically
-     * unmask the event channel */
-    bool_t auto_unmask;
+    l1_pgentry_t **gdt_ldt_l1tab;
 
-    /* Pseudophysical e820 map (XENMEM_memory_map).  */
-    spinlock_t e820_lock;
-    struct e820entry *e820;
-    unsigned int nr_e820;
+    /* map_domain_page() mapping cache. */
+    struct mapcache_domain mapcache;
 };
 
 struct arch_domain
 {
-    struct page_info **mm_perdomain_pt_pages;
-    l2_pgentry_t *mm_perdomain_l2;
-    l3_pgentry_t *mm_perdomain_l3;
+    struct page_info *perdomain_l3_pg;
 
     unsigned int hv_compat_vstart;
 
@@ -309,21 +301,33 @@ struct arch_domain
                                 (possibly other cases in the future */
     uint64_t vtsc_kerncount; /* for hvm, counts all vtsc */
     uint64_t vtsc_usercount; /* not used for hvm */
+
+    /* Pseudophysical e820 map (XENMEM_memory_map).  */
+    spinlock_t e820_lock;
+    struct e820entry *e820;
+    unsigned int nr_e820;
+
+    /* set auto_unmask to 1 if you want PHYSDEVOP_eoi to automatically
+     * unmask the event channel */
+    bool_t auto_unmask;
+    /* Shared page for notifying that explicit PIRQ EOI is required. */
+    unsigned long *pirq_eoi_map;
+    unsigned long pirq_eoi_map_mfn;
 } __cacheline_aligned;
 
 #define has_arch_pdevs(d)    (!list_empty(&(d)->arch.pdev_list))
-#define has_arch_mmios(d)    (!rangeset_is_empty((d)->iomem_caps))
 
-#define perdomain_pt_pgidx(v) \
+#define gdt_ldt_pt_idx(v) \
       ((v)->vcpu_id >> (PAGETABLE_ORDER - GDT_LDT_VCPU_SHIFT))
-#define perdomain_ptes(d, v) \
-    ((l1_pgentry_t *)page_to_virt((d)->arch.mm_perdomain_pt_pages \
-      [perdomain_pt_pgidx(v)]) + (((v)->vcpu_id << GDT_LDT_VCPU_SHIFT) & \
-                                  (L1_PAGETABLE_ENTRIES - 1)))
-#define perdomain_pt_page(d, n) ((d)->arch.mm_perdomain_pt_pages[n])
+#define gdt_ldt_ptes(d, v) \
+    ((d)->arch.pv_domain.gdt_ldt_l1tab[gdt_ldt_pt_idx(v)] + \
+     (((v)->vcpu_id << GDT_LDT_VCPU_SHIFT) & (L1_PAGETABLE_ENTRIES - 1)))
 
 struct pv_vcpu
 {
+    /* map_domain_page() mapping cache. */
+    struct mapcache_vcpu mapcache;
+
     struct trap_info *trap_ctxt;
 
     unsigned long gdt_frames[FIRST_RESERVED_GDT_PAGE];
@@ -370,8 +374,12 @@ struct pv_vcpu
     unsigned long shadow_ldt_mapcnt;
     spinlock_t shadow_ldt_lock;
 
-    /* Guest-specified relocation of vcpu_info. */
-    unsigned long vcpu_info_mfn;
+    /* data breakpoint extension MSRs */
+    uint32_t dr_mask[4];
+
+    /* Deferred VA-based update state. */
+    bool_t need_update_runstate_area;
+    struct vcpu_time_info pending_system_time;
 };
 
 struct arch_vcpu
@@ -401,14 +409,9 @@ struct arch_vcpu
         struct hvm_vcpu hvm_vcpu;
     };
 
-    /*
-     * Every domain has a L1 pagetable of its own. Per-domain mappings
-     * are put in this table (eg. the current GDT is mapped here).
-     */
-    l1_pgentry_t *perdomain_ptes;
-
     pagetable_t guest_table_user;       /* (MFN) x86/64 user-space pagetable */
     pagetable_t guest_table;            /* (MFN) guest notion of cr3 */
+    struct page_info *old_guest_table;  /* partially destructed pagetable */
     /* guest_table holds a ref to the page, and also a type-count unless
      * shadow refcounts are in use */
     pagetable_t shadow_table[4];        /* (MFN) shadow(s) of guest */
@@ -443,14 +446,15 @@ struct arch_vcpu
 
     /* A secondary copy of the vcpu time info. */
     XEN_GUEST_HANDLE(vcpu_time_info_t) time_info_guest;
-
-    void *compat_arg_xlat;
-
 } __cacheline_aligned;
 
 /* Shorthands to improve code legibility. */
 #define hvm_vmx         hvm_vcpu.u.vmx
 #define hvm_svm         hvm_vcpu.u.svm
+
+bool_t update_runstate_area(const struct vcpu *);
+bool_t update_secondary_system_time(const struct vcpu *,
+                                    struct vcpu_time_info *);
 
 void vcpu_show_execution_state(struct vcpu *);
 void vcpu_show_registers(const struct vcpu *);
@@ -462,13 +466,13 @@ unsigned long pv_guest_cr4_fixup(const struct vcpu *, unsigned long guest_cr4);
 #define pv_guest_cr4_to_real_cr4(v)                         \
     (((v)->arch.pv_vcpu.ctrlreg[4]                          \
       | (mmu_cr4_features                                   \
-         & (X86_CR4_PGE | X86_CR4_PSE | X86_CR4_SMEP))      \
-      | ((v)->domain->arch.vtsc ? X86_CR4_TSD : 0)          \
-      | ((xsave_enabled(v))? X86_CR4_OSXSAVE : 0))          \
+         & (X86_CR4_PGE | X86_CR4_PSE | X86_CR4_SMEP |      \
+            X86_CR4_OSXSAVE | X86_CR4_FSGSBASE))            \
+      | ((v)->domain->arch.vtsc ? X86_CR4_TSD : 0))         \
      & ~X86_CR4_DE)
 #define real_cr4_to_pv_guest_cr4(c)                         \
-    ((c) & ~(X86_CR4_PGE | X86_CR4_PSE | X86_CR4_TSD        \
-             | X86_CR4_OSXSAVE | X86_CR4_SMEP))
+    ((c) & ~(X86_CR4_PGE | X86_CR4_PSE | X86_CR4_TSD |      \
+             X86_CR4_OSXSAVE | X86_CR4_SMEP | X86_CR4_FSGSBASE))
 
 void domain_cpuid(struct domain *d,
                   unsigned int  input,
@@ -483,7 +487,7 @@ void domain_cpuid(struct domain *d,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

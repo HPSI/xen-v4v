@@ -58,14 +58,6 @@ typedef const struct hw_interrupt_type hw_irq_controller;
 
 #include <asm/irq.h>
 
-#ifdef NR_IRQS
-# define nr_irqs NR_IRQS
-# define nr_irqs_gsi NR_IRQS
-#else
-extern unsigned int nr_irqs_gsi;
-extern unsigned int nr_irqs;
-#endif
-
 struct msi_desc;
 /*
  * This is the "IRQ descriptor", which contains various information
@@ -73,10 +65,10 @@ struct msi_desc;
  * whether it is disabled etc etc.
  */
 typedef struct irq_desc {
-    unsigned int status;		/* IRQ status */
+    unsigned int status;        /* IRQ status */
     hw_irq_controller *handler;
     struct msi_desc   *msi_desc;
-    struct irqaction *action;	/* IRQ action list */
+    struct irqaction *action;   /* IRQ action list */
     int irq;
     spinlock_t lock;
     struct arch_irq_desc arch;
@@ -101,7 +93,7 @@ extern int setup_irq(unsigned int irq, struct irqaction *);
 extern void release_irq(unsigned int irq);
 extern int request_irq(unsigned int irq,
                void (*handler)(int, void *, struct cpu_user_regs *),
-               unsigned long irqflags, const char * devname, void *dev_id);
+               const char * devname, void *dev_id);
 
 extern hw_irq_controller no_irq_type;
 extern void no_action(int cpl, void *dev_id, struct cpu_user_regs *regs);

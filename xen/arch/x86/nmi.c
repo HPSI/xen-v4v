@@ -18,6 +18,7 @@
 #include <xen/lib.h>
 #include <xen/mm.h>
 #include <xen/irq.h>
+#include <xen/nmi.h>
 #include <xen/delay.h>
 #include <xen/time.h>
 #include <xen/sched.h>
@@ -164,7 +165,7 @@ static void nmi_timer_fn(void *unused)
     set_timer(&this_cpu(nmi_timer), NOW() + MILLISECS(1000));
 }
 
-static void disable_lapic_nmi_watchdog(void)
+void disable_lapic_nmi_watchdog(void)
 {
     if (nmi_active <= 0)
         return;
@@ -409,7 +410,12 @@ void watchdog_enable(void)
     atomic_dec(&watchdog_disable_count);
 }
 
-void __init watchdog_setup(void)
+bool_t watchdog_enabled(void)
+{
+    return !atomic_read(&watchdog_disable_count);
+}
+
+int __init watchdog_setup(void)
 {
     unsigned int cpu;
 
@@ -422,14 +428,14 @@ void __init watchdog_setup(void)
     register_cpu_notifier(&cpu_nmi_nfb);
 
     watchdog_enable();
+    return 0;
 }
 
 void nmi_watchdog_tick(struct cpu_user_regs * regs)
 {
     unsigned int sum = this_cpu(nmi_timer_ticks);
 
-    if ( (this_cpu(last_irq_sums) == sum) &&
-         !atomic_read(&watchdog_disable_count) )
+    if ( (this_cpu(last_irq_sums) == sum) && watchdog_enabled() )
     {
         /*
          * Ayiee, looks like this CPU is stuck ... wait for the timeout
@@ -482,13 +488,14 @@ void nmi_watchdog_tick(struct cpu_user_regs * regs)
  * 8-3 and 8-4 in IA32 Reference Manual Volume 3. We send the IPI to
  * our own APIC ID explicitly which is valid.
  */
-void self_nmi(void) 
+void self_nmi(void)
 {
+    unsigned long flags;
     u32 id = get_apic_id();
-    local_irq_disable();
+    local_irq_save(flags);
     apic_wait_icr_idle();
     apic_icr_write(APIC_DM_NMI | APIC_DEST_PHYSICAL, id);
-    local_irq_enable();
+    local_irq_restore(flags);
 }
 
 static void do_nmi_trigger(unsigned char key)
@@ -512,7 +519,7 @@ static void do_nmi_stats(unsigned char key)
     for_each_online_cpu ( i )
         printk("%3d\t%3d\n", i, nmi_count(i));
 
-    if ( ((d = dom0) == NULL) || (d->vcpu == NULL) ||
+    if ( ((d = hardware_domain) == NULL) || (d->vcpu == NULL) ||
          ((v = d->vcpu[0]) == NULL) )
         return;
 

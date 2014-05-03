@@ -96,7 +96,10 @@ static void thaw_domains(void)
 
     rcu_read_lock(&domlist_read_lock);
     for_each_domain ( d )
+    {
+        restore_vcpu_affinity(d);
         domain_unpause(d);
+    }
     rcu_read_unlock(&domlist_read_lock);
 }
 
@@ -219,6 +222,7 @@ static int enter_state(u32 state)
     mtrr_aps_sync_begin();
     enable_nonboot_cpus();
     mtrr_aps_sync_end();
+    adjust_vtd_irq_affinities();
     acpi_dmar_zap();
     thaw_domains();
     system_state = SYS_STATE_active;
@@ -238,23 +242,47 @@ static long enter_state_helper(void *data)
  */
 int acpi_enter_sleep(struct xenpf_enter_acpi_sleep *sleep)
 {
-    if ( !IS_PRIV(current->domain) || !acpi_sinfo.pm1a_cnt_blk.address )
+    if ( sleep->flags & XENPF_ACPI_SLEEP_EXTENDED )
+    {
+        if ( !acpi_sinfo.sleep_control.address ||
+             !acpi_sinfo.sleep_status.address )
+            return -EPERM;
+
+        if ( sleep->flags & ~XENPF_ACPI_SLEEP_EXTENDED )
+            return -EINVAL;
+
+        if ( sleep->val_a > ACPI_SLEEP_TYPE_MAX ||
+             (sleep->val_b != ACPI_SLEEP_TYPE_INVALID &&
+              sleep->val_b > ACPI_SLEEP_TYPE_MAX) )
+            return -ERANGE;
+
+        acpi_sinfo.sleep_type_a = sleep->val_a;
+        acpi_sinfo.sleep_type_b = sleep->val_b;
+
+        acpi_sinfo.sleep_extended = 1;
+    }
+
+    else if ( !acpi_sinfo.pm1a_cnt_blk.address )
         return -EPERM;
 
     /* Sanity check */
-    if ( acpi_sinfo.pm1b_cnt_val &&
-         ((sleep->pm1a_cnt_val ^ sleep->pm1b_cnt_val) &
-          ACPI_BITMASK_SLEEP_ENABLE) )
+    else if ( sleep->val_b &&
+              ((sleep->val_a ^ sleep->val_b) & ACPI_BITMASK_SLEEP_ENABLE) )
     {
         gdprintk(XENLOG_ERR, "Mismatched pm1a/pm1b setting.");
         return -EINVAL;
     }
 
-    if ( sleep->flags )
+    else if ( sleep->flags )
         return -EINVAL;
 
-    acpi_sinfo.pm1a_cnt_val = sleep->pm1a_cnt_val;
-    acpi_sinfo.pm1b_cnt_val = sleep->pm1b_cnt_val;
+    else
+    {
+        acpi_sinfo.pm1a_cnt_val = sleep->val_a;
+        acpi_sinfo.pm1b_cnt_val = sleep->val_b;
+        acpi_sinfo.sleep_extended = 0;
+    }
+
     acpi_sinfo.sleep_state = sleep->sleep_state;
 
     return continue_hypercall_on_cpu(0, enter_state_helper, &acpi_sinfo);
@@ -264,6 +292,13 @@ static int acpi_get_wake_status(void)
 {
     uint32_t val;
     acpi_status status;
+
+    if ( acpi_sinfo.sleep_extended )
+    {
+        status = acpi_hw_register_read(ACPI_REGISTER_SLEEP_STATUS, &val);
+
+        return ACPI_FAILURE(status) ? 0 : val & ACPI_X_WAKE_STATUS;
+    }
 
     /* Wake status is the 15th bit of PM1 status register. (ACPI spec 3.0) */
     status = acpi_hw_register_read(ACPI_REGISTER_PM1_STATUS, &val);
@@ -334,18 +369,32 @@ acpi_status acpi_enter_sleep_state(u8 sleep_state)
 
     ACPI_FLUSH_CPU_CACHE();
 
-    status = acpi_hw_register_write(ACPI_REGISTER_PM1A_CONTROL, 
-                                    acpi_sinfo.pm1a_cnt_val);
+    if ( acpi_sinfo.sleep_extended )
+    {
+        /*
+         * Set the SLP_TYP and SLP_EN bits.
+         *
+         * Note: We only use the first value returned by the \_Sx method
+         * (acpi_sinfo.sleep_type_a) - As per ACPI specification.
+         */
+        u8 sleep_type_value =
+            ((acpi_sinfo.sleep_type_a << ACPI_X_SLEEP_TYPE_POSITION) &
+             ACPI_X_SLEEP_TYPE_MASK) | ACPI_X_SLEEP_ENABLE;
+
+        status = acpi_hw_register_write(ACPI_REGISTER_SLEEP_CONTROL,
+                                        sleep_type_value);
+    }
+    else
+    {
+        status = acpi_hw_register_write(ACPI_REGISTER_PM1A_CONTROL,
+                                        acpi_sinfo.pm1a_cnt_val);
+        if ( !ACPI_FAILURE(status) && acpi_sinfo.pm1b_cnt_blk.address )
+            status = acpi_hw_register_write(ACPI_REGISTER_PM1B_CONTROL,
+                                            acpi_sinfo.pm1b_cnt_val);
+    }
+
     if ( ACPI_FAILURE(status) )
         return_ACPI_STATUS(AE_ERROR);
-
-    if ( acpi_sinfo.pm1b_cnt_blk.address )
-    {
-        status = acpi_hw_register_write(ACPI_REGISTER_PM1B_CONTROL, 
-                                        acpi_sinfo.pm1b_cnt_val);
-        if ( ACPI_FAILURE(status) )
-            return_ACPI_STATUS(AE_ERROR);
-    }
 
     /* Wait until we enter sleep state, and spin until we wake */
     while ( !acpi_get_wake_status() )

@@ -129,7 +129,7 @@ static int xc_map_foreign_batch_single(int fd, uint32_t dom,
 
     do
     {
-        *mfn ^= XEN_DOMCTL_PFINFO_PAGEDTAB;
+        *mfn ^= PRIVCMD_MMAPBATCH_PAGED_ERROR;
         usleep(100);
         rc = ioctl(fd, IOCTL_PRIVCMD_MMAPBATCH, &ioctlx);
     }
@@ -166,8 +166,8 @@ static void *linux_privcmd_map_foreign_batch(xc_interface *xch, xc_osdep_handle 
 
         for ( i = 0; i < num; i++ )
         {
-            if ( (arr[i] & XEN_DOMCTL_PFINFO_LTAB_MASK) ==
-                 XEN_DOMCTL_PFINFO_PAGEDTAB )
+            if ( (arr[i] & PRIVCMD_MMAPBATCH_MFN_ERROR) ==
+                           PRIVCMD_MMAPBATCH_PAGED_ERROR )
             {
                 unsigned long paged_addr = (unsigned long)addr + (i << XC_PAGE_SHIFT);
                 rc = xc_map_foreign_batch_single(fd, dom, &arr[i],
@@ -323,12 +323,12 @@ static void *linux_privcmd_map_foreign_bulk(xc_interface *xch, xc_osdep_handle h
             default:
                 err[i] = -EINVAL;
                 continue;
-            case XEN_DOMCTL_PFINFO_PAGEDTAB:
+            case PRIVCMD_MMAPBATCH_PAGED_ERROR:
                 if ( rc != -ENOENT )
                 {
                     err[i] = rc ?: -EINVAL;
                     continue;
-                 }
+                }
                 rc = xc_map_foreign_batch_single(fd, dom, pfn + i,
                         (unsigned long)addr + ((unsigned long)i<<XC_PAGE_SHIFT));
                 if ( rc < 0 )
@@ -378,6 +378,8 @@ static void *linux_privcmd_map_foreign_range(xc_interface *xch, xc_osdep_handle 
 
     num = (size + XC_PAGE_SIZE - 1) >> XC_PAGE_SHIFT;
     arr = calloc(num, sizeof(xen_pfn_t));
+    if ( arr == NULL )
+        return NULL;
 
     for ( i = 0; i < num; i++ )
         arr[i] = mfn + i;
@@ -402,6 +404,8 @@ static void *linux_privcmd_map_foreign_ranges(xc_interface *xch, xc_osdep_handle
     num_per_entry = chunksize >> XC_PAGE_SHIFT;
     num = num_per_entry * nentries;
     arr = calloc(num, sizeof(xen_pfn_t));
+    if ( arr == NULL )
+        return NULL;
 
     for ( i = 0; i < nentries; i++ )
         for ( j = 0; j < num_per_entry; j++ )
@@ -865,7 +869,7 @@ xc_osdep_info_t xc_osdep_info = {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -19,14 +19,22 @@
  */
 
 #include <xsm/xsm.h>
+#ifdef CONFIG_MULTIBOOT
 #include <xen/multiboot.h>
-#include <asm/bitops.h>
+#endif
+#include <xen/bitops.h>
+#ifdef HAS_DEVICE_TREE
+# include <asm/setup.h>
+# include <xen/device_tree.h>
+#endif
 
 char *__initdata policy_buffer = NULL;
 u32 __initdata policy_size = 0;
 
-int xsm_policy_init(unsigned long *module_map, const multiboot_info_t *mbi,
-                    void *(*bootstrap_map)(const module_t *))
+#ifdef CONFIG_MULTIBOOT
+int __init xsm_multiboot_policy_init(unsigned long *module_map,
+                                     const multiboot_info_t *mbi,
+                                     void *(*bootstrap_map)(const module_t *))
 {
     int i;
     module_t *mod = (module_t *)__va(mbi->mods_addr);
@@ -51,7 +59,7 @@ int xsm_policy_init(unsigned long *module_map, const multiboot_info_t *mbi,
             policy_buffer = (char *)_policy_start;
             policy_size = _policy_len;
 
-            printk("Policy len  0x%lx, start at %p.\n",
+            printk("Policy len %#lx, start at %p.\n",
                    _policy_len,_policy_start);
 
             __clear_bit(i, module_map);
@@ -64,3 +72,37 @@ int xsm_policy_init(unsigned long *module_map, const multiboot_info_t *mbi,
 
     return rc;
 }
+#endif
+
+#ifdef HAS_DEVICE_TREE
+int __init xsm_dt_policy_init(void)
+{
+    paddr_t paddr = early_info.modules.module[MOD_XSM].start;
+    paddr_t len = early_info.modules.module[MOD_XSM].size;
+    xsm_magic_t magic;
+
+    if ( !len )
+        return 0;
+
+    copy_from_paddr(&magic, paddr, sizeof(magic));
+
+    if ( magic != XSM_MAGIC )
+    {
+        printk(XENLOG_ERR "xsm: Invalid magic for XSM blob got 0x%x "
+               "expected 0x%x\n", magic, XSM_MAGIC);
+        return -EINVAL;
+    }
+
+    printk("xsm: Policy len = 0x%"PRIpaddr" start at 0x%"PRIpaddr"\n",
+           len, paddr);
+
+    policy_buffer = xmalloc_bytes(len);
+    if ( !policy_buffer )
+        return -ENOMEM;
+
+    copy_from_paddr(policy_buffer, paddr, len);
+    policy_size = len;
+
+    return 0;
+}
+#endif

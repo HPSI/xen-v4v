@@ -5,14 +5,14 @@ include $(XEN_ROOT)/tools/Rules.mk
 include Config
 
 ifeq ($(GIT_HTTP),y)
-IPXE_GIT_URL := http://git.ipxe.org/ipxe.git
+IPXE_GIT_URL ?= http://git.ipxe.org/ipxe.git
 else
-IPXE_GIT_URL := git://git.ipxe.org/ipxe.git
+IPXE_GIT_URL ?= git://git.ipxe.org/ipxe.git
 endif
 
 IPXE_GIT_TAG := 9a93db3f0947484e30e753bbd61a10b17336e20e
 
-IPXE_TARBALL_URL := $(XEN_EXTFILES_URL)/ipxe-git-$(IPXE_GIT_TAG).tar.gz
+IPXE_TARBALL_URL ?= $(XEN_EXTFILES_URL)/ipxe-git-$(IPXE_GIT_TAG).tar.gz
 
 D=ipxe
 T=ipxe.tar.gz
@@ -28,7 +28,7 @@ all: $(ROMS)
 	$(MAKE) -C $D/src bin/$(*F).rom
 
 $T:
-	if ! wget -O _$T $(IPXE_TARBALL_URL); then \
+	if ! $(FETCHER) _$T $(IPXE_TARBALL_URL); then \
 		$(GIT) clone $(IPXE_GIT_URL) $D.git; \
 		(cd $D.git && $(GIT) archive --format=tar --prefix=$D/ \
 		$(IPXE_GIT_TAG) | gzip >../_$T); \

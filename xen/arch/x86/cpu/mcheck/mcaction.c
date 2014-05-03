@@ -13,13 +13,11 @@ mci_action_add_pageoffline(int bank, struct mc_info *mi,
     if (!mi)
         return NULL;
 
-    rec = x86_mcinfo_reserve(mi, sizeof(struct mcinfo_recovery));
+    rec = x86_mcinfo_reserve(mi, sizeof(*rec));
     if (!rec) {
         mi->flags |= MCINFO_FLAGS_UNCOMPLETE;
         return NULL;
     }
-
-    memset(rec, 0, sizeof(struct mcinfo_recovery));
 
     rec->common.type = MC_TYPE_RECOVERY;
     rec->common.size = sizeof(*rec);
@@ -47,7 +45,7 @@ mc_memerr_dhandler(struct mca_binfo *binfo,
     struct domain *d;
     unsigned long mfn, gfn;
     uint32_t status;
-    uint16_t vmce_vcpuid;
+    int vmce_vcpuid;
 
     if (!mc_check_addr(bank->mc_status, bank->mc_misc, MC_ADDR_PHYSICAL)) {
         dprintk(XENLOG_WARNING,
@@ -84,12 +82,6 @@ mc_memerr_dhandler(struct mca_binfo *binfo,
                 d = get_domain_by_id(bank->mc_domid);
                 ASSERT(d);
                 gfn = get_gpfn_from_mfn((bank->mc_addr) >> PAGE_SHIFT);
-
-                if ( !is_vmce_ready(bank, d) )
-                {
-                    printk("DOM%d not ready for vMCE\n", d->domain_id);
-                    goto vmce_failed;
-                }
 
                 if ( unmmap_broken_page(d, _mfn(mfn), gfn) )
                 {

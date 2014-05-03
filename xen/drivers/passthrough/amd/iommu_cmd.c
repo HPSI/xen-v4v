@@ -75,11 +75,9 @@ static void flush_command_buffer(struct amd_iommu *iommu)
     u32 cmd[4], status;
     int loop_count, comp_wait;
 
-    /* clear 'ComWaitInt' in status register (WIC) */
-    set_field_in_reg_u32(IOMMU_CONTROL_ENABLED, 0,
-                         IOMMU_STATUS_COMP_WAIT_INT_MASK,
-                         IOMMU_STATUS_COMP_WAIT_INT_SHIFT, &status);
-    writel(status, iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+    /* RW1C 'ComWaitInt' in status register */
+    writel(IOMMU_STATUS_COMP_WAIT_INT_MASK,
+           iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
 
     /* send an empty COMPLETION_WAIT command to flush command buffer */
     cmd[3] = cmd[2] = 0;
@@ -103,9 +101,9 @@ static void flush_command_buffer(struct amd_iommu *iommu)
 
     if ( comp_wait )
     {
-        /* clear 'ComWaitInt' in status register (WIC) */
-        status &= IOMMU_STATUS_COMP_WAIT_INT_MASK;
-        writel(status, iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+        /* RW1C 'ComWaitInt' in status register */
+        writel(IOMMU_STATUS_COMP_WAIT_INT_MASK,
+               iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
         return;
     }
     AMD_IOMMU_DEBUG("Warning: ComWaitInt bit did not assert!\n");
@@ -287,12 +285,12 @@ void invalidate_iommu_all(struct amd_iommu *iommu)
     send_iommu_command(iommu, cmd);
 }
 
-void amd_iommu_flush_iotlb(struct pci_dev *pdev,
+void amd_iommu_flush_iotlb(u8 devfn, const struct pci_dev *pdev,
                            uint64_t gaddr, unsigned int order)
 {
     unsigned long flags;
     struct amd_iommu *iommu;
-    unsigned int bdf, req_id, queueid, maxpend;
+    unsigned int req_id, queueid, maxpend;
     struct pci_ats_dev *ats_pdev;
 
     if ( !ats_enabled )
@@ -305,8 +303,8 @@ void amd_iommu_flush_iotlb(struct pci_dev *pdev,
     if ( !pci_ats_enabled(ats_pdev->seg, ats_pdev->bus, ats_pdev->devfn) )
         return;
 
-    bdf = PCI_BDF2(ats_pdev->bus, ats_pdev->devfn);
-    iommu = find_iommu_for_device(ats_pdev->seg, bdf);
+    iommu = find_iommu_for_device(ats_pdev->seg,
+                                  PCI_BDF2(ats_pdev->bus, ats_pdev->devfn));
 
     if ( !iommu )
     {
@@ -319,9 +317,9 @@ void amd_iommu_flush_iotlb(struct pci_dev *pdev,
     if ( !iommu_has_cap(iommu, PCI_CAP_IOTLB_SHIFT) )
         return;
 
-    req_id = get_dma_requestor_id(iommu->seg, bdf);
+    req_id = get_dma_requestor_id(iommu->seg, PCI_BDF2(ats_pdev->bus, devfn));
     queueid = req_id;
-    maxpend = (ats_pdev->ats_queue_depth + 32) & 0xff;
+    maxpend = ats_pdev->ats_queue_depth & 0xff;
 
     /* send INVALIDATE_IOTLB_PAGES command */
     spin_lock_irqsave(&iommu->lock, flags);
@@ -339,7 +337,15 @@ static void amd_iommu_flush_all_iotlbs(struct domain *d, uint64_t gaddr,
         return;
 
     for_each_pdev( d, pdev )
-        amd_iommu_flush_iotlb(pdev, gaddr, order);
+    {
+        u8 devfn = pdev->devfn;
+
+        do {
+            amd_iommu_flush_iotlb(devfn, pdev, gaddr, order);
+            devfn += pdev->phantom_stride;
+        } while ( devfn != pdev->devfn &&
+                  PCI_SLOT(devfn) == PCI_SLOT(pdev->devfn) );
+    }
 }
 
 /* Flush iommu cache after p2m changes. */

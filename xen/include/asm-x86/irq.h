@@ -11,6 +11,10 @@
 #include <irq_vectors.h>
 #include <asm/percpu.h>
 
+extern unsigned int nr_irqs_gsi;
+extern unsigned int nr_irqs;
+#define nr_static_irqs nr_irqs_gsi
+
 #define IO_APIC_IRQ(irq)    (platform_legacy_irq(irq) ?    \
 			     (1 << (irq)) & io_apic_irqs : \
 			     (irq) < nr_irqs_gsi)
@@ -137,6 +141,7 @@ int map_domain_pirq(struct domain *d, int pirq, int irq, int type,
                            void *data);
 int unmap_domain_pirq(struct domain *d, int pirq);
 int get_free_pirq(struct domain *d, int type);
+int get_free_pirqs(struct domain *, unsigned int nr);
 void free_domain_pirqs(struct domain *d);
 int map_domain_emuirq_pirq(struct domain *d, int pirq, int irq);
 int unmap_domain_pirq_emuirq(struct domain *d, int pirq);

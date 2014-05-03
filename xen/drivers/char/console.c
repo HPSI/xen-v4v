@@ -20,12 +20,15 @@
 #include <xen/keyhandler.h>
 #include <xen/delay.h>
 #include <xen/guest_access.h>
+#include <xen/watchdog.h>
 #include <xen/shutdown.h>
-#include <xen/vga.h>
+#include <xen/video.h>
 #include <xen/kexec.h>
+#include <xen/ctype.h>
 #include <asm/debugger.h>
 #include <asm/div64.h>
 #include <xen/hypercall.h> /* for do_console_io */
+#include <xen/early_printk.h>
 
 /* console: comma-separated list of console outputs. */
 static char __initdata opt_console[30] = OPT_CONSOLE_STR;
@@ -47,8 +50,18 @@ static bool_t __read_mostly opt_console_to_ring;
 boolean_param("console_to_ring", opt_console_to_ring);
 
 /* console_timestamps: include a timestamp prefix on every Xen console line. */
-static bool_t __read_mostly opt_console_timestamps;
-boolean_param("console_timestamps", opt_console_timestamps);
+enum con_timestamp_mode
+{
+    TSM_NONE,          /* No timestamps */
+    TSM_DATE,          /* [YYYY-MM-DD HH:MM:SS] */
+    TSM_DATE_MS,       /* [YYYY-MM-DD HH:MM:SS.mmm] */
+    TSM_BOOT           /* [SSSSSS.uuuuuu] */
+};
+
+static enum con_timestamp_mode __read_mostly opt_con_timestamp_mode = TSM_NONE;
+
+static void parse_console_timestamps(char *s);
+custom_param("console_timestamps", parse_console_timestamps);
 
 /* conring_size: allows a large console ring than default (16kB). */
 static uint32_t __initdata opt_conring_size;
@@ -98,8 +111,10 @@ static DEFINE_SPINLOCK(console_lock);
 
 static int __read_mostly xenlog_upper_thresh = XENLOG_UPPER_THRESHOLD;
 static int __read_mostly xenlog_lower_thresh = XENLOG_LOWER_THRESHOLD;
-static int __read_mostly xenlog_guest_upper_thresh = XENLOG_GUEST_UPPER_THRESHOLD;
-static int __read_mostly xenlog_guest_lower_thresh = XENLOG_GUEST_LOWER_THRESHOLD;
+static int __read_mostly xenlog_guest_upper_thresh =
+    XENLOG_GUEST_UPPER_THRESHOLD;
+static int __read_mostly xenlog_guest_lower_thresh =
+    XENLOG_GUEST_LOWER_THRESHOLD;
 
 static void parse_loglvl(char *s);
 static void parse_guest_loglvl(char *s);
@@ -172,10 +187,15 @@ static char * __init loglvl_str(int lvl)
  * ********************************************************
  */
 
-static void putchar_console_ring(int c)
+static void conring_puts(const char *str)
 {
+    char c;
+
     ASSERT(spin_is_locked(&console_lock));
-    conring[CONRING_IDX_MASK(conringp++)] = c;
+
+    while ( (c = *str++) != '\0' )
+        conring[CONRING_IDX_MASK(conringp++)] = c;
+
     if ( (uint32_t)(conringp - conringc) > conring_size )
         conringc = conringp - conring_size;
 }
@@ -236,7 +256,7 @@ long read_console_ring(struct xen_sysctl_readconsole *op)
 static char serial_rx_ring[SERIAL_RX_SIZE];
 static unsigned int serial_rx_cons, serial_rx_prod;
 
-static void (*serial_steal_fn)(const char *);
+static void (*serial_steal_fn)(const char *) = early_puts;
 
 int console_steal(int handle, void (*fn)(const char *))
 {
@@ -297,7 +317,7 @@ static void dump_console_ring_key(unsigned char key)
     buf[sofar] = '\0';
 
     sercon_puts(buf);
-    vga_puts(buf);
+    video_puts(buf);
 
     free_xenheap_pages(buf, order);
 }
@@ -309,7 +329,7 @@ static struct keyhandler dump_console_ring_keyhandler = {
 
 /* CTRL-<switch_char> switches input direction between Xen and DOM0. */
 #define switch_code (opt_conswitch[0]-'a'+1)
-static int __read_mostly xen_rx = 1; /* FALSE => serial input passed to domain 0. */
+static int __read_mostly xen_rx = 1; /* FALSE => input passed to domain 0. */
 
 static void switch_serial_input(void)
 {
@@ -365,12 +385,13 @@ static DECLARE_SOFTIRQ_TASKLET(notify_dom0_con_ring_tasklet,
 
 static long guest_console_write(XEN_GUEST_HANDLE_PARAM(char) buffer, int count)
 {
-    char kbuf[128], *kptr;
-    int kcount;
+    char kbuf[128];
+    int kcount = 0;
+    struct domain *cd = current->domain;
 
     while ( count > 0 )
     {
-        if ( hypercall_preempt_check() )
+        if ( kcount && hypercall_preempt_check() )
             return hypercall_create_continuation(
                 __HYPERVISOR_console_io, "iih",
                 CONSOLEIO_write, count, buffer);
@@ -380,19 +401,58 @@ static long guest_console_write(XEN_GUEST_HANDLE_PARAM(char) buffer, int count)
             return -EFAULT;
         kbuf[kcount] = '\0';
 
-        spin_lock_irq(&console_lock);
-
-        sercon_puts(kbuf);
-        vga_puts(kbuf);
-
-        if ( opt_console_to_ring )
+        if ( is_hardware_domain(cd) )
         {
-            for ( kptr = kbuf; *kptr != '\0'; kptr++ )
-                putchar_console_ring(*kptr);
-            tasklet_schedule(&notify_dom0_con_ring_tasklet);
-        }
+            /* Use direct console output as it could be interactive */
+            spin_lock_irq(&console_lock);
 
-        spin_unlock_irq(&console_lock);
+            sercon_puts(kbuf);
+            video_puts(kbuf);
+
+            if ( opt_console_to_ring )
+            {
+                conring_puts(kbuf);
+                tasklet_schedule(&notify_dom0_con_ring_tasklet);
+            }
+
+            spin_unlock_irq(&console_lock);
+        }
+        else
+        {
+            char *kin = kbuf, *kout = kbuf, c;
+
+            /* Strip non-printable characters */
+            for ( ; ; )
+            {
+                c = *kin++;
+                if ( c == '\0' || c == '\n' )
+                    break;
+                if ( isprint(c) || c == '\t' )
+                    *kout++ = c;
+            }
+            *kout = '\0';
+            spin_lock(&cd->pbuf_lock);
+            if ( c == '\n' )
+            {
+                kcount = kin - kbuf;
+                cd->pbuf[cd->pbuf_idx] = '\0';
+                guest_printk(cd, XENLOG_G_DEBUG "%s%s\n", cd->pbuf, kbuf);
+                cd->pbuf_idx = 0;
+            }
+            else if ( cd->pbuf_idx + kcount < (DOMAIN_PBUF_SIZE - 1) )
+            {
+                /* buffer the output until a newline */
+                memcpy(cd->pbuf + cd->pbuf_idx, kbuf, kcount);
+                cd->pbuf_idx += kcount;
+            }
+            else
+            {
+                cd->pbuf[cd->pbuf_idx] = '\0';
+                guest_printk(cd, XENLOG_G_DEBUG "%s%s\n", cd->pbuf, kbuf);
+                cd->pbuf_idx = 0;
+            }
+            spin_unlock(&cd->pbuf_lock);
+        }
 
         guest_handle_add_offset(buffer, kcount);
         count -= kcount;
@@ -406,13 +466,7 @@ long do_console_io(int cmd, int count, XEN_GUEST_HANDLE_PARAM(char) buffer)
     long rc;
     unsigned int idx, len;
 
-#ifndef VERBOSE
-    /* Only domain 0 may access the emergency console. */
-    if ( current->domain->domain_id != 0 )
-        return -EPERM;
-#endif
-
-    rc = xsm_console_io(current->domain, cmd);
+    rc = xsm_console_io(XSM_OTHER, current->domain, cmd);
     if ( rc )
         return rc;
 
@@ -459,19 +513,15 @@ static bool_t console_locks_busted;
 
 static void __putstr(const char *str)
 {
-    int c;
-
     ASSERT(spin_is_locked(&console_lock));
 
     sercon_puts(str);
-    vga_puts(str);
+    video_puts(str);
+
+    conring_puts(str);
 
     if ( !console_locks_busted )
-    {
-        while ( (c = *str++) != '\0' )
-            putchar_console_ring(c);
         tasklet_schedule(&notify_dom0_con_ring_tasklet);
-    }
 }
 
 static int printk_prefix_check(char *p, char **pp)
@@ -507,32 +557,68 @@ static int printk_prefix_check(char *p, char **pp)
             ((loglvl < upper_thresh) && printk_ratelimit()));
 } 
 
-static void printk_start_of_line(void)
+static void __init parse_console_timestamps(char *s)
+{
+    if ( *s == '\0' || /* Compat for old booleanparam() */
+         !strcmp(s, "date") )
+        opt_con_timestamp_mode = TSM_DATE;
+    else if ( !strcmp(s, "datems") )
+        opt_con_timestamp_mode = TSM_DATE_MS;
+    else if ( !strcmp(s, "boot") )
+        opt_con_timestamp_mode = TSM_BOOT;
+    else if ( !strcmp(s, "none") )
+        opt_con_timestamp_mode = TSM_NONE;
+}
+
+static void printk_start_of_line(const char *prefix)
 {
     struct tm tm;
     char tstr[32];
+    uint64_t sec, nsec;
 
-    __putstr("(XEN) ");
+    __putstr(prefix);
 
-    if ( !opt_console_timestamps )
+    switch ( opt_con_timestamp_mode )
+    {
+    case TSM_DATE:
+    case TSM_DATE_MS:
+        tm = wallclock_time(&nsec);
+
+        if ( tm.tm_mday == 0 )
+            return;
+
+        if ( opt_con_timestamp_mode == TSM_DATE )
+            snprintf(tstr, sizeof(tstr), "[%04u-%02u-%02u %02u:%02u:%02u] ",
+                     1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec);
+        else
+            snprintf(tstr, sizeof(tstr),
+                     "[%04u-%02u-%02u %02u:%02u:%02u.%03"PRIu64"] ",
+                     1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
+                     tm.tm_hour, tm.tm_min, tm.tm_sec, nsec / 1000000);
+        break;
+
+    case TSM_BOOT:
+        sec = NOW();
+        nsec = do_div(sec, 1000000000);
+
+        snprintf(tstr, sizeof(tstr), "[%5"PRIu64".%06"PRIu64"] ",
+                 sec, nsec / 1000);
+        break;
+
+    case TSM_NONE:
+    default:
         return;
+    }
 
-    tm = wallclock_time();
-    if ( tm.tm_mday == 0 )
-        return;
-
-    snprintf(tstr, sizeof(tstr), "[%04u-%02u-%02u %02u:%02u:%02u] ",
-             1900 + tm.tm_year, tm.tm_mon + 1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec);
     __putstr(tstr);
 }
 
-void printk(const char *fmt, ...)
+static void vprintk_common(const char *prefix, const char *fmt, va_list args)
 {
     static char   buf[1024];
     static int    start_of_line = 1, do_print;
 
-    va_list       args;
     char         *p, *q;
     unsigned long flags;
 
@@ -540,9 +626,7 @@ void printk(const char *fmt, ...)
     local_irq_save(flags);
     spin_lock_recursive(&console_lock);
 
-    va_start(args, fmt);
     (void)vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);        
 
     p = buf;
 
@@ -554,7 +638,7 @@ void printk(const char *fmt, ...)
         if ( do_print )
         {
             if ( start_of_line )
-                printk_start_of_line();
+                printk_start_of_line(prefix);
             __putstr(p);
             __putstr("\n");
         }
@@ -569,7 +653,7 @@ void printk(const char *fmt, ...)
         if ( do_print )
         {
             if ( start_of_line )
-                printk_start_of_line();
+                printk_start_of_line(prefix);
             __putstr(p);
         }
         start_of_line = 0;
@@ -577,6 +661,26 @@ void printk(const char *fmt, ...)
 
     spin_unlock_recursive(&console_lock);
     local_irq_restore(flags);
+}
+
+void printk(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    vprintk_common("(XEN) ", fmt, args);
+    va_end(args);
+}
+
+void guest_printk(const struct domain *d, const char *fmt, ...)
+{
+    va_list args;
+    char prefix[16];
+
+    snprintf(prefix, sizeof(prefix), "(d%d) ", d->domain_id);
+
+    va_start(args, fmt);
+    vprintk_common(prefix, fmt, args);
+    va_end(args);
 }
 
 void __init console_init_preirq(void)
@@ -592,11 +696,14 @@ void __init console_init_preirq(void)
         if ( *p == ',' )
             p++;
         if ( !strncmp(p, "vga", 3) )
-            vga_init();
+            video_init();
         else if ( !strncmp(p, "none", 4) )
             continue;
         else if ( (sh = serial_parse_handle(p)) >= 0 )
+        {
             sercon_handle = sh;
+            serial_steal_fn = NULL;
+        }
         else
         {
             char *q = strchr(p, ',');
@@ -614,10 +721,10 @@ void __init console_init_preirq(void)
     spin_lock(&console_lock);
     __putstr(xen_banner());
     spin_unlock(&console_lock);
-    printk("Xen version %d.%d%s (%s@%s) (%s) %s\n",
+    printk("Xen version %d.%d%s (%s@%s) (%s) debug=%c %s\n",
            xen_major_version(), xen_minor_version(), xen_extra_version(),
            xen_compile_by(), xen_compile_domain(),
-           xen_compiler(), xen_compile_date());
+           xen_compiler(), debug_build() ? 'y' : 'n', xen_compile_date());
     printk("Latest ChangeSet: %s\n", xen_changeset());
 
     if ( opt_sync_console )
@@ -631,7 +738,7 @@ void __init console_init_preirq(void)
 void __init console_init_postirq(void)
 {
     char *ring;
-    unsigned int i, order;
+    unsigned int i, order, memflags;
 
     serial_init_postirq();
 
@@ -639,7 +746,8 @@ void __init console_init_postirq(void)
         opt_conring_size = num_present_cpus() << (9 + xenlog_lower_thresh);
 
     order = get_order_from_bytes(max(opt_conring_size, conring_size));
-    while ( (ring = alloc_xenheap_pages(order, MEMF_bits(crashinfo_maxaddr_bits))) == NULL )
+    memflags = MEMF_bits(crashinfo_maxaddr_bits);
+    while ( (ring = alloc_xenheap_pages(order, memflags)) == NULL )
     {
         BUG_ON(order == 0);
         order--;
@@ -650,7 +758,7 @@ void __init console_init_postirq(void)
     for ( i = conringc ; i != conringp; i++ )
         ring[i & (opt_conring_size - 1)] = conring[i & (conring_size - 1)];
     conring = ring;
-    wmb(); /* Allow users of console_force_unlock() to see larger buffer. */
+    smp_wmb(); /* Allow users of console_force_unlock() to see larger buffer. */
     conring_size = opt_conring_size;
     spin_unlock_irq(&console_lock);
 
@@ -694,7 +802,7 @@ void __init console_endboot(void)
         printk("\n");
     }
 
-    vga_endboot();
+    video_endboot();
 
     /*
      * If user specifies so, we fool the switch routine to redirect input
@@ -739,6 +847,7 @@ void console_end_log_everything(void)
 
 void console_force_unlock(void)
 {
+    watchdog_disable();
     spin_lock_init(&console_lock);
     serial_force_unlock(sercon_handle);
     console_locks_busted = 1;
@@ -793,7 +902,7 @@ int __printk_ratelimit(int ratelimit_ms, int ratelimit_burst)
             snprintf(lost_str, sizeof(lost_str), "%d", lost);
             /* console_lock may already be acquired by printk(). */
             spin_lock_recursive(&console_lock);
-            printk_start_of_line();
+            printk_start_of_line("(XEN) ");
             __putstr("printk: ");
             __putstr(lost_str);
             __putstr(" messages suppressed.\n");
@@ -999,7 +1108,7 @@ void panic(const char *fmt, ...)
     console_start_sync();
     printk("\n****************************************\n");
     printk("Panic on CPU %d:\n", smp_processor_id());
-    printk("%s", buf);
+    printk("%s\n", buf);
     printk("****************************************\n\n");
     if ( opt_noreboot )
         printk("Manual reset required ('noreboot' specified)\n");
@@ -1030,8 +1139,7 @@ void __bug(char *file, int line)
     console_start_sync();
     printk("Xen BUG at %s:%d\n", file, line);
     dump_execution_state();
-    panic("Xen BUG at %s:%d\n", file, line);
-    for ( ; ; ) ;
+    panic("Xen BUG at %s:%d", file, line);
 }
 
 void __warn(char *file, int line)
@@ -1067,7 +1175,7 @@ int console_resume(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

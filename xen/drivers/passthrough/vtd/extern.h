@@ -79,7 +79,7 @@ void free_pgtable_maddr(u64 maddr);
 void *map_vtd_domain_page(u64 maddr);
 void unmap_vtd_domain_page(void *va);
 int domain_context_mapping_one(struct domain *domain, struct iommu *iommu,
-                               u8 bus, u8 devfn);
+                               u8 bus, u8 devfn, const struct pci_dev *);
 int domain_context_unmap_one(struct domain *domain, struct iommu *iommu,
                              u8 bus, u8 devfn);
 
@@ -90,7 +90,7 @@ void io_apic_write_remap_rte(unsigned int apic,
 struct msi_desc;
 struct msi_msg;
 void msi_msg_read_remap_rte(struct msi_desc *, struct msi_msg *);
-void msi_msg_write_remap_rte(struct msi_desc *, struct msi_msg *);
+int msi_msg_write_remap_rte(struct msi_desc *, struct msi_msg *);
 
 int intel_setup_hpet_msi(struct msi_desc *);
 

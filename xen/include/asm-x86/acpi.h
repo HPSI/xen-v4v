@@ -80,7 +80,6 @@ int __acpi_release_global_lock(unsigned int *lock);
 
 extern bool_t acpi_lapic, acpi_ioapic, acpi_noirq;
 extern bool_t acpi_force, acpi_ht, acpi_disabled;
-extern bool_t acpi_skip_timer_override;
 extern u32 acpi_smi_cmd;
 extern u8 acpi_enable_value, acpi_disable_value;
 void acpi_pic_sci_set_trigger(unsigned int, u16);
@@ -126,11 +125,20 @@ struct acpi_sleep_info {
     struct acpi_generic_address pm1b_cnt_blk;
     struct acpi_generic_address pm1a_evt_blk;
     struct acpi_generic_address pm1b_evt_blk;
-    uint16_t pm1a_cnt_val;
-    uint16_t pm1b_cnt_val;
+    struct acpi_generic_address sleep_control;
+    struct acpi_generic_address sleep_status;
+    union {
+        uint16_t pm1a_cnt_val;
+        uint8_t sleep_type_a;
+    };
+    union {
+        uint16_t pm1b_cnt_val;
+        uint8_t sleep_type_b;
+    };
     uint32_t sleep_state;
     uint64_t wakeup_vector;
     uint32_t vector_width;
+    bool_t sleep_extended;
 };
 
 #endif /* CONFIG_ACPI_SLEEP */

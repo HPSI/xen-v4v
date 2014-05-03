@@ -1771,13 +1771,12 @@ int security_get_user_sids(u32 fromsid, char *username, u32 **sids, u32 *nel)
     }
     usercon.user = user->value;
 
-    mysids = xmalloc_array(u32, maxnel);
+    mysids = xzalloc_array(u32, maxnel);
     if ( !mysids )
     {
         rc = -ENOMEM;
         goto out_unlock;
     }
-    memset(mysids, 0, maxnel*sizeof(*mysids));
 
     ebitmap_for_each_positive_bit(&user->roles, rnode, i)
     {
@@ -1808,14 +1807,13 @@ int security_get_user_sids(u32 fromsid, char *username, u32 **sids, u32 *nel)
             else
             {
                 maxnel += SIDS_NEL;
-                mysids2 = xmalloc_array(u32, maxnel);
+                mysids2 = xzalloc_array(u32, maxnel);
                 if ( !mysids2 )
                 {
                     rc = -ENOMEM;
                     xfree(mysids);
                     goto out_unlock;
                 }
-                memset(mysids2, 0, maxnel*sizeof(*mysids2));
                 memcpy(mysids2, mysids, mynel * sizeof(*mysids2));
                 xfree(mysids);
                 mysids = mysids2;
@@ -1850,7 +1848,7 @@ int security_find_bool(const char *name)
     return rv;
 }
 
-int security_get_bools(int *len, char ***names, int **values)
+int security_get_bools(int *len, char ***names, int **values, size_t *maxstr)
 {
     int i, rc = -ENOMEM;
 
@@ -1858,6 +1856,8 @@ int security_get_bools(int *len, char ***names, int **values)
     if ( names )
         *names = NULL;
     *values = NULL;
+    if ( maxstr )
+        *maxstr = 0;
 
     *len = policydb.p_bools.nprim;
     if ( !*len )
@@ -1866,29 +1866,30 @@ int security_get_bools(int *len, char ***names, int **values)
         goto out;
     }
 
-    if ( names ) {
-        *names = (char**)xmalloc_array(char*, *len);
+    if ( names )
+    {
+        *names = xzalloc_array(char *, *len);
         if ( !*names )
             goto err;
-        memset(*names, 0, sizeof(char*) * *len);
     }
 
-    *values = (int*)xmalloc_array(int, *len);
+    *values = xmalloc_array(int, *len);
     if ( !*values )
         goto err;
 
     for ( i = 0; i < *len; i++ )
     {
-        size_t name_len;
+        size_t name_len = strlen(policydb.p_bool_val_to_name[i]);
+
         (*values)[i] = policydb.bool_val_to_struct[i]->state;
         if ( names ) {
-            name_len = strlen(policydb.p_bool_val_to_name[i]) + 1;
-            (*names)[i] = (char*)xmalloc_array(char, name_len);
+            (*names)[i] = xmalloc_array(char, name_len + 1);
             if ( !(*names)[i] )
                 goto err;
-            strlcpy((*names)[i], policydb.p_bool_val_to_name[i], name_len);
-            (*names)[i][name_len - 1] = 0;
+            strlcpy((*names)[i], policydb.p_bool_val_to_name[i], name_len + 1);
         }
+        if ( maxstr && name_len > *maxstr )
+            *maxstr = name_len;
     }
     rc = 0;
 out:
@@ -1899,6 +1900,7 @@ err:
     {
         for ( i = 0; i < *len; i++ )
             xfree((*names)[i]);
+        xfree(*names);
     }
     xfree(*values);
     goto out;
@@ -1956,7 +1958,7 @@ out:
     return rc;
 }
 
-int security_get_bool_value(unsigned int bool)
+int security_get_bool_value(unsigned int b)
 {
     int rc = 0;
     unsigned int len;
@@ -1964,19 +1966,19 @@ int security_get_bool_value(unsigned int bool)
     POLICY_RDLOCK;
 
     len = policydb.p_bools.nprim;
-    if ( bool >= len )
+    if ( b >= len )
     {
         rc = -ENOENT;
         goto out;
     }
 
-    rc = policydb.bool_val_to_struct[bool]->state;
+    rc = policydb.bool_val_to_struct[b]->state;
 out:
     POLICY_RDUNLOCK;
     return rc;
 }
 
-char *security_get_bool_name(unsigned int bool)
+char *security_get_bool_name(unsigned int b)
 {
     unsigned int len;
     char *rv = NULL;
@@ -1984,16 +1986,16 @@ char *security_get_bool_name(unsigned int bool)
     POLICY_RDLOCK;
 
     len = policydb.p_bools.nprim;
-    if ( bool >= len )
+    if ( b >= len )
     {
         goto out;
     }
 
-    len = strlen(policydb.p_bool_val_to_name[bool]) + 1;
+    len = strlen(policydb.p_bool_val_to_name[b]) + 1;
     rv = xmalloc_array(char, len);
     if ( !rv )
         goto out;
-    memcpy(rv, policydb.p_bool_val_to_name[bool], len);
+    memcpy(rv, policydb.p_bool_val_to_name[b], len);
 out:
     POLICY_RDUNLOCK;
     return rv;
@@ -2006,9 +2008,9 @@ static int security_preserve_bools(struct policydb *p)
     struct cond_bool_datum *booldatum;
     struct cond_node *cur;
 
-    rc = security_get_bools(&nbools, &bnames, &bvalues);
+    rc = security_get_bools(&nbools, &bnames, &bvalues, NULL);
     if ( rc )
-        goto out;
+        return rc;
     for ( i = 0; i < nbools; i++ )
     {
         booldatum = hashtab_search(p->p_bools.table, bnames[i]);
@@ -2033,20 +2035,6 @@ out:
     return rc;
 }
 
-int determine_ocontext( char *ocontext )
-{
-    if ( strcmp(ocontext, "pirq") == 0 )
-        return OCON_PIRQ;
-    else if ( strcmp(ocontext, "ioport") == 0 )
-        return OCON_IOPORT;
-    else if ( strcmp(ocontext, "iomem") == 0 )
-        return OCON_IOMEM;
-    else if ( strcmp(ocontext, "pcidevice") == 0 )
-        return OCON_DEVICE;
-    else
-        return -1;
-}
-
 int security_ocontext_add( u32 ocon, unsigned long low, unsigned long high
                             ,u32 sid )
 {
@@ -2055,9 +2043,8 @@ int security_ocontext_add( u32 ocon, unsigned long low, unsigned long high
     struct ocontext *prev;
     struct ocontext *add;
 
-    if ( (add = xmalloc(struct ocontext)) == NULL )
+    if ( (add = xzalloc(struct ocontext)) == NULL )
         return -ENOMEM;
-    memset(add, 0, sizeof(struct ocontext));
     add->sid[0] = sid;
 
     POLICY_WRLOCK;
@@ -2110,7 +2097,7 @@ int security_ocontext_add( u32 ocon, unsigned long low, unsigned long high
                 c->u.ioport.high_ioport == high && c->sid[0] == sid)
                 break;
 
-            printk("%s: IO Port overlap with entry 0x%x - 0x%x\n",
+            printk("%s: IO Port overlap with entry %#x - %#x\n",
                    __FUNCTION__, c->u.ioport.low_ioport,
                    c->u.ioport.high_ioport);
             ret = -EEXIST;
@@ -2144,7 +2131,7 @@ int security_ocontext_add( u32 ocon, unsigned long low, unsigned long high
                 c->u.iomem.high_iomem == high && c->sid[0] == sid)
                 break;
 
-            printk("%s: IO Memory overlap with entry 0x%x - 0x%x\n",
+            printk("%s: IO Memory overlap with entry %#x - %#x\n",
                    __FUNCTION__, c->u.iomem.low_iomem,
                    c->u.iomem.high_iomem);
             ret = -EEXIST;
@@ -2176,7 +2163,7 @@ int security_ocontext_add( u32 ocon, unsigned long low, unsigned long high
                 if ( c->sid[0] == sid )
                     break;
 
-                printk("%s: Duplicate PCI Device 0x%x\n", __FUNCTION__,
+                printk("%s: Duplicate PCI Device %#x\n", __FUNCTION__,
                         add->u.device);
                 ret = -EEXIST;
                 break;
@@ -2256,7 +2243,7 @@ int security_ocontext_del( u32 ocon, unsigned int low, unsigned int high )
             }
         }
 
-        printk("%s: ocontext not found: ioport 0x%x - 0x%x\n", __FUNCTION__,
+        printk("%s: ocontext not found: ioport %#x - %#x\n", __FUNCTION__,
                 low, high);
         ret = -ENOENT;
         break;
@@ -2283,7 +2270,7 @@ int security_ocontext_del( u32 ocon, unsigned int low, unsigned int high )
             }
         }
 
-        printk("%s: ocontext not found: iomem 0x%x - 0x%x\n", __FUNCTION__,
+        printk("%s: ocontext not found: iomem %#x - %#x\n", __FUNCTION__,
                 low, high);
         ret = -ENOENT;
         break;
@@ -2309,7 +2296,7 @@ int security_ocontext_del( u32 ocon, unsigned int low, unsigned int high )
             }
         }
 
-        printk("%s: ocontext not found: pcidevice 0x%x\n", __FUNCTION__, low);
+        printk("%s: ocontext not found: pcidevice %#x\n", __FUNCTION__, low);
         ret = -ENOENT;
         break;
 

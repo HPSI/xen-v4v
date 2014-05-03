@@ -28,6 +28,7 @@
 #include <xen/init.h>
 #include <xen/acpi.h>
 #include <xen/irq.h>
+#include <xen/mm.h>
 #include <xen/dmi.h>
 #include <asm/fixmap.h>
 #include <asm/page.h>
@@ -55,7 +56,9 @@ bool_t __initdata acpi_ht = 1;	/* enable HT */
 bool_t __initdata acpi_lapic;
 bool_t __initdata acpi_ioapic;
 
-bool_t acpi_skip_timer_override __initdata;
+/* acpi_skip_timer_override: Skip IRQ0 overrides. */
+static bool_t acpi_skip_timer_override __initdata;
+boolean_param("acpi_skip_timer_override", acpi_skip_timer_override);
 
 #ifdef CONFIG_X86_LOCAL_APIC
 static u64 acpi_lapic_addr __initdata = APIC_DEFAULT_PHYS_BASE;
@@ -96,7 +99,20 @@ acpi_parse_x2apic(struct acpi_subtable_header *header, const unsigned long end)
 
 	acpi_table_print_madt_entry(header);
 
-	/* Record local apic id only when enabled */
+	/* Record local apic id only when enabled and fitting. */
+	if (processor->local_apic_id >= MAX_APICS ||
+	    processor->uid >= MAX_MADT_ENTRIES) {
+		printk("%sAPIC ID %#x and/or ACPI ID %#x beyond limit"
+		       " - processor ignored\n",
+		       processor->lapic_flags & ACPI_MADT_ENABLED ?
+				KERN_WARNING "WARNING: " : KERN_INFO,
+		       processor->local_apic_id, processor->uid);
+		/*
+		 * Must not return an error here, to prevent
+		 * acpi_table_parse_entries() from terminating early.
+		 */
+		return 0 /* -ENOSPC */;
+	}
 	if (processor->lapic_flags & ACPI_MADT_ENABLED) {
 		x86_acpiid_to_apicid[processor->uid] =
 			processor->local_apic_id;
@@ -275,6 +291,22 @@ static int __init acpi_parse_hpet(struct acpi_table_header *table)
 		return -1;
 	}
 
+	/*
+	 * Some BIOSes provide multiple HPET tables.  Sometimes this is a BIOS
+	 * bug; the intended way of supporting more than 1 HPET is to use AML
+	 * entries.
+	 *
+	 * If someone finds a real system with two genuine HPET tables, perhaps
+	 * they will be kind and implement support.  Until then however, warn
+	 * that we will ignore subsequent tables.
+	 */
+	if (hpet_address)
+	{
+		printk(KERN_WARNING PREFIX
+		       "Found multiple HPET tables. Only using first\n");
+		return -1;
+	}
+
 	hpet_address = hpet_tbl->address.address;
 	hpet_blockid = hpet_tbl->sequence;
 	printk(KERN_INFO PREFIX "HPET id: %#x base: %#lx\n",
@@ -286,16 +318,38 @@ static int __init acpi_parse_hpet(struct acpi_table_header *table)
 #define	acpi_parse_hpet	NULL
 #endif
 
+static int __init acpi_invalidate_bgrt(struct acpi_table_header *table)
+{
+	struct acpi_table_bgrt *bgrt_tbl =
+		container_of(table, struct acpi_table_bgrt, header);
+
+	if (table->length < sizeof(*bgrt_tbl))
+		return -1;
+
+	if (bgrt_tbl->version == 1 && bgrt_tbl->image_address
+	    && !page_is_ram_type(PFN_DOWN(bgrt_tbl->image_address),
+				 RAM_TYPE_CONVENTIONAL))
+		return 0;
+
+	printk(KERN_INFO PREFIX "BGRT: invalidating v%d image at %#"PRIx64"\n",
+	       bgrt_tbl->version, bgrt_tbl->image_address);
+	bgrt_tbl->image_address = 0;
+	bgrt_tbl->status &= ~1;
+
+	return 0;
+}
+
 #ifdef CONFIG_ACPI_SLEEP
 #define acpi_fadt_copy_address(dst, src, len) do {			\
-	if (fadt->header.revision >= FADT2_REVISION_ID)			\
+	if (fadt->header.revision >= FADT2_REVISION_ID &&		\
+	    fadt->header.length >= ACPI_FADT_V2_SIZE)			\
 		acpi_sinfo.dst##_blk = fadt->x##src##_block;		\
 	if (!acpi_sinfo.dst##_blk.address) {				\
 		acpi_sinfo.dst##_blk.address      = fadt->src##_block;	\
 		acpi_sinfo.dst##_blk.space_id     = ACPI_ADR_SPACE_SYSTEM_IO; \
 		acpi_sinfo.dst##_blk.bit_width    = fadt->len##_length << 3; \
 		acpi_sinfo.dst##_blk.bit_offset   = 0;			\
-		acpi_sinfo.dst##_blk.access_width = 0;			\
+		acpi_sinfo.dst##_blk.access_width = fadt->len##_length;	\
 	} \
 } while (0)
 
@@ -306,17 +360,59 @@ acpi_fadt_parse_sleep_info(struct acpi_table_fadt *fadt)
 	struct acpi_table_facs *facs = NULL;
 	uint64_t facs_pa;
 
+	if (fadt->header.revision >= 5 &&
+	    fadt->header.length >= ACPI_FADT_V5_SIZE) {
+		acpi_sinfo.sleep_control = fadt->sleep_control;
+		acpi_sinfo.sleep_status = fadt->sleep_status;
+
+		printk(KERN_INFO PREFIX
+		       "v5 SLEEP INFO: control[%d:%"PRIx64"],"
+		       " status[%d:%"PRIx64"]\n",
+		       acpi_sinfo.sleep_control.space_id,
+		       acpi_sinfo.sleep_control.address,
+		       acpi_sinfo.sleep_status.space_id,
+		       acpi_sinfo.sleep_status.address);
+
+		if ((fadt->sleep_control.address &&
+		     (fadt->sleep_control.bit_offset ||
+		      fadt->sleep_control.bit_width !=
+		      fadt->sleep_control.access_width * 8)) ||
+		    (fadt->sleep_status.address &&
+		     (fadt->sleep_status.bit_offset ||
+		      fadt->sleep_status.bit_width !=
+		      fadt->sleep_status.access_width * 8))) {
+			printk(KERN_WARNING PREFIX
+			       "Invalid sleep control/status register data:"
+			       " %#x:%#x:%#x %#x:%#x:%#x\n",
+			       fadt->sleep_control.bit_offset,
+			       fadt->sleep_control.bit_width,
+			       fadt->sleep_control.access_width,
+			       fadt->sleep_status.bit_offset,
+			       fadt->sleep_status.bit_width,
+			       fadt->sleep_status.access_width);
+			fadt->sleep_control.address = 0;
+			fadt->sleep_status.address = 0;
+		}
+	}
+
+	if (fadt->flags & ACPI_FADT_HW_REDUCED)
+		goto bad;
+
 	acpi_fadt_copy_address(pm1a_cnt, pm1a_control, pm1_control);
 	acpi_fadt_copy_address(pm1b_cnt, pm1b_control, pm1_control);
 	acpi_fadt_copy_address(pm1a_evt, pm1a_event, pm1_event);
 	acpi_fadt_copy_address(pm1b_evt, pm1b_event, pm1_event);
 
 	printk(KERN_INFO PREFIX
-	       "ACPI SLEEP INFO: pm1x_cnt[%"PRIx64",%"PRIx64"], "
-	       "pm1x_evt[%"PRIx64",%"PRIx64"]\n",
+	       "SLEEP INFO: pm1x_cnt[%d:%"PRIx64",%d:%"PRIx64"], "
+	       "pm1x_evt[%d:%"PRIx64",%d:%"PRIx64"]\n",
+	       acpi_sinfo.pm1a_cnt_blk.space_id,
 	       acpi_sinfo.pm1a_cnt_blk.address,
+	       acpi_sinfo.pm1b_cnt_blk.space_id,
 	       acpi_sinfo.pm1b_cnt_blk.address,
+	       acpi_sinfo.pm1a_evt_blk.space_id,
 	       acpi_sinfo.pm1a_evt_blk.address,
+	       acpi_sinfo.pm1b_evt_blk.space_id,
 	       acpi_sinfo.pm1b_evt_blk.address);
 
 	/* Now FACS... */
@@ -329,6 +425,8 @@ acpi_fadt_parse_sleep_info(struct acpi_table_fadt *fadt)
 		       fadt->facs, facs_pa);
 		facs_pa = (uint64_t)fadt->facs;
 	}
+	if (!facs_pa)
+		goto bad;
 
 	facs = (struct acpi_table_facs *)
 		__acpi_map_table(facs_pa, sizeof(struct acpi_table_facs));
@@ -357,11 +455,14 @@ acpi_fadt_parse_sleep_info(struct acpi_table_fadt *fadt)
 	acpi_sinfo.vector_width = 32;
 
 	printk(KERN_INFO PREFIX
-	       "                 wakeup_vec[%"PRIx64"], vec_size[%x]\n",
+	       "            wakeup_vec[%"PRIx64"], vec_size[%x]\n",
 	       acpi_sinfo.wakeup_vector, acpi_sinfo.vector_width);
 	return;
 bad:
-	memset(&acpi_sinfo, 0, sizeof(acpi_sinfo));
+	memset(&acpi_sinfo, 0,
+	       offsetof(struct acpi_sleep_info, sleep_control));
+	memset(&acpi_sinfo.sleep_status + 1, 0,
+	       (long)(&acpi_sinfo + 1) - (long)(&acpi_sinfo.sleep_status + 1));
 }
 #endif
 
@@ -652,6 +753,8 @@ int __init acpi_boot_init(void)
 	acpi_dmar_init();
 
 	erst_init();
+
+	acpi_table_parse(ACPI_SIG_BGRT, acpi_invalidate_bgrt);
 
 	return 0;
 }

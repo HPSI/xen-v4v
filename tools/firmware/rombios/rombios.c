@@ -1805,12 +1805,12 @@ keyboard_init()
     while ( (inb(0x64) & 0x02) && (--max>0)) outb(0x80, 0x00);
 
     /* flush incoming keys */
-    max=0x2000;
+    max=2;
     while (--max > 0) {
         outb(0x80, 0x00);
         if (inb(0x64) & 0x01) {
             inb(0x60);
-            max = 0x2000;
+            max = 2;
             }
         }
 
@@ -2531,16 +2531,15 @@ void ata_init( )
 
 #define IDE_TIMEOUT 32000u //32 seconds max for IDE ops
 
-int await_ide();
-static int await_ide(when_done,base,timeout)
+Bit8u await_ide();
+static Bit8u await_ide(when_done,base,timeout)
   Bit8u when_done;
   Bit16u base;
   Bit16u timeout;
 {
   Bit32u time=0,last=0;
-  Bit16u status;
+  Bit8u status;
   Bit8u result;
-  status = inb(base + ATA_CB_STAT); // for the times you're supposed to throw one away
   for(;;) {
     status = inb(base+ATA_CB_STAT);
     time++;
@@ -2557,7 +2556,7 @@ static int await_ide(when_done,base,timeout)
     else if (when_done == TIMEOUT)
       result = 0;
 
-    if (result) return 0;
+    if (result) return status;
     if (time>>16 != last) // mod 2048 each 16 ms
     {
       last = time >>16;
@@ -2566,12 +2565,12 @@ static int await_ide(when_done,base,timeout)
     if (status & ATA_CB_STAT_ERR)
     {
       BX_DEBUG_ATA("await_ide: ERROR (TIMEOUT,BSY,!BSY,!BSY_DRQ,!BSY_!DRQ,!BSY_RDY) %d time= %ld timeout= %d\n",when_done,time>>11, timeout);
-      return -1;
+      return status;
     }
     if ((timeout == 0) || ((time>>11) > timeout)) break;
   }
   BX_INFO("IDE time out\n");
-  return -1;
+  return status;
 }
 
 // ---------------------------------------------------------------------------
@@ -2914,8 +2913,8 @@ Bit16u device;
 // 8.2.1 (a) -- set SRST in DC
   outb(iobase2+ATA_CB_DC, ATA_CB_DC_HD15 | ATA_CB_DC_NIEN | ATA_CB_DC_SRST);
 
-// 8.2.1 (b) -- wait for BSY
-  await_ide(BSY, iobase1, 20);
+// 8.2.1 (b) -- wait
+  outb(0x80, 0x00);
 
 // 8.2.1 (f) -- clear SRST
   outb(iobase2+ATA_CB_DC, ATA_CB_DC_HD15 | ATA_CB_DC_NIEN);
@@ -3017,8 +3016,7 @@ Bit32u lba_low, lba_high;
   outb(iobase1 + ATA_CB_DH, (slave ? ATA_CB_DH_DEV1 : ATA_CB_DH_DEV0) | (Bit8u) head );
   outb(iobase1 + ATA_CB_CMD, command);
 
-  await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
-  status = inb(iobase1 + ATA_CB_STAT);
+  status = await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
 
   if (status & ATA_CB_STAT_ERR) {
     BX_DEBUG_ATA("ata_cmd_data_in : read error\n");
@@ -3078,8 +3076,7 @@ ASM_END
     current++;
     write_word(ebda_seg, &EbdaData->ata.trsfsectors,current);
     count--;
-    await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
-    status = inb(iobase1 + ATA_CB_STAT);
+    status = await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
     if (count == 0) {
       if ( (status & (ATA_CB_STAT_BSY | ATA_CB_STAT_RDY | ATA_CB_STAT_DRQ | ATA_CB_STAT_ERR) )
           != ATA_CB_STAT_RDY ) {
@@ -3168,8 +3165,7 @@ Bit32u lba_low, lba_high;
   outb(iobase1 + ATA_CB_DH, (slave ? ATA_CB_DH_DEV1 : ATA_CB_DH_DEV0) | (Bit8u) head );
   outb(iobase1 + ATA_CB_CMD, command);
 
-  await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
-  status = inb(iobase1 + ATA_CB_STAT);
+  status = await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
 
   if (status & ATA_CB_STAT_ERR) {
     BX_DEBUG_ATA("ata_cmd_data_out : read error\n");
@@ -3317,8 +3313,7 @@ Bit32u length;
   outb(iobase1 + ATA_CB_CMD, ATA_CMD_PACKET);
 
   // Device should ok to receive command
-  await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
-  status = inb(iobase1 + ATA_CB_STAT);
+  status = await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
 
   if (status & ATA_CB_STAT_ERR) {
     BX_DEBUG_ATA("ata_cmd_packet : error, status is %02x\n",status);
@@ -3354,8 +3349,7 @@ ASM_START
 ASM_END
 
   if (inout == ATA_DATA_NO) {
-    await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
-    status = inb(iobase1 + ATA_CB_STAT);
+    status = await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
     }
   else {
         Bit16u loops = 0;
@@ -3364,13 +3358,12 @@ ASM_END
 
       if (loops == 0) {//first time through
         status = inb(iobase2 + ATA_CB_ASTAT);
-        await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
+        status = await_ide(NOT_BSY_DRQ, iobase1, IDE_TIMEOUT);
       }
       else
-        await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
+        status = await_ide(NOT_BSY, iobase1, IDE_TIMEOUT);
       loops++;
 
-      status = inb(iobase1 + ATA_CB_STAT);
       sc = inb(iobase1 + ATA_CB_SC);
 
       // Check if command completed

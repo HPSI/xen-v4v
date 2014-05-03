@@ -9,16 +9,19 @@
 #include <xen/smp.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
+#include <asm/debugreg.h>
 #include <asm/flushtlb.h>
 #include <asm/hvm/hvm.h>
 #include <asm/hvm/support.h>
 #include <asm/i387.h>
+#include <asm/xstate.h>
 #include <xen/hypercall.h>
 
 static unsigned long saved_lstar, saved_cstar;
 static unsigned long saved_sysenter_esp, saved_sysenter_eip;
 static unsigned long saved_fs_base, saved_gs_base, saved_kernel_gs_base;
 static uint16_t saved_segs[4];
+static uint64_t saved_xcr0;
 
 void save_rest_processor_state(void)
 {
@@ -27,8 +30,8 @@ void save_rest_processor_state(void)
     asm volatile (
         "movw %%ds,(%0); movw %%es,2(%0); movw %%fs,4(%0); movw %%gs,6(%0)"
         : : "r" (saved_segs) : "memory" );
-    rdmsrl(MSR_FS_BASE, saved_fs_base);
-    rdmsrl(MSR_GS_BASE, saved_gs_base);
+    saved_fs_base = rdfsbase();
+    saved_gs_base = rdgsbase();
     rdmsrl(MSR_SHADOW_GS_BASE, saved_kernel_gs_base);
     rdmsrl(MSR_CSTAR, saved_cstar);
     rdmsrl(MSR_LSTAR, saved_lstar);
@@ -38,6 +41,8 @@ void save_rest_processor_state(void)
         rdmsrl(MSR_IA32_SYSENTER_ESP, saved_sysenter_esp);
         rdmsrl(MSR_IA32_SYSENTER_EIP, saved_sysenter_eip);
     }
+    if ( cpu_has_xsave )
+        saved_xcr0 = get_xcr0();
 }
 
 
@@ -56,8 +61,8 @@ void restore_rest_processor_state(void)
           X86_EFLAGS_DF|X86_EFLAGS_IF|X86_EFLAGS_TF,
           0U);
 
-    wrmsrl(MSR_FS_BASE, saved_fs_base);
-    wrmsrl(MSR_GS_BASE, saved_gs_base);
+    wrfsbase(saved_fs_base);
+    wrgsbase(saved_gs_base);
     wrmsrl(MSR_SHADOW_GS_BASE, saved_kernel_gs_base);
 
     if ( boot_cpu_data.x86_vendor == X86_VENDOR_INTEL ||
@@ -77,8 +82,11 @@ void restore_rest_processor_state(void)
         do_set_segment_base(SEGBASE_GS_USER_SEL, saved_segs[3]);
     }
 
+    if ( cpu_has_xsave && !set_xcr0(saved_xcr0) )
+        BUG();
+
     /* Maybe load the debug registers. */
-    BUG_ON(is_hvm_vcpu(curr));
+    BUG_ON(!is_pv_vcpu(curr));
     if ( !is_idle_vcpu(curr) && curr->arch.debugreg[7] )
     {
         write_debugreg(0, curr->arch.debugreg[0]);

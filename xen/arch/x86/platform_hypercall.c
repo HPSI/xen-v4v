@@ -66,14 +66,15 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     ret_t ret = 0;
     struct xen_platform_op curop, *op = &curop;
 
-    if ( !IS_PRIV(current->domain) )
-        return -EPERM;
-
     if ( copy_from_guest(op, u_xenpf_op, 1) )
         return -EFAULT;
 
     if ( op->interface_version != XENPF_INTERFACE_VERSION )
         return -EACCES;
+
+    ret = xsm_platform_op(XSM_PRIV, op->cmd);
+    if ( ret )
+        return ret;
 
     /*
      * Trylock here avoids deadlock with an existing platform critical section
@@ -89,10 +90,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     {
     case XENPF_settime:
     {
-        ret = xsm_xen_settime();
-        if ( ret )
-            break;
-
         do_settime(op->u.settime.secs, 
                    op->u.settime.nsecs, 
                    op->u.settime.system_time);
@@ -102,10 +99,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
     case XENPF_add_memtype:
     {
-        ret = xsm_memtype(op->cmd);
-        if ( ret )
-            break;
-
         ret = mtrr_add_page(
             op->u.add_memtype.mfn,
             op->u.add_memtype.nr_mfns,
@@ -115,7 +108,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
         {
             op->u.add_memtype.handle = 0;
             op->u.add_memtype.reg    = ret;
-            ret = copy_to_guest(u_xenpf_op, op, 1) ? -EFAULT : 0;
+            ret = __copy_field_to_guest(u_xenpf_op, op, u.add_memtype) ?
+                  -EFAULT : 0;
             if ( ret != 0 )
                 mtrr_del_page(ret, 0, 0);
         }
@@ -124,10 +118,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
     case XENPF_del_memtype:
     {
-        ret = xsm_memtype(op->cmd);
-        if ( ret )
-            break;
-
         if (op->u.del_memtype.handle == 0
             /* mtrr/main.c otherwise does a lookup */
             && (int)op->u.del_memtype.reg >= 0)
@@ -146,10 +136,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
         unsigned long mfn, nr_mfns;
         mtrr_type     type;
 
-        ret = xsm_memtype(op->cmd);
-        if ( ret )
-            break;
-
         ret = -EINVAL;
         if ( op->u.read_memtype.reg < num_var_ranges )
         {
@@ -157,7 +143,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             op->u.read_memtype.mfn     = mfn;
             op->u.read_memtype.nr_mfns = nr_mfns;
             op->u.read_memtype.type    = type;
-            ret = copy_to_guest(u_xenpf_op, op, 1) ? -EFAULT : 0;
+            ret = __copy_field_to_guest(u_xenpf_op, op, u.read_memtype)
+                  ? -EFAULT : 0;
         }
     }
     break;
@@ -165,10 +152,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     case XENPF_microcode_update:
     {
         XEN_GUEST_HANDLE(const_void) data;
-
-        ret = xsm_microcode();
-        if ( ret )
-            break;
 
         guest_from_compat_handle(data, op->u.microcode.data);
 
@@ -197,10 +180,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     {
         int quirk_id = op->u.platform_quirk.quirk_id;
 
-        ret = xsm_platform_quirk(quirk_id);
-        if ( ret )
-            break;
-
         switch ( quirk_id )
         {
         case QUIRK_NOIRQBALANCING:
@@ -222,10 +201,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     break;
 
     case XENPF_firmware_info:
-        ret = xsm_firmware_info();
-        if ( ret )
-            break;
-
         switch ( op->u.firmware_info.type )
         {
         case XEN_FW_DISK_INFO: {
@@ -263,8 +238,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             C(legacy_sectors_per_track);
 #undef C
 
-            ret = (copy_field_to_guest(u_xenpf_op, op,
-                                      u.firmware_info.u.disk_info)
+            ret = (__copy_field_to_guest(u_xenpf_op, op,
+                                         u.firmware_info.u.disk_info)
                    ? -EFAULT : 0);
             break;
         }
@@ -281,8 +256,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             op->u.firmware_info.u.disk_mbr_signature.mbr_signature =
                 sig->signature;
 
-            ret = (copy_field_to_guest(u_xenpf_op, op,
-                                      u.firmware_info.u.disk_mbr_signature)
+            ret = (__copy_field_to_guest(u_xenpf_op, op,
+                                         u.firmware_info.u.disk_mbr_signature)
                    ? -EFAULT : 0);
             break;
         }
@@ -299,10 +274,10 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
                 bootsym(boot_edid_caps) >> 8;
 
             ret = 0;
-            if ( copy_field_to_guest(u_xenpf_op, op, u.firmware_info.
-                                     u.vbeddc_info.capabilities) ||
-                 copy_field_to_guest(u_xenpf_op, op, u.firmware_info.
-                                     u.vbeddc_info.edid_transfer_time) ||
+            if ( __copy_field_to_guest(u_xenpf_op, op, u.firmware_info.
+                                       u.vbeddc_info.capabilities) ||
+                 __copy_field_to_guest(u_xenpf_op, op, u.firmware_info.
+                                       u.vbeddc_info.edid_transfer_time) ||
                  copy_to_compat(op->u.firmware_info.u.vbeddc_info.edid,
                                 bootsym(boot_edid_info), 128) )
                 ret = -EFAULT;
@@ -311,8 +286,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             ret = efi_get_info(op->u.firmware_info.index,
                                &op->u.firmware_info.u.efi_info);
             if ( ret == 0 &&
-                 copy_field_to_guest(u_xenpf_op, op,
-                                     u.firmware_info.u.efi_info) )
+                 __copy_field_to_guest(u_xenpf_op, op,
+                                       u.firmware_info.u.efi_info) )
                 ret = -EFAULT;
             break;
         case XEN_FW_KBD_SHIFT_FLAGS:
@@ -323,8 +298,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             op->u.firmware_info.u.kbd_shift_flags = bootsym(kbd_shift_flags);
 
             ret = 0;
-            if ( copy_field_to_guest(u_xenpf_op, op,
-                                     u.firmware_info.u.kbd_shift_flags) )
+            if ( __copy_field_to_guest(u_xenpf_op, op,
+                                       u.firmware_info.u.kbd_shift_flags) )
                 ret = -EFAULT;
             break;
         default:
@@ -334,29 +309,17 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
         break;
 
     case XENPF_efi_runtime_call:
-        ret = xsm_efi_call();
-        if ( ret )
-            break;
-
         ret = efi_runtime_call(&op->u.efi_runtime_call);
         if ( ret == 0 &&
-             copy_field_to_guest(u_xenpf_op, op, u.efi_runtime_call) )
+             __copy_field_to_guest(u_xenpf_op, op, u.efi_runtime_call) )
             ret = -EFAULT;
         break;
 
     case XENPF_enter_acpi_sleep:
-        ret = xsm_acpi_sleep();
-        if ( ret )
-            break;
-
         ret = acpi_enter_sleep(&op->u.enter_acpi_sleep);
         break;
 
     case XENPF_change_freq:
-        ret = xsm_change_freq();
-        if ( ret )
-            break;
-
         ret = -ENOSYS;
         if ( cpufreq_controller != FREQCTL_dom0_kernel )
             break;
@@ -373,32 +336,32 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     {
         uint32_t cpu;
         uint64_t idletime, now = NOW();
-        struct xenctl_cpumap ctlmap;
+        struct xenctl_bitmap ctlmap;
         cpumask_var_t cpumap;
         XEN_GUEST_HANDLE(uint8) cpumap_bitmap;
         XEN_GUEST_HANDLE(uint64) idletimes;
-
-        ret = xsm_getidletime();
-        if ( ret )
-            break;
 
         ret = -ENOSYS;
         if ( cpufreq_controller != FREQCTL_dom0_kernel )
             break;
 
-        ctlmap.nr_cpus  = op->u.getidletime.cpumap_nr_cpus;
+        ctlmap.nr_bits  = op->u.getidletime.cpumap_nr_cpus;
         guest_from_compat_handle(cpumap_bitmap,
                                  op->u.getidletime.cpumap_bitmap);
         ctlmap.bitmap.p = cpumap_bitmap.p; /* handle -> handle_64 conversion */
-        if ( (ret = xenctl_cpumap_to_cpumask(&cpumap, &ctlmap)) != 0 )
+        if ( (ret = xenctl_bitmap_to_cpumask(&cpumap, &ctlmap)) != 0 )
             goto out;
         guest_from_compat_handle(idletimes, op->u.getidletime.idletime);
 
         for_each_cpu ( cpu, cpumap )
         {
-            if ( idle_vcpu[cpu] == NULL )
-                cpumask_clear_cpu(cpu, cpumap);
             idletime = get_cpu_idle_time(cpu);
+
+            if ( !idletime )
+            {
+                cpumask_clear_cpu(cpu, cpumap);
+                continue;
+            }
 
             if ( copy_to_guest_offset(idletimes, cpu, &idletime, 1) )
             {
@@ -409,19 +372,15 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
         op->u.getidletime.now = now;
         if ( ret == 0 )
-            ret = cpumask_to_xenctl_cpumap(&ctlmap, cpumap);
+            ret = cpumask_to_xenctl_bitmap(&ctlmap, cpumap);
         free_cpumask_var(cpumap);
 
-        if ( ret == 0 && copy_to_guest(u_xenpf_op, op, 1) )
+        if ( ret == 0 && __copy_field_to_guest(u_xenpf_op, op, u.getidletime) )
             ret = -EFAULT;
     }
     break;
 
     case XENPF_set_processor_pminfo:
-        ret = xsm_setpminfo();
-        if ( ret )
-            break;
-
         switch ( op->u.set_pminfo.type )
         {
         case XEN_PM_PX:
@@ -474,10 +433,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
         g_info = &op->u.pcpu_info;
 
-        ret = xsm_getcpuinfo();
-        if ( ret )
-            break;
-
         if ( !get_cpu_maps() )
         {
             ret = -EBUSY;
@@ -503,7 +458,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
         put_cpu_maps();
 
-        ret = copy_to_guest(u_xenpf_op, op, 1) ? -EFAULT : 0;
+        ret = __copy_field_to_guest(u_xenpf_op, op, u.pcpu_info) ? -EFAULT : 0;
     }
     break;
 
@@ -538,7 +493,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
         put_cpu_maps();
 
-        if ( copy_field_to_guest(u_xenpf_op, op, u.pcpu_version) )
+        if ( __copy_field_to_guest(u_xenpf_op, op, u.pcpu_version) )
             ret = -EFAULT;
     }
     break;
@@ -547,7 +502,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     {
         int cpu = op->u.cpu_ol.cpuid;
 
-        ret = xsm_resource_plug_core();
+        ret = xsm_resource_plug_core(XSM_HOOK);
         if ( ret )
             break;
 
@@ -563,10 +518,6 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
             break;
         }
 
-        ret = xsm_resource_plug_core();
-        if ( ret )
-            break;
-
         ret = continue_hypercall_on_cpu(
             0, cpu_up_helper, (void *)(unsigned long)cpu);
         break;
@@ -576,7 +527,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     {
         int cpu = op->u.cpu_ol.cpuid;
 
-        ret = xsm_resource_unplug_core();
+        ret = xsm_resource_unplug_core(XSM_HOOK);
         if ( ret )
             break;
 
@@ -605,7 +556,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     break;
 
     case XENPF_cpu_hotadd:
-        ret = xsm_resource_plug_core();
+        ret = xsm_resource_plug_core(XSM_HOOK);
         if ( ret )
             break;
 
@@ -615,7 +566,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
     break;
 
     case XENPF_mem_hotadd:
-        ret = xsm_resource_plug_core();
+        ret = xsm_resource_plug_core(XSM_HOOK);
         if ( ret )
             break;
 
@@ -639,7 +590,8 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 
         case XEN_CORE_PARKING_GET:
             op->u.core_parking.idle_nums = get_cur_idle_nums();
-            ret = copy_to_guest(u_xenpf_op, op, 1) ? -EFAULT : 0;
+            ret = __copy_field_to_guest(u_xenpf_op, op, u.core_parking) ?
+                  -EFAULT : 0;
             break;
 
         default:
@@ -663,7 +615,7 @@ ret_t do_platform_op(XEN_GUEST_HANDLE_PARAM(xen_platform_op_t) u_xenpf_op)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

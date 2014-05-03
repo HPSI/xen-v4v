@@ -43,10 +43,23 @@ void end_boot_allocator(void);
 
 /* Xen suballocator. These functions are interrupt-safe. */
 void init_xenheap_pages(paddr_t ps, paddr_t pe);
+void xenheap_max_mfn(unsigned long mfn);
 void *alloc_xenheap_pages(unsigned int order, unsigned int memflags);
 void free_xenheap_pages(void *v, unsigned int order);
 #define alloc_xenheap_page() (alloc_xenheap_pages(0,0))
 #define free_xenheap_page(v) (free_xenheap_pages(v,0))
+/* Map machine page range in Xen virtual address space. */
+int map_pages_to_xen(
+    unsigned long virt,
+    unsigned long mfn,
+    unsigned long nr_mfns,
+    unsigned int flags);
+void destroy_xen_mappings(unsigned long v, unsigned long e);
+
+/* Claim handling */
+unsigned long domain_adjust_tot_pages(struct domain *d, long pages);
+int domain_set_outstanding_pages(struct domain *d, unsigned long pages);
+void get_outstanding_claims(uint64_t *free_pages, uint64_t *outstanding_pages);
 
 /* Domain suballocator. These functions are *not* interrupt-safe.*/
 void init_domheap_pages(paddr_t ps, paddr_t pe);
@@ -109,7 +122,7 @@ struct page_list_head
 /* These must only have instances in struct page_info. */
 # define page_list_entry
 
-#define PAGE_LIST_NULL (~0)
+# define PAGE_LIST_NULL ((typeof(((struct page_info){}).list.next))~0)
 
 # if !defined(pdx_to_page) && !defined(page_to_pdx)
 #  if defined(__page_to_mfn) || defined(__mfn_to_page)
@@ -342,6 +355,10 @@ static inline unsigned int get_order_from_pages(unsigned long nr_pages)
 }
 
 void scrub_one_page(struct page_info *);
+
+int xenmem_add_to_physmap_one(struct domain *d, unsigned int space,
+                              domid_t foreign_domid,
+                              unsigned long idx, xen_pfn_t gpfn);
 
 /* Returns 1 on success, 0 on error, negative if the ring
  * for event propagation is full in the presence of paging */

@@ -43,8 +43,25 @@ static void __init do_xsm_initcalls(void)
     }
 }
 
-int __init xsm_init(unsigned long *module_map, const multiboot_info_t *mbi,
-                    void *(*bootstrap_map)(const module_t *))
+static int __init xsm_core_init(void)
+{
+    if ( verify(&dummy_xsm_ops) )
+    {
+        printk("%s could not verify "
+               "dummy_xsm_ops structure.\n", __FUNCTION__);
+        return -EIO;
+    }
+
+    xsm_ops = &dummy_xsm_ops;
+    do_xsm_initcalls();
+
+    return 0;
+}
+
+#ifdef CONFIG_MULTIBOOT
+int __init xsm_multiboot_init(unsigned long *module_map,
+                              const multiboot_info_t *mbi,
+                              void *(*bootstrap_map)(const module_t *))
 {
     int ret = 0;
 
@@ -52,7 +69,7 @@ int __init xsm_init(unsigned long *module_map, const multiboot_info_t *mbi,
 
     if ( XSM_MAGIC )
     {
-        ret = xsm_policy_init(module_map, mbi, bootstrap_map);
+        ret = xsm_multiboot_policy_init(module_map, mbi, bootstrap_map);
         if ( ret )
         {
             bootstrap_map(NULL);
@@ -61,20 +78,38 @@ int __init xsm_init(unsigned long *module_map, const multiboot_info_t *mbi,
         }
     }
 
-    if ( verify(&dummy_xsm_ops) )
-    {
-        bootstrap_map(NULL);
-        printk("%s could not verify "
-               "dummy_xsm_ops structure.\n", __FUNCTION__);
-        return -EIO;
-    }
-
-    xsm_ops = &dummy_xsm_ops;
-    do_xsm_initcalls();
+    ret = xsm_core_init();
     bootstrap_map(NULL);
 
     return 0;
 }
+#endif
+
+#ifdef HAS_DEVICE_TREE
+int __init xsm_dt_init(void)
+{
+    int ret = 0;
+
+    printk("XSM Framework v" XSM_FRAMEWORK_VERSION " initialized\n");
+
+    if ( XSM_MAGIC )
+    {
+        ret = xsm_dt_policy_init();
+        if ( ret )
+        {
+            printk("%s: Error initializing policy (rc = %d).\n",
+                   __FUNCTION__, ret);
+            return -EINVAL;
+        }
+    }
+
+    ret = xsm_core_init();
+
+    xfree(policy_buffer);
+
+    return ret;
+}
+#endif
 
 int register_xsm(struct xsm_operations *ops)
 {
@@ -113,7 +148,12 @@ int unregister_xsm(struct xsm_operations *ops)
 
 long do_xsm_op (XEN_GUEST_HANDLE_PARAM(xsm_op_t) op)
 {
-    return __do_xsm_op(op);
+    return xsm_do_xsm_op(op);
 }
 
-
+#ifdef CONFIG_COMPAT
+int compat_xsm_op (XEN_GUEST_HANDLE_PARAM(xsm_op_t) op)
+{
+    return xsm_do_compat_op(op);
+}
+#endif

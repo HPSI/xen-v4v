@@ -3,9 +3,10 @@
 
 #include <xen/config.h>
 #include <xen/cache.h>
+#include <xen/types.h>
 
 typedef struct {
-	unsigned long __softirq_pending;
+	unsigned int __softirq_pending;
 	unsigned int __local_irq_count;
 	unsigned int __nmi_count;
 	bool_t __mwait_wakeup;

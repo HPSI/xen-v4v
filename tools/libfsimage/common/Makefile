@@ -31,8 +31,8 @@ install: all
 	$(INSTALL_DATA) fsimage_plugin.h $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL_DATA) fsimage_grub.h $(DESTDIR)$(INCLUDEDIR)
 
-clean distclean:
-	rm -f $(PIC_OBJS) $(LIB) $(DEPS)
+clean distclean::
+	rm -f $(LIB)
 
 libfsimage.so: libfsimage.so.$(MAJOR)
 	ln -sf $< $@
@@ -40,7 +40,7 @@ libfsimage.so.$(MAJOR): libfsimage.so.$(MAJOR).$(MINOR)
 	ln -sf $< $@
 
 libfsimage.so.$(MAJOR).$(MINOR): $(PIC_OBJS)
-	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libfsimage.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(PTHREAD_LIBS)
+	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libfsimage.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(PTHREAD_LIBS) $(APPEND_LDFLAGS)
 
 -include $(DEPS)
 

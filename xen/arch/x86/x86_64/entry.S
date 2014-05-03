@@ -11,6 +11,7 @@
 #include <asm/apicdef.h>
 #include <asm/page.h>
 #include <public/xen.h>
+#include <irq_vectors.h>
 
         ALIGN
 /* %rbx: struct vcpu */
@@ -47,12 +48,10 @@ restore_all_guest:
         cmpl  $1,%ecx
         ja    .Lforce_iret
 
-        addq  $8,%rsp
-        popq  %rcx                    # RIP
-        popq  %r11                    # CS
-        cmpw  $FLAT_USER_CS32,%r11
-        popq  %r11                    # RFLAGS
-        popq  %rsp                    # RSP
+        cmpw  $FLAT_USER_CS32,16(%rsp)# CS
+        movq  8(%rsp),%rcx            # RIP
+        movq  24(%rsp),%r11           # RFLAGS
+        movq  32(%rsp),%rsp           # RSP
         je    1f
         sysretq
 1:      sysretl
@@ -101,8 +100,7 @@ failsafe_callback:
         ALIGN
 /* No special register assumptions. */
 restore_all_xen:
-        RESTORE_ALL
-        addq  $8,%rsp
+        RESTORE_ALL adj=8
         iretq
 
 /*
@@ -126,9 +124,8 @@ ENTRY(syscall_enter)
         movl  $FLAT_KERNEL_SS,24(%rsp)
         pushq %rcx
         pushq $0
-        movl  $TRAP_syscall,4(%rsp)
-        movq  24(%rsp),%r11 /* Re-load user RFLAGS into %r11 before SAVE_ALL */
-        SAVE_ALL
+        movq  24(%rsp),%r11 /* Re-load user RFLAGS into %r11 before saving */
+        SAVE_VOLATILE TRAP_syscall
         GET_CURRENT(%rbx)
         movq  VCPU_domain(%rbx),%rcx
         testb $1,DOMAIN_is_32bit_pv(%rcx)
@@ -194,11 +191,12 @@ skip_clobber:
 
 /* %rbx: struct vcpu */
 test_all_events:
+        ASSERT_NOT_IN_ATOMIC
         cli                             # tests must not race interrupts
 /*test_softirqs:*/  
         movl  VCPU_processor(%rbx),%eax
-        shl   $IRQSTAT_shift,%rax
-        leaq  irq_stat(%rip),%rcx
+        shll  $IRQSTAT_shift,%eax
+        leaq  irq_stat+IRQSTAT_softirq_pending(%rip),%rcx
         cmpl  $0,(%rcx,%rax,1)
         jne   process_softirqs
         testb $1,VCPU_mce_pending(%rbx)
@@ -225,6 +223,7 @@ test_guest_events:
 /* %rbx: struct vcpu */
 process_softirqs:
         sti       
+        SAVE_PRESERVED
         call do_softirq
         jmp  test_all_events
 
@@ -273,22 +272,28 @@ ENTRY(sysenter_entry)
         pushq $FLAT_USER_SS
         pushq $0
         pushfq
-        .globl sysenter_eflags_saved
-sysenter_eflags_saved:
+GLOBAL(sysenter_eflags_saved)
         pushq $3 /* ring 3 null cs */
         pushq $0 /* null rip */
         pushq $0
-        movl  $TRAP_syscall,4(%rsp)
-        SAVE_ALL
+        SAVE_VOLATILE TRAP_syscall
         GET_CURRENT(%rbx)
         cmpb  $0,VCPU_sysenter_disables_events(%rbx)
         movq  VCPU_sysenter_addr(%rbx),%rax
         setne %cl
+        testl $X86_EFLAGS_NT,UREGS_eflags(%rsp)
         leaq  VCPU_trap_bounce(%rbx),%rdx
+UNLIKELY_START(nz, sysenter_nt_set)
+        pushfq
+        andl  $~X86_EFLAGS_NT,(%rsp)
+        popfq
+        xorl  %eax,%eax
+UNLIKELY_END(sysenter_nt_set)
         testq %rax,%rax
         leal  (,%rcx,TBF_INTERRUPT),%ecx
 UNLIKELY_START(z, sysenter_gpf)
         movq  VCPU_trap_ctxt(%rbx),%rsi
+        SAVE_PRESERVED
         movl  $TRAP_gp_fault,UREGS_entry_vector(%rsp)
         movl  %eax,TRAPBOUNCE_error_code(%rdx)
         movq  TRAP_gp_fault * TRAPINFO_sizeof + TRAPINFO_eip(%rsi),%rax
@@ -305,14 +310,13 @@ UNLIKELY_END(sysenter_gpf)
 
 ENTRY(int80_direct_trap)
         pushq $0
-        SAVE_ALL
+        SAVE_VOLATILE 0x80
 
         cmpb  $0,untrusted_msi(%rip)
 UNLIKELY_START(ne, msi_check)
         movl  $0x80,%edi
         call  check_for_unexpected_msi
-        RESTORE_ALL
-        SAVE_ALL
+        LOAD_C_CLOBBERED
 UNLIKELY_END(msi_check)
 
         GET_CURRENT(%rbx)
@@ -335,6 +339,7 @@ int80_slow_path:
          * IDT entry with DPL==0.
          */
         movl  $((0x80 << 3) | 0x2),UREGS_error_code(%rsp)
+        SAVE_PRESERVED
         movl  $TRAP_gp_fault,UREGS_entry_vector(%rsp)
         /* A GPF wouldn't have incremented the instruction pointer. */
         subq  $2,UREGS_rip(%rsp)
@@ -365,7 +370,10 @@ create_bounce_frame:
         sbb   %ecx,%ecx                 # In +ve address space? Then okay.
         cmpq  %rax,%rsi
         adc   %ecx,%ecx                 # Above Xen private area? Then okay.
-        jg    domain_crash_synchronous
+UNLIKELY_START(g, create_bounce_frame_bad_sp)
+        lea   UNLIKELY_DISPATCH_LABEL(create_bounce_frame_bad_sp)(%rip), %rdi
+        jmp   asm_domain_crash_synchronous  /* Does not return */
+__UNLIKELY_END(create_bounce_frame_bad_sp)
         movb  TRAPBOUNCE_flags(%rdx),%cl
         subq  $40,%rsi
         movq  UREGS_ss+8(%rsp),%rax
@@ -416,7 +424,7 @@ UNLIKELY_END(bounce_failsafe)
         /* Rewrite our stack frame and return to guest-OS mode. */
         /* IA32 Ref. Vol. 3: TF, VM, RF and NT flags are cleared on trap. */
         /* Also clear AC: alignment checks shouldn't trigger in kernel mode. */
-        movl  $TRAP_syscall,UREGS_entry_vector+8(%rsp)
+        orl   $TRAP_syscall,UREGS_entry_vector+8(%rsp)
         andl  $~(X86_EFLAGS_AC|X86_EFLAGS_VM|X86_EFLAGS_RF|\
                  X86_EFLAGS_NT|X86_EFLAGS_TF),UREGS_eflags+8(%rsp)
         movq  $FLAT_KERNEL_SS,UREGS_ss+8(%rsp)
@@ -424,26 +432,26 @@ UNLIKELY_END(bounce_failsafe)
         movq  $FLAT_KERNEL_CS,UREGS_cs+8(%rsp)
         movq  TRAPBOUNCE_eip(%rdx),%rax
         testq %rax,%rax
-        jz    domain_crash_synchronous
+UNLIKELY_START(z, create_bounce_frame_bad_bounce_ip)
+        lea   UNLIKELY_DISPATCH_LABEL(create_bounce_frame_bad_bounce_ip)(%rip), %rdi
+        jmp   asm_domain_crash_synchronous  /* Does not return */
+__UNLIKELY_END(create_bounce_frame_bad_bounce_ip)
         movq  %rax,UREGS_rip+8(%rsp)
         ret
-        _ASM_EXTABLE(.Lft2,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft3,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft4,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft5,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft6,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft7,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft8,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft9,  domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft10, domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft11, domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft12, domain_crash_synchronous)
-        _ASM_EXTABLE(.Lft13, domain_crash_synchronous)
+        _ASM_EXTABLE(.Lft2,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft3,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft4,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft5,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft6,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft7,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft8,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft9,  dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft10, dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft11, dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft12, dom_crash_sync_extable)
+        _ASM_EXTABLE(.Lft13, dom_crash_sync_extable)
 
-domain_crash_synchronous_string:
-        .asciz "domain_crash_sync called from entry.S\n"
-
-ENTRY(domain_crash_synchronous)
+ENTRY(dom_crash_sync_extable)
         # Get out of the guest-save area of the stack.
         GET_STACK_BASE(%rax)
         leaq  STACK_CPUINFO_FIELD(guest_cpu_user_regs)(%rax),%rsp
@@ -454,11 +462,8 @@ ENTRY(domain_crash_synchronous)
         setz  %al
         leal  (%rax,%rax,2),%eax
         orb   %al,UREGS_cs(%rsp)
-        # printk(domain_crash_synchronous_string)
-        leaq  domain_crash_synchronous_string(%rip),%rdi
-        xorl  %eax,%eax
-        call  printk
-        jmp  __domain_crash_synchronous
+        xorl  %edi,%edi
+        jmp   asm_domain_crash_synchronous /* Does not return */
 
 /* No special register assumptions. */
 ENTRY(ret_from_intr)
@@ -473,15 +478,14 @@ ENTRY(ret_from_intr)
 ENTRY(page_fault)
         movl  $TRAP_page_fault,4(%rsp)
 /* No special register assumptions. */
-	.globl handle_exception
-handle_exception:
+GLOBAL(handle_exception)
         SAVE_ALL
 handle_exception_saved:
         testb $X86_EFLAGS_IF>>8,UREGS_eflags+1(%rsp)
         jz    exception_with_ints_disabled
         sti
 1:      movq  %rsp,%rdi
-        movl  UREGS_entry_vector(%rsp),%eax
+        movzbl UREGS_entry_vector(%rsp),%eax
         leaq  exception_table(%rip),%rdx
         GET_CURRENT(%rbx)
         PERFC_INCR(exceptions, %rax, %rbx)
@@ -522,7 +526,7 @@ exception_with_ints_disabled:
 
 /* No special register assumptions. */
 FATAL_exception_with_ints_disabled:
-        movl  UREGS_entry_vector(%rsp),%edi
+        movzbl UREGS_entry_vector(%rsp),%edi
         movq  %rsp,%rsi
         call  fatal_trap
         ud2
@@ -617,6 +621,9 @@ ENTRY(early_page_fault)
         jmp   restore_all_xen
         .popsection
 
+ENTRY(nmi)
+        pushq $0
+        movl  $TRAP_nmi,4(%rsp)
 handle_ist_exception:
         SAVE_ALL
         testb $3,UREGS_cs(%rsp)
@@ -628,20 +635,63 @@ handle_ist_exception:
         movq  %rdi,%rsp
         rep   movsq
 1:      movq  %rsp,%rdi
-        movl  UREGS_entry_vector(%rsp),%eax
+        movzbl UREGS_entry_vector(%rsp),%eax
         leaq  exception_table(%rip),%rdx
         callq *(%rdx,%rax,8)
-        jmp   ret_from_intr
+        cmpb  $TRAP_nmi,UREGS_entry_vector(%rsp)
+        jne   ret_from_intr
 
-ENTRY(nmi)
+        /* We want to get straight to the IRET on the NMI exit path. */
+        testb $3,UREGS_cs(%rsp)
+        jz    restore_all_xen
+        GET_CURRENT(%rbx)
+        /* Send an IPI to ourselves to cover for the lack of event checking. */
+        movl  VCPU_processor(%rbx),%eax
+        shll  $IRQSTAT_shift,%eax
+        leaq  irq_stat+IRQSTAT_softirq_pending(%rip),%rcx
+        cmpl  $0,(%rcx,%rax,1)
+        je    1f
+        movl  $EVENT_CHECK_VECTOR,%edi
+        call  send_IPI_self
+1:      movq  VCPU_domain(%rbx),%rax
+        cmpb  $0,DOMAIN_is_32bit_pv(%rax)
+        je    restore_all_guest
+        jmp   compat_restore_all_guest
+
+ENTRY(nmi_crash)
         pushq $0
-        movl  $TRAP_nmi,4(%rsp)
-        jmp   handle_ist_exception
+        movl $TRAP_nmi,4(%rsp)
+        SAVE_ALL
+        movq %rsp,%rdi
+        callq do_nmi_crash /* Does not return */
+        ud2
 
 ENTRY(machine_check)
         pushq $0
         movl  $TRAP_machine_check,4(%rsp)
         jmp   handle_ist_exception
+
+/* Enable NMIs.  No special register assumptions. Only %rax is not preserved. */
+ENTRY(enable_nmis)
+        movq  %rsp, %rax /* Grab RSP before pushing */
+
+        /* Set up stack frame */
+        pushq $0               /* SS */
+        pushq %rax             /* RSP */
+        pushfq                 /* RFLAGS */
+        pushq $__HYPERVISOR_CS /* CS */
+        leaq  1f(%rip),%rax
+        pushq %rax             /* RIP */
+
+        iretq /* Disable the hardware NMI latch */
+1:
+        retq
+
+/* No op trap handler.  Required for kexec crash path. */
+GLOBAL(trap_nop)
+        iretq
+
+
 
 .section .rodata, "a", @progbits
 

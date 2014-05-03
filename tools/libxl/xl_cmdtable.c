@@ -50,12 +50,16 @@ struct cmd_spec cmd_table[] = {
       "[options] [Domain]\n",
       "-l, --long              Output all VM details\n"
       "-v, --verbose           Prints out UUIDs and security context\n"
-      "-Z, --context           Prints out security context"
+      "-Z, --context           Prints out security context\n"
+      "-n, --numa              Prints out NUMA node affinity"
     },
     { "destroy",
       &main_destroy, 0, 1,
       "Terminate a domain immediately",
-      "<Domain>",
+      "[options] <Domain>\n",
+      "-f                      Permit destroying domain 0, which will only succeed\n"
+      "                        when run from disaggregated toolstack domain with a\n"
+      "                        hardware domain distinct from domain 0."
     },
     { "shutdown",
       &main_shutdown, 0, 1,
@@ -136,16 +140,18 @@ struct cmd_spec cmd_table[] = {
       "                         -autopass\n"
       "--vncviewer-autopass     (consistency alias for --autopass)"
     },
+#ifndef LIBXL_HAVE_NO_SUSPEND_RESUME
     { "save",
       &main_save, 0, 1,
       "Save a domain state to restore later",
       "[options] <Domain> <CheckpointFile> [<ConfigFile>]",
       "-h  Print this help.\n"
-      "-c  Leave domain running after creating the snapshot."
+      "-c  Leave domain running after creating the snapshot.\n"
+      "-p  Leave domain paused after creating the snapshot."
     },
     { "migrate",
       &main_migrate, 0, 1,
-      "Save a domain state to restore later",
+      "Migrate a domain to another host",
       "[options] <Domain> <host>",
       "-h              Print this help.\n"
       "-C <config>     Send <config> instead of config file from creation.\n"
@@ -153,12 +159,8 @@ struct cmd_spec cmd_table[] = {
       "                to sh. If empty, run <host> instead of ssh <host> xl\n"
       "                migrate-receive [-d -e]\n"
       "-e              Do not wait in the background (on <host>) for the death\n"
-      "                of the domain."
-    },
-    { "dump-core",
-      &main_dump_core, 0, 1,
-      "Core dump a domain",
-      "<Domain> <filename>"
+      "                of the domain.\n"
+      "--debug         Print huge (!) amount of debug during the migration process."
     },
     { "restore",
       &main_restore, 0, 1,
@@ -176,10 +178,16 @@ struct cmd_spec cmd_table[] = {
       "Restore a domain from a saved state",
       "- for internal use only",
     },
+#endif
+    { "dump-core",
+      &main_dump_core, 0, 1,
+      "Core dump a domain",
+      "<Domain> <filename>"
+    },
     { "cd-insert",
       &main_cd_insert, 1, 1,
       "Insert a cdrom into a guest's cd drive",
-      "<Domain> <VirtualDevice> <type:path>",
+      "<Domain> <VirtualDevice> <path>",
     },
     { "cd-eject",
       &main_cd_eject, 1, 1,
@@ -208,14 +216,15 @@ struct cmd_spec cmd_table[] = {
       "[Domain, ...]",
     },
     { "vcpu-pin",
-      &main_vcpupin, 0, 1,
+      &main_vcpupin, 1, 1,
       "Set which CPUs a VCPU can use",
       "<Domain> <VCPU|all> <CPUs|all>",
     },
     { "vcpu-set",
       &main_vcpuset, 0, 1,
       "Set the number of active VCPUs allowed for the domain",
-      "<Domain> <vCPUs>",
+      "[option] <Domain> <vCPUs>",
+      "-i, --ignore-host  Don't limit the vCPU based on the host CPU count",
     },
     { "vm-list",
       &main_vm_list, 0, 0,
@@ -341,10 +350,31 @@ struct cmd_spec cmd_table[] = {
       "Destroy a domain's virtual block device",
       "<Domain> <DevId>",
     },
+    { "vtpm-attach",
+      &main_vtpmattach, 1, 1,
+      "Create a new virtual TPM device",
+      "<Domain> [uuid=<uuid>] [backend=<BackDomain>]",
+    },
+    { "vtpm-list",
+      &main_vtpmlist, 0, 0,
+      "List virtual TPM devices for a domain",
+      "<Domain(s)>",
+    },
+    { "vtpm-detach",
+      &main_vtpmdetach, 0, 1,
+      "Destroy a domain's virtual TPM device",
+      "<Domain> <DevId|uuid>",
+    },
     { "uptime",
       &main_uptime, 0, 0,
       "Print uptime for all/some domains",
       "[-s] [Domain]",
+    },
+    { "claims",
+      &main_claims, 0, 0,
+      "List outstanding claim information about all domains",
+      "",
+      "",
     },
     { "tmem-list",
       &main_tmem_list, 0, 0,
@@ -449,6 +479,7 @@ struct cmd_spec cmd_table[] = {
       "Loads a new policy int the Flask Xen security module",
       "<policy file>",
     },
+#ifndef LIBXL_HAVE_NO_SUSPEND_RESUME
     { "remus",
       &main_remus, 0, 1,
       "Enable Remus HA for domain",
@@ -461,7 +492,13 @@ struct cmd_spec cmd_table[] = {
       "                        ssh <host> xl migrate-receive -r [-e]\n"
       "-e                      Do not wait in the background (on <host>) for the death\n"
       "                        of the domain."
-
+    },
+#endif
+    { "devd",
+      &main_devd, 0, 1,
+      "Daemon that listens for devices and launches backends",
+      "[options]",
+      "-F                      Run in the foreground",
     },
 };
 

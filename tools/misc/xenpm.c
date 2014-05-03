@@ -29,11 +29,10 @@
 #include <inttypes.h>
 #include <sys/time.h>
 
-#define ARRAY_SIZE(a) (sizeof (a) / sizeof ((a)[0]))
+#define MAX_PKG_RESIDENCIES 12
+#define MAX_CORE_RESIDENCIES 8
 
-#define CPUFREQ_TURBO_DISABLED      -1
-#define CPUFREQ_TURBO_UNSUPPORTED   0
-#define CPUFREQ_TURBO_ENABLED       1
+#define ARRAY_SIZE(a) (sizeof (a) / sizeof ((a)[0]))
 
 static xc_interface *xc_handle;
 static unsigned int max_cpu_nr;
@@ -106,7 +105,7 @@ static void parse_cpuid_and_int(int argc, char *argv[],
 
 static void print_cxstat(int cpuid, struct xc_cx_stat *cxstat)
 {
-    int i;
+    unsigned int i;
 
     printf("cpu id               : %d\n", cpuid);
     printf("total C-states       : %d\n", cxstat->nr);
@@ -119,17 +118,14 @@ static void print_cxstat(int cpuid, struct xc_cx_stat *cxstat)
         printf("                       residency  [%20"PRIu64" ms]\n",
                cxstat->residencies[i]/1000000UL);
     }
-    printf("pc2                  : [%20"PRIu64" ms]\n"
-           "pc3                  : [%20"PRIu64" ms]\n"
-           "pc6                  : [%20"PRIu64" ms]\n"
-           "pc7                  : [%20"PRIu64" ms]\n",
-            cxstat->pc2/1000000UL, cxstat->pc3/1000000UL,
-            cxstat->pc6/1000000UL, cxstat->pc7/1000000UL);
-    printf("cc3                  : [%20"PRIu64" ms]\n"
-           "cc6                  : [%20"PRIu64" ms]\n"
-           "cc7                  : [%20"PRIu64" ms]\n",
-            cxstat->cc3/1000000UL, cxstat->cc6/1000000UL,
-            cxstat->cc7/1000000UL);
+    for ( i = 0; i < MAX_PKG_RESIDENCIES && i < cxstat->nr_pc; ++i )
+        if ( cxstat->pc[i] )
+           printf("pc%d                  : [%20"PRIu64" ms]\n", i + 1,
+                  cxstat->pc[i] / 1000000UL);
+    for ( i = 0; i < MAX_CORE_RESIDENCIES && i < cxstat->nr_cc; ++i )
+        if ( cxstat->cc[i] )
+           printf("cc%d                  : [%20"PRIu64" ms]\n", i + 1,
+                  cxstat->cc[i] / 1000000UL);
     printf("\n");
 }
 
@@ -149,15 +145,23 @@ static int get_cxstat_by_cpuid(xc_interface *xc_handle, int cpuid, struct xc_cx_
     if ( !max_cx_num )
         return -ENODEV;
 
-    cxstat->triggers = malloc(max_cx_num * sizeof(uint64_t));
-    if ( !cxstat->triggers )
-        return -ENOMEM;
-    cxstat->residencies = malloc(max_cx_num * sizeof(uint64_t));
-    if ( !cxstat->residencies )
+    cxstat->triggers = calloc(max_cx_num, sizeof(*cxstat->triggers));
+    cxstat->residencies = calloc(max_cx_num, sizeof(*cxstat->residencies));
+    cxstat->pc = calloc(MAX_PKG_RESIDENCIES, sizeof(*cxstat->pc));
+    cxstat->cc = calloc(MAX_CORE_RESIDENCIES, sizeof(*cxstat->cc));
+    if ( !cxstat->triggers || !cxstat->residencies ||
+         !cxstat->pc || !cxstat->cc )
     {
+        free(cxstat->cc);
+        free(cxstat->pc);
+        free(cxstat->residencies);
         free(cxstat->triggers);
         return -ENOMEM;
     }
+
+    cxstat->nr = max_cx_num;
+    cxstat->nr_pc = MAX_PKG_RESIDENCIES;
+    cxstat->nr_cc = MAX_CORE_RESIDENCIES;
 
     ret = xc_pm_get_cxstat(xc_handle, cpuid, cxstat);
     if( ret )
@@ -165,8 +169,12 @@ static int get_cxstat_by_cpuid(xc_interface *xc_handle, int cpuid, struct xc_cx_
         ret = -errno;
         free(cxstat->triggers);
         free(cxstat->residencies);
+        free(cxstat->pc);
+        free(cxstat->cc);
         cxstat->triggers = NULL;
         cxstat->residencies = NULL;
+        cxstat->pc = NULL;
+        cxstat->cc = NULL;
     }
 
     return ret;
@@ -202,6 +210,8 @@ static int show_cxstat_by_cpuid(xc_interface *xc_handle, int cpuid)
 
     free(cxstatinfo.triggers);
     free(cxstatinfo.residencies);
+    free(cxstatinfo.pc);
+    free(cxstatinfo.cc);
     return 0;
 }
 
@@ -486,25 +496,26 @@ static void signal_int_handler(int signo)
             /* print out CC? and PC? */
             for ( i = 0; i < socket_nr; i++ )
             {
+                unsigned int n;
                 uint64_t res;
+
                 for ( j = 0; j <= info.max_cpu_index; j++ )
                 {
                     if ( cpu_to_socket[j] == socket_ids[i] )
                         break;
                 }
                 printf("\nSocket %d\n", socket_ids[i]);
-                res = cxstat_end[j].pc2 - cxstat_start[j].pc2;
-                printf("\tPC2\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL,
-                       100UL * res / (double)sum_cx[j]);
-                res = cxstat_end[j].pc3 - cxstat_start[j].pc3;
-                printf("\tPC3\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL, 
-                       100UL * res / (double)sum_cx[j]);
-                res = cxstat_end[j].pc6 - cxstat_start[j].pc6;
-                printf("\tPC6\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL, 
-                       100UL * res / (double)sum_cx[j]);
-                res = cxstat_end[j].pc7 - cxstat_start[j].pc7;
-                printf("\tPC7\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL, 
-                       100UL * res / (double)sum_cx[j]);
+                for ( n = 0; n < MAX_PKG_RESIDENCIES; ++n )
+                {
+                    if ( n >= cxstat_end[j].nr_pc )
+                        continue;
+                    res = cxstat_end[j].pc[n];
+                    if ( n < cxstat_start[j].nr_pc )
+                        res -= cxstat_start[j].pc[n];
+                    printf("\tPC%u\t%"PRIu64" ms\t%.2f%%\n",
+                           n + 1, res / 1000000UL,
+                           100UL * res / (double)sum_cx[j]);
+                }
                 for ( k = 0; k < core_nr; k++ )
                 {
                     for ( j = 0; j <= info.max_cpu_index; j++ )
@@ -514,15 +525,17 @@ static void signal_int_handler(int signo)
                             break;
                     }
                     printf("\t Core %d CPU %d\n", core_ids[k], j);
-                    res = cxstat_end[j].cc3 - cxstat_start[j].cc3;
-                    printf("\t\tCC3\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL, 
-                           100UL * res / (double)sum_cx[j]);
-                    res = cxstat_end[j].cc6 - cxstat_start[j].cc6;
-                    printf("\t\tCC6\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL, 
-                           100UL * res / (double)sum_cx[j]);
-                    res = cxstat_end[j].cc7 - cxstat_start[j].cc7;
-                    printf("\t\tCC7\t%"PRIu64" ms\t%.2f%%\n",  res / 1000000UL,
-                           100UL * res / (double)sum_cx[j]);
+                    for ( n = 0; n < MAX_CORE_RESIDENCIES; ++n )
+                    {
+                        if ( n >= cxstat_end[j].nr_cc )
+                            continue;
+                        res = cxstat_end[j].cc[n];
+                        if ( n < cxstat_start[j].nr_cc )
+                            res -= cxstat_start[j].cc[n];
+                        printf("\t\tCC%u\t%"PRIu64" ms\t%.2f%%\n",
+                               n + 1, res / 1000000UL,
+                               100UL * res / (double)sum_cx[j]);
+                    }
                 }
             }
         }
@@ -533,6 +546,8 @@ static void signal_int_handler(int signo)
     {
         free(cxstat[i].triggers);
         free(cxstat[i].residencies);
+        free(cxstat[i].pc);
+        free(cxstat[i].cc);
         free(pxstat[i].trans_pt);
         free(pxstat[i].pt);
     }
@@ -699,13 +714,9 @@ static void print_cpufreq_para(int cpuid, struct xc_get_cpufreq_para *p_cpufreq)
            p_cpufreq->scaling_max_freq,
            p_cpufreq->scaling_min_freq,
            p_cpufreq->scaling_cur_freq);
-    if (p_cpufreq->turbo_enabled != CPUFREQ_TURBO_UNSUPPORTED) {
-           printf("turbo mode           : ");
-           if (p_cpufreq->turbo_enabled == CPUFREQ_TURBO_ENABLED)
-               printf("enabled\n");
-           else
-               printf("disabled\n");
-    }
+
+    printf("turbo mode           : %s\n",
+           p_cpufreq->turbo_enabled ? "enabled" : "disabled or n/a");
     printf("\n");
 }
 

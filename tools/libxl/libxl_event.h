@@ -64,7 +64,11 @@ void libxl_event_free(libxl_ctx *ctx, libxl_event *event);
 
 typedef struct libxl_event_hooks {
     uint64_t event_occurs_mask;
-    void (*event_occurs)(void *user, const libxl_event *event);
+    void (*event_occurs)(void *user,
+#ifndef LIBXL_HAVE_NONCONST_EVENT_OCCURS_EVENT_ARG
+                         const
+#endif
+                         libxl_event *event);
     void (*disaster)(void *user, libxl_event_type type,
                      const char *msg, int errnoval);
 } libxl_event_hooks;
@@ -287,8 +291,10 @@ typedef struct libxl_osevent_hooks {
   int (*timeout_register)(void *user, void **for_app_registration_out,
                           struct timeval abs, void *for_libxl);
   int (*timeout_modify)(void *user, void **for_app_registration_update,
-                         struct timeval abs);
-  void (*timeout_deregister)(void *user, void *for_app_registration);
+                         struct timeval abs)
+      /* only ever called with abs={0,0}, meaning ASAP */;
+  void (*timeout_deregister)(void *user, void *for_app_registration)
+      /* will never be called */;
 } libxl_osevent_hooks;
 
 /* The application which calls register_fd_hooks promises to
@@ -336,6 +342,17 @@ typedef struct libxl_osevent_hooks {
  * (or *for_app_registration_update) by a successful call to
  * register (or modify), and pass it to subsequent calls to modify
  * or deregister.
+ *
+ * Note that the application must cope with a call from libxl to
+ * timeout_modify racing with its own call to
+ * libxl__osevent_occurred_timeout.  libxl guarantees that
+ * timeout_modify will only be called with abs={0,0} but the
+ * application must still ensure that libxl's attempt to cause the
+ * timeout to occur immediately is safely ignored even the timeout is
+ * actually already in the process of occurring.
+ *
+ * timeout_deregister is not used because it forms part of a
+ * deprecated unsafe mode of use of the API.
  *
  * osevent_register_hooks may be called only once for each libxl_ctx.
  * libxl may make calls to register/modify/deregister from within
@@ -425,39 +442,68 @@ void libxl_osevent_occurred_timeout(libxl_ctx *ctx, void *for_libxl)
  * For programs which run their own children alongside libxl's:
  *
  *     A program which does this must call libxl_childproc_setmode.
- *     There are two options:
+ *     There are three options:
  * 
+ *     libxl_sigchld_owner_libxl:
+ *
+ *       While any libxl operation which might use child processes
+ *       is running, works like libxl_sigchld_owner_libxl_always;
+ *       but, deinstalls the handler the rest of the time.
+ *
+ *       In this mode, the application, while it uses any libxl
+ *       operation which might create or use child processes (see
+ *       above):
+ *           - Must not have any child processes running.
+ *           - Must not install a SIGCHLD handler.
+ *           - Must not reap any children.
+ *
+ *       This is the default (i.e. if setmode is not called, or 0 is
+ *       passed for hooks).
+ *
  *     libxl_sigchld_owner_mainloop:
+ *
  *       The application must install a SIGCHLD handler and reap (at
- *       least) all of libxl's children and pass their exit status
- *       to libxl by calling libxl_childproc_exited.
+ *       least) all of libxl's children and pass their exit status to
+ *       libxl by calling libxl_childproc_exited.  (If the application
+ *       has multiple libxl ctx's, it must call libxl_childproc_exited
+ *       on each ctx.)
  *
  *     libxl_sigchld_owner_libxl_always:
- *       The application expects libxl to reap all of its children,
- *       and provides a callback to be notified of their exit
- *       statues.
  *
- * An application which fails to call setmode, or which passes 0 for
- * hooks, while it uses any libxl operation which might
- * create or use child processes (see above):
- *   - Must not have any child processes running.
- *   - Must not install a SIGCHLD handler.
- *   - Must not reap any children.
+ *       The application expects this libxl ctx to reap all of the
+ *       process's children, and provides a callback to be notified of
+ *       their exit statuses.  The application must have only one
+ *       libxl_ctx configured this way.
+ *
+ *     libxl_sigchld_owner_libxl_always_selective_reap:
+ *
+ *       The application expects to reap all of its own children
+ *       synchronously, and does not use SIGCHLD.  libxl is to install
+ *       a SIGCHLD handler.  The application may have multiple
+ *       libxl_ctxs configured this way; in which case all of its ctxs
+ *       must be so configured.
  */
 
 
 typedef enum {
-    /* libxl owns SIGCHLD whenever it has a child. */
+    /* libxl owns SIGCHLD whenever it has a child, and reaps
+     * all children, including those not spawned by libxl. */
     libxl_sigchld_owner_libxl,
 
-    /* Application promises to call libxl_childproc_exited but NOT
-     * from within a signal handler.  libxl will not itself arrange to
-     * (un)block or catch SIGCHLD. */
+    /* Application promises to discover when SIGCHLD occurs and call
+     * libxl_childproc_exited or libxl_childproc_sigchld_occurred (but
+     * NOT from within a signal handler).  libxl will not itself
+     * arrange to (un)block or catch SIGCHLD. */
     libxl_sigchld_owner_mainloop,
 
     /* libxl owns SIGCHLD all the time, and the application is
-     * relying on libxl's event loop for reaping its own children. */
+     * relying on libxl's event loop for reaping its children too. */
     libxl_sigchld_owner_libxl_always,
+
+    /* libxl owns SIGCHLD all the time, but it must only reap its own
+     * children.  The application will reap its own children
+     * synchronously with waitpid, without the assistance of SIGCHLD. */
+    libxl_sigchld_owner_libxl_always_selective_reap,
 } libxl_sigchld_owner;
 
 typedef struct {
@@ -510,7 +556,8 @@ void libxl_childproc_setmode(libxl_ctx *ctx, const libxl_childproc_hooks *hooks,
 
 /*
  * This function is for an application which owns SIGCHLD and which
- * therefore reaps all of the process's children.
+ * reaps all of the process's children, and dispatches the exit status
+ * to the correct place inside the application.
  *
  * May be called only by an application which has called setmode with
  * chldowner == libxl_sigchld_owner_mainloop.  If pid was a process started
@@ -526,6 +573,25 @@ void libxl_childproc_setmode(libxl_ctx *ctx, const libxl_childproc_hooks *hooks,
 int libxl_childproc_reaped(libxl_ctx *ctx, pid_t, int status)
                            LIBXL_EXTERNAL_CALLERS_ONLY;
 
+/*
+ * This function is for an application which owns SIGCHLD but which
+ * doesn't keep track of all of its own children in a manner suitable
+ * for reaping all of them and then dispatching them.
+ *
+ * Such an the application must notify libxl, by calling this
+ * function, that a SIGCHLD occurred.  libxl will then check all its
+ * children, reap any that are ready, and take any action necessary -
+ * but it will not reap anything else.
+ *
+ * May be called only by an application which has called setmode with
+ * chldowner == libxl_sigchld_owner_mainloop.
+ *
+ * May NOT be called from within a signal handler which might
+ * interrupt any libxl operation (just like libxl_childproc_reaped).
+ */
+void libxl_childproc_sigchld_occurred(libxl_ctx *ctx)
+                           LIBXL_EXTERNAL_CALLERS_ONLY;
+
 
 /*
  * An application which initialises a libxl_ctx in a parent process
@@ -535,6 +601,22 @@ int libxl_childproc_reaped(libxl_ctx *ctx, pid_t, int status)
  * this all previously existing libxl_ctx's are invalidated and
  * must not be used - or even freed.  It is harmless to call this
  * postfork function and then exec anyway.
+ *
+ * Until libxl_postfork_child_noexec has returned:
+ *  - No other libxl calls may be made.
+ *  - If any libxl ctx was configured handle the process's SIGCHLD,
+ *    the child may not create further (grand)child processes, nor
+ *    manipulate SIGCHLD.
+ *
+ * libxl_postfork_child_noexec may not reclaim all the resources
+ * associated with the libxl ctx.  This includes but is not limited
+ * to: ordinary memory; files on disk and in /var/run; file
+ * descriptors; memory mapped into the process from domains being
+ * managed (grant maps); Xen event channels.  Use of libxl in
+ * processes which fork long-lived children is not recommended for
+ * this reason.  libxl_postfork_child_noexec is provided so that
+ * an application can make further libxl calls in a child which
+ * is going to exec or exit soon.
  */
 void libxl_postfork_child_noexec(libxl_ctx *ctx);
 

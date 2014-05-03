@@ -32,6 +32,7 @@ struct vcpu;
 typedef s64 s_time_t;
 #define PRI_stime PRId64
 
+s_time_t get_s_time_fixed(u64 at_tick);
 s_time_t get_s_time(void);
 unsigned long get_localtime(struct domain *d);
 uint64_t get_localtime_us(struct domain *d);
@@ -48,6 +49,7 @@ struct tm {
     int     tm_isdst;       /* daylight saving time */
 };
 struct tm gmtime(unsigned long t);
+struct tm wallclock_time(uint64_t *ns);
 
 #define SYSTEM_TIME_HZ  1000000000ULL
 #define NOW()           ((s_time_t)get_s_time())
@@ -55,6 +57,8 @@ struct tm gmtime(unsigned long t);
 #define MILLISECS(_ms)  ((s_time_t)((_ms) * 1000000ULL))
 #define MICROSECS(_us)  ((s_time_t)((_us) * 1000ULL))
 #define STIME_MAX ((s_time_t)((uint64_t)~0ull>>1))
+/* Chosen so (NOW() + delta) wont overflow without an uptime of 200 years */
+#define STIME_DELTA_MAX ((s_time_t)((uint64_t)~0ull>>2))
 
 extern void update_vcpu_system_time(struct vcpu *v);
 extern void update_domain_wallclock_time(struct domain *d);
@@ -73,7 +77,7 @@ void domain_set_time_offset(struct domain *d, int32_t time_offset_seconds);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

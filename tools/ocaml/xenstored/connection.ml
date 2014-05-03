@@ -18,6 +18,8 @@ exception End_of_file
 
 open Stdext
 
+let xenstore_payload_max = 4096 (* xen/include/public/io/xs_wire.h *)
+
 type watch = {
 	con: t;
 	token: string;
@@ -37,6 +39,11 @@ and t = {
 	mutable stat_nb_ops: int;
 	mutable perm: Perms.Connection.t;
 }
+
+let mark_as_bad con =
+	match con.dom with
+	|None -> ()
+	| Some domain -> Domain.mark_as_bad domain
 
 let get_path con =
 Printf.sprintf "/local/domain/%i/" (match con.dom with None -> 0 | Some d -> Domain.get_id d)
@@ -107,8 +114,15 @@ let restrict con domid =
 let set_target con target_domid =
 	con.perm <- Perms.Connection.set_target (get_perm con) ~perms:[Perms.READ; Perms.WRITE] target_domid
 
+let is_backend_mmap con = match con.xb.Xenbus.Xb.backend with
+	| Xenbus.Xb.Xenmmap _ -> true
+	| _ -> false
+
 let send_reply con tid rid ty data =
-	Xenbus.Xb.queue con.xb (Xenbus.Xb.Packet.create tid rid ty data)
+	if (String.length data) > xenstore_payload_max && (is_backend_mmap con) then
+		Xenbus.Xb.queue con.xb (Xenbus.Xb.Packet.create tid rid Xenbus.Xb.Op.Error "E2BIG\000")
+	else
+		Xenbus.Xb.queue con.xb (Xenbus.Xb.Packet.create tid rid ty data)
 
 let send_error con tid rid err = send_reply con tid rid Xenbus.Xb.Op.Error (err ^ "\000")
 let send_ack con tid rid ty = send_reply con tid rid ty "OK\000"

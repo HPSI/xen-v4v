@@ -1,4 +1,12 @@
 #!/bin/sh -e
-cd tools
 autoconf
-autoheader
+( cd tools
+  autoconf
+  autoheader
+)
+( cd stubdom
+  autoconf
+)
+( cd docs
+  autoconf
+)

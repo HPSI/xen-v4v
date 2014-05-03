@@ -66,6 +66,16 @@ struct hvm_vcpu_io {
     /* We may write up to m256 as a number of device-model transactions. */
     unsigned int mmio_large_write_bytes;
     paddr_t mmio_large_write_pa;
+    /* For retries we shouldn't re-fetch the instruction. */
+    unsigned int mmio_insn_bytes;
+    unsigned char mmio_insn[16];
+    /*
+     * For string instruction emulation we need to be able to signal a
+     * necessary retry through other than function return codes.
+     */
+    bool_t mmio_retry, mmio_retrying;
+
+    unsigned long msix_unmask_address;
 };
 
 #define VMCX_EADDR    (~0ULL)
@@ -100,6 +110,9 @@ struct nestedvcpu {
      */
     bool_t nv_ioport80;
     bool_t nv_ioportED;
+
+    /* L2's control-resgister, just as the L2 sees them. */
+    unsigned long       guest_cr[5];
 };
 
 #define vcpu_nestedhvm(v) ((v)->arch.hvm_vcpu.nvcpu)
@@ -127,7 +140,7 @@ struct hvm_vcpu {
 
     int                 xen_port;
 
-    bool_t              flag_dr_dirty;
+    u8                  flag_dr_dirty;
     bool_t              debug_state_latch;
     bool_t              single_step;
 

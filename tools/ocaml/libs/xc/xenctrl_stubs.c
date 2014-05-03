@@ -461,8 +461,6 @@ CAMLprim value stub_xc_vcpu_getaffinity(value xch, value domid,
 
 	retval = xc_vcpu_getaffinity(_H(xch), _D(domid),
 	                             Int_val(vcpu), c_cpumap);
-	free(c_cpumap);
-
 	if (retval < 0) {
 		free(c_cpumap);
 		failwith_xc(_H(xch));
@@ -716,6 +714,7 @@ CAMLprim value stub_xc_domain_cpuid_set(value xch, value domid,
 {
 	CAMLparam4(xch, domid, input, config);
 	CAMLlocal2(array, tmp);
+#if defined(__i386__) || defined(__x86_64__)
 	int r;
 	unsigned int c_input[2];
 	char *c_config[4], *out_config[4];
@@ -744,17 +743,24 @@ CAMLprim value stub_xc_domain_cpuid_set(value xch, value domid,
 			 c_input, (const char **)c_config, out_config);
 	if (r < 0)
 		failwith_xc(_H(xch));
+#else
+	caml_failwith("xc_domain_cpuid_set: not implemented");
+#endif
 	CAMLreturn(array);
 }
 
 CAMLprim value stub_xc_domain_cpuid_apply_policy(value xch, value domid)
 {
 	CAMLparam2(xch, domid);
+#if defined(__i386__) || defined(__x86_64__)
 	int r;
 
 	r = xc_cpuid_apply_policy(_H(xch), _D(domid));
 	if (r < 0)
 		failwith_xc(_H(xch));
+#else
+	caml_failwith("xc_domain_cpuid_apply_policy: not implemented");
+#endif
 	CAMLreturn(Val_unit);
 }
 
@@ -762,6 +768,7 @@ CAMLprim value stub_xc_cpuid_check(value xch, value input, value config)
 {
 	CAMLparam3(xch, input, config);
 	CAMLlocal3(ret, array, tmp);
+#if defined(__i386__) || defined(__x86_64__)
 	int r;
 	unsigned int c_input[2];
 	char *c_config[4], *out_config[4];
@@ -794,6 +801,9 @@ CAMLprim value stub_xc_cpuid_check(value xch, value input, value config)
 	Store_field(ret, 0, Val_bool(r));
 	Store_field(ret, 1, array);
 
+#else
+	caml_failwith("xc_domain_cpuid_check: not implemented");
+#endif
 	CAMLreturn(ret);
 }
 
@@ -1083,29 +1093,28 @@ CAMLprim value stub_xc_domain_irq_permission(value xch, value domid,
 	CAMLreturn(Val_unit);
 }
 
-static uint32_t pci_dev_to_bdf(int domain, int bus, int slot, int func)
+static uint32_t encode_sbdf(int domain, int bus, int dev, int func)
 {
-	uint32_t bdf = 0;
-	bdf |= (bus & 0xff) << 16;
-	bdf |= (slot & 0x1f) << 11;
-	bdf |= (func & 0x7) << 8;
-	return bdf;
+	return  ((uint32_t)domain & 0xffff) << 16 |
+		((uint32_t)bus    &   0xff) << 8  |
+		((uint32_t)dev    &   0x1f) << 3  |
+		((uint32_t)func   &    0x7);
 }
 
 CAMLprim value stub_xc_domain_test_assign_device(value xch, value domid, value desc)
 {
 	CAMLparam3(xch, domid, desc);
 	int ret;
-	int domain, bus, slot, func;
-	uint32_t bdf;
+	int domain, bus, dev, func;
+	uint32_t sbdf;
 
 	domain = Int_val(Field(desc, 0));
 	bus = Int_val(Field(desc, 1));
-	slot = Int_val(Field(desc, 2));
+	dev = Int_val(Field(desc, 2));
 	func = Int_val(Field(desc, 3));
-	bdf = pci_dev_to_bdf(domain, bus, slot, func);
+	sbdf = encode_sbdf(domain, bus, dev, func);
 
-	ret = xc_test_assign_device(_H(xch), _D(domid), bdf);
+	ret = xc_test_assign_device(_H(xch), _D(domid), sbdf);
 
 	CAMLreturn(Val_bool(ret == 0));
 }
@@ -1114,16 +1123,16 @@ CAMLprim value stub_xc_domain_assign_device(value xch, value domid, value desc)
 {
 	CAMLparam3(xch, domid, desc);
 	int ret;
-	int domain, bus, slot, func;
-	uint32_t bdf;
+	int domain, bus, dev, func;
+	uint32_t sbdf;
 
 	domain = Int_val(Field(desc, 0));
 	bus = Int_val(Field(desc, 1));
-	slot = Int_val(Field(desc, 2));
+	dev = Int_val(Field(desc, 2));
 	func = Int_val(Field(desc, 3));
-	bdf = pci_dev_to_bdf(domain, bus, slot, func);
+	sbdf = encode_sbdf(domain, bus, dev, func);
 
-	ret = xc_assign_device(_H(xch), _D(domid), bdf);
+	ret = xc_assign_device(_H(xch), _D(domid), sbdf);
 
 	if (ret < 0)
 		failwith_xc(_H(xch));
@@ -1134,16 +1143,16 @@ CAMLprim value stub_xc_domain_deassign_device(value xch, value domid, value desc
 {
 	CAMLparam3(xch, domid, desc);
 	int ret;
-	int domain, bus, slot, func;
-	uint32_t bdf;
+	int domain, bus, dev, func;
+	uint32_t sbdf;
 
 	domain = Int_val(Field(desc, 0));
 	bus = Int_val(Field(desc, 1));
-	slot = Int_val(Field(desc, 2));
+	dev = Int_val(Field(desc, 2));
 	func = Int_val(Field(desc, 3));
-	bdf = pci_dev_to_bdf(domain, bus, slot, func);
+	sbdf = encode_sbdf(domain, bus, dev, func);
 
-	ret = xc_deassign_device(_H(xch), _D(domid), bdf);
+	ret = xc_deassign_device(_H(xch), _D(domid), sbdf);
 
 	if (ret < 0)
 		failwith_xc(_H(xch));

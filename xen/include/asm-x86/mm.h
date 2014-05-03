@@ -265,7 +265,6 @@ struct spage_info
     ((_p)->v.inuse._domain = (_d) ? virt_to_pdx(_d) : 0)
 
 #define maddr_get_owner(ma)   (page_get_owner(maddr_to_page((ma))))
-#define vaddr_get_owner(va)   (page_get_owner(virt_to_page((va))))
 
 #define XENSHARE_writable 0
 #define XENSHARE_readonly 1
@@ -301,7 +300,7 @@ static inline struct page_info *__virt_to_page(const void *v)
 
 static inline void *__page_to_virt(const struct page_info *pg)
 {
-    ASSERT((unsigned long)pg - FRAMETABLE_VIRT_START < FRAMETABLE_VIRT_END);
+    ASSERT((unsigned long)pg - FRAMETABLE_VIRT_START < FRAMETABLE_SIZE);
     /*
      * (sizeof(*pg) & -sizeof(*pg)) selects the LS bit of sizeof(*pg). The
      * division and re-multiplication avoids one shift when sizeof(*pg) is a
@@ -317,10 +316,13 @@ static inline void *__page_to_virt(const struct page_info *pg)
 int free_page_type(struct page_info *page, unsigned long type,
                    int preemptible);
 
+void init_guest_l4_table(l4_pgentry_t[], const struct domain *);
+
 int is_iomem_page(unsigned long mfn);
 
 void clear_superpage_mark(struct page_info *page);
 
+const unsigned long *get_platform_badpages(unsigned int *array_size);
 /* Per page locks:
  * page_lock() is used for two purposes: pte serialization, and memory sharing.
  *
@@ -352,6 +354,7 @@ void put_page_type(struct page_info *page);
 int  get_page_type(struct page_info *page, unsigned long type);
 int  put_page_type_preemptible(struct page_info *page);
 int  get_page_type_preemptible(struct page_info *page, unsigned long type);
+int  put_old_guest_table(struct vcpu *);
 int  get_page_from_l1e(
     l1_pgentry_t l1e, struct domain *l1e_owner, struct domain *pg_owner);
 void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner);
@@ -362,15 +365,10 @@ static inline void put_page_and_type(struct page_info *page)
     put_page(page);
 }
 
-static inline int put_page_and_type_preemptible(struct page_info *page,
-                                                int preemptible)
+static inline int put_page_and_type_preemptible(struct page_info *page)
 {
-    int rc = 0;
+    int rc = put_page_type_preemptible(page);
 
-    if ( preemptible )
-        rc = put_page_type_preemptible(page);
-    else
-        put_page_type(page);
     if ( likely(rc == 0) )
         put_page(page);
     return rc;
@@ -401,7 +399,7 @@ static inline int get_page_and_type(struct page_info *page,
 int check_descriptor(const struct domain *, struct desc_struct *d);
 
 extern bool_t opt_allow_superpage;
-extern bool_t mem_hotplug;
+extern paddr_t mem_hotplug;
 
 /******************************************************************************
  * With shadow pagetables, the different kinds of address start 
@@ -456,6 +454,11 @@ static inline _type _name##_x(_name##_t n) { return n; }
 
 TYPE_SAFE(unsigned long,mfn);
 
+#ifndef mfn_t
+#define mfn_t /* Grep fodder: mfn_t, _mfn() and mfn_x() are defined above */
+#undef mfn_t
+#endif
+
 /* Macro for printk formats: use as printk("%"PRI_mfn"\n", mfn_x(foo)); */
 #define PRI_mfn "05lx"
 
@@ -492,6 +495,8 @@ extern bool_t machine_to_phys_mapping_valid;
     if ( machine_to_phys_mapping_valid )        \
         _set_gpfn_from_mfn(mfn, pfn);           \
 } while (0)
+
+extern struct rangeset *mmio_ro_ranges;
 
 #define get_gpfn_from_mfn(mfn)      (machine_to_phys_mapping[(mfn)])
 
@@ -549,15 +554,16 @@ void audit_domains(void);
 int new_guest_cr3(unsigned long pfn);
 void make_cr3(struct vcpu *v, unsigned long mfn);
 void update_cr3(struct vcpu *v);
-void propagate_page_fault(unsigned long addr, u16 error_code);
+int vcpu_destroy_pagetables(struct vcpu *);
+struct trap_bounce *propagate_page_fault(unsigned long addr, u16 error_code);
 void *do_page_walk(struct vcpu *v, unsigned long addr);
 
 int __sync_local_execstate(void);
 
 /* Arch-specific portion of memory_op hypercall. */
-long arch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg);
-long subarch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg);
-int compat_arch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void));
+long arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg);
+long subarch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg);
+int compat_arch_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void));
 int compat_subarch_memory_op(int op, XEN_GUEST_HANDLE_PARAM(void));
 
 int steal_page(
@@ -566,6 +572,16 @@ int donate_page(
     struct domain *d, struct page_info *page, unsigned int memflags);
 
 int map_ldt_shadow_page(unsigned int);
+
+#define NIL(type) ((type *)-sizeof(type))
+#define IS_NIL(ptr) (!((uintptr_t)(ptr) + sizeof(*(ptr))))
+
+int create_perdomain_mapping(struct domain *, unsigned long va,
+                             unsigned int nr, l1_pgentry_t **,
+                             struct page_info **);
+void destroy_perdomain_mapping(struct domain *, unsigned long va,
+                               unsigned int nr);
+void free_perdomain_mappings(struct domain *);
 
 extern int memory_add(unsigned long spfn, unsigned long epfn, unsigned int pxm);
 

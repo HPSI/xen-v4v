@@ -3,7 +3,7 @@ include $(XEN_ROOT)/tools/Rules.mk
 
 ROOT = $(XEN_ROOT)/xen/include/public
 
-architectures := arm x86_32 x86_64
+architectures := arm32 arm64 x86_32 x86_64
 headers := $(patsubst %, %.h, $(architectures))
 
 .PHONY: all clean check-headers
@@ -22,7 +22,10 @@ check-headers: checker
 	diff -u reference.size tmp.size
 	rm tmp.size
 
-arm.h: mkheader.py structs.py $(ROOT)/arch-arm.h
+arm32.h: mkheader.py structs.py $(ROOT)/arch-arm.h $(ROOT)/xen.h
+	$(PYTHON) $< $* $@ $(filter %.h,$^)
+
+arm64.h: mkheader.py structs.py $(ROOT)/arch-arm.h $(ROOT)/xen.h
 	$(PYTHON) $< $* $@ $(filter %.h,$^)
 
 x86_32.h: mkheader.py structs.py $(ROOT)/arch-x86/xen-x86_32.h $(ROOT)/arch-x86/xen.h $(ROOT)/xen.h

@@ -172,6 +172,14 @@ HYPERVISOR_sched_op(
 	return _hypercall2(int, sched_op, cmd, arg);
 }
 
+static inline int
+HYPERVISOR_shutdown(
+	unsigned int reason)
+{
+	struct sched_shutdown shutdown = { .reason = reason };
+	return _hypercall2(int, sched_op, SCHEDOP_shutdown, &shutdown);
+}
+
 static inline long
 HYPERVISOR_set_timer_op(
 	uint64_t timeout)
@@ -247,9 +255,9 @@ HYPERVISOR_console_io(
 
 static inline int
 HYPERVISOR_physdev_op(
-	void *physdev_op)
+	int cmd, void *physdev_op)
 {
-	return _hypercall1(int, physdev_op, physdev_op);
+	return _hypercall2(int, physdev_op, cmd, physdev_op);
 }
 
 static inline int

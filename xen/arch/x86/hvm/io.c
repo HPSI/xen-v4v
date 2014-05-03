@@ -152,6 +152,9 @@ void send_invalidate_req(void)
     struct vcpu *v = current;
     ioreq_t *p = get_ioreq(v);
 
+    if ( !p )
+        return;
+
     if ( p->state != STATE_IOREQ_NONE )
     {
         gdprintk(XENLOG_ERR, "WARNING: send invalidate req with something "
@@ -221,12 +224,14 @@ int handle_mmio_with_translation(unsigned long gva, unsigned long gpfn)
     return handle_mmio();
 }
 
-int handle_pio(uint16_t port, int size, int dir)
+int handle_pio(uint16_t port, unsigned int size, int dir)
 {
     struct vcpu *curr = current;
     struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
     unsigned long data, reps = 1;
     int rc;
+
+    ASSERT((size - 1) < 4 && size != 3);
 
     if ( dir == IOREQ_WRITE )
         data = guest_cpu_user_regs()->eax;
@@ -237,7 +242,12 @@ int handle_pio(uint16_t port, int size, int dir)
     {
     case X86EMUL_OKAY:
         if ( dir == IOREQ_READ )
-            memcpy(&guest_cpu_user_regs()->eax, &data, vio->io_size);
+        {
+            if ( size == 4 ) /* Needs zero extension. */
+                guest_cpu_user_regs()->rax = (uint32_t)data;
+            else
+                memcpy(&guest_cpu_user_regs()->rax, &data, size);
+        }
         break;
     case X86EMUL_RETRY:
         if ( vio->io_state != HVMIO_awaiting_completion )
@@ -255,11 +265,10 @@ int handle_pio(uint16_t port, int size, int dir)
     return 1;
 }
 
-void hvm_io_assist(void)
+void hvm_io_assist(ioreq_t *p)
 {
     struct vcpu *curr = current;
     struct hvm_vcpu_io *vio = &curr->arch.hvm_vcpu.hvm_io;
-    ioreq_t *p = get_ioreq(curr);
     enum hvm_io_state io_state;
 
     rmb(); /* see IORESP_READY /then/ read contents of ioreq */
@@ -281,25 +290,39 @@ void hvm_io_assist(void)
         (void)handle_mmio();
         break;
     case HVMIO_handle_pio_awaiting_completion:
-        memcpy(&guest_cpu_user_regs()->eax,
-               &p->data, vio->io_size);
+        if ( vio->io_size == 4 ) /* Needs zero extension. */
+            guest_cpu_user_regs()->rax = (uint32_t)p->data;
+        else
+            memcpy(&guest_cpu_user_regs()->rax, &p->data, vio->io_size);
         break;
     default:
         break;
     }
 
     if ( p->state == STATE_IOREQ_NONE )
+    {
+        msix_write_completion(curr);
         vcpu_end_shutdown_deferral(curr);
+    }
 }
 
 static int dpci_ioport_read(uint32_t mport, ioreq_t *p)
 {
-    int i, sign = p->df ? -1 : 1;
+    struct hvm_vcpu_io *vio = &current->arch.hvm_vcpu.hvm_io;
+    int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
     uint32_t data = 0;
 
     for ( i = 0; i < p->count; i++ )
     {
-        switch ( p->size )
+        if ( vio->mmio_retrying )
+        {
+            if ( vio->mmio_large_read_bytes != p->size )
+                return X86EMUL_UNHANDLEABLE;
+            memcpy(&data, vio->mmio_large_read, p->size);
+            vio->mmio_large_read_bytes = 0;
+            vio->mmio_retrying = 0;
+        }
+        else switch ( p->size )
         {
         case 1:
             data = inb(mport);
@@ -316,23 +339,51 @@ static int dpci_ioport_read(uint32_t mport, ioreq_t *p)
 
         if ( p->data_is_ptr )
         {
-            int ret;
-            ret = hvm_copy_to_guest_phys(p->data + (sign * i * p->size), &data,
-                                         p->size);
-            if ( (ret == HVMCOPY_gfn_paged_out) ||
-                 (ret == HVMCOPY_gfn_shared) )
-                return X86EMUL_RETRY;
+            switch ( hvm_copy_to_guest_phys(p->data + step * i,
+                                            &data, p->size) )
+            {
+            case HVMCOPY_okay:
+                break;
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
+                rc = X86EMUL_RETRY;
+                break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                /* Drop the write as real hardware would. */
+                continue;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
+            }
+            if ( rc != X86EMUL_OKAY)
+                break;
         }
         else
             p->data = data;
     }
-    
-    return X86EMUL_OKAY;
+
+    if ( rc == X86EMUL_RETRY )
+    {
+        vio->mmio_retry = 1;
+        vio->mmio_large_read_bytes = p->size;
+        memcpy(vio->mmio_large_read, &data, p->size);
+    }
+
+    if ( i != 0 )
+    {
+        p->count = i;
+        rc = X86EMUL_OKAY;
+    }
+
+    return rc;
 }
 
 static int dpci_ioport_write(uint32_t mport, ioreq_t *p)
 {
-    int i, sign = p->df ? -1 : 1;
+    int rc = X86EMUL_OKAY, i, step = p->df ? -p->size : p->size;
     uint32_t data;
 
     for ( i = 0; i < p->count; i++ )
@@ -340,14 +391,27 @@ static int dpci_ioport_write(uint32_t mport, ioreq_t *p)
         data = p->data;
         if ( p->data_is_ptr )
         {
-            int ret;
-            
-            ret = hvm_copy_from_guest_phys(&data, 
-                                           p->data + (sign * i * p->size),
-                                           p->size);
-            if ( (ret == HVMCOPY_gfn_paged_out) &&
-                 (ret == HVMCOPY_gfn_shared) )
-                return X86EMUL_RETRY;
+            switch ( hvm_copy_from_guest_phys(&data, p->data + step * i,
+                                              p->size) )
+            {
+            case HVMCOPY_okay:
+                break;
+            case HVMCOPY_gfn_paged_out:
+            case HVMCOPY_gfn_shared:
+                rc = X86EMUL_RETRY;
+                break;
+            case HVMCOPY_bad_gfn_to_mfn:
+                data = ~0;
+                break;
+            case HVMCOPY_bad_gva_to_gfn:
+                ASSERT(0);
+                /* fall through */
+            default:
+                rc = X86EMUL_UNHANDLEABLE;
+                break;
+            }
+            if ( rc != X86EMUL_OKAY)
+                break;
         }
 
         switch ( p->size )
@@ -366,7 +430,16 @@ static int dpci_ioport_write(uint32_t mport, ioreq_t *p)
         }
     }
 
-    return X86EMUL_OKAY;
+    if ( rc == X86EMUL_RETRY )
+        current->arch.hvm_vcpu.hvm_io.mmio_retry = 1;
+
+    if ( i != 0 )
+    {
+        p->count = i;
+        rc = X86EMUL_OKAY;
+    }
+
+    return rc;
 }
 
 int dpci_ioport_intercept(ioreq_t *p)
@@ -417,7 +490,7 @@ int dpci_ioport_intercept(ioreq_t *p)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

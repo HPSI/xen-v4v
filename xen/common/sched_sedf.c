@@ -138,18 +138,6 @@ static inline int extraq_on(struct vcpu *d, int i)
             (EXTRALIST(d,i)->next != EXTRALIST(d,i)));
 }
 
-static inline void extraq_add_head(struct vcpu *d, int i)
-{
-    list_add(EXTRALIST(d,i), EXTRAQ(d->processor,i));
-    ASSERT(extraq_on(d, i));
-}
-
-static inline void extraq_add_tail(struct vcpu *d, int i)
-{
-    list_add_tail(EXTRALIST(d,i), EXTRAQ(d->processor,i));
-    ASSERT(extraq_on(d, i));
-}
-
 static inline void extraq_del(struct vcpu *d, int i)
 {
     struct list_head *list = EXTRALIST(d,i);
@@ -397,7 +385,8 @@ static int sedf_pick_cpu(const struct scheduler *ops, struct vcpu *v)
 
     online = cpupool_scheduler_cpumask(v->domain->cpupool);
     cpumask_and(&online_affinity, v->cpu_affinity, online);
-    return cpumask_first(&online_affinity);
+    return cpumask_cycle(v->vcpu_id % cpumask_weight(&online_affinity) - 1,
+                         &online_affinity);
 }
 
 /*
@@ -1349,14 +1338,16 @@ static int sedf_adjust_weights(struct cpupool *c, int nr_cpus, int *sumw, s_time
             if ( EDOM_INFO(p)->weight )
             {
                 /* Interrupts already off */
-                vcpu_schedule_lock(p);
+                spinlock_t *lock = vcpu_schedule_lock(p);
+
                 EDOM_INFO(p)->period_orig = 
                     EDOM_INFO(p)->period  = WEIGHT_PERIOD;
                 EDOM_INFO(p)->slice_orig  =
                     EDOM_INFO(p)->slice   = 
                     (EDOM_INFO(p)->weight *
                      (WEIGHT_PERIOD - WEIGHT_SAFETY - sumt[cpu])) / sumw[cpu];
-                vcpu_schedule_unlock(p);
+
+                vcpu_schedule_unlock(lock, p);
             }
         }
     }
@@ -1417,21 +1408,24 @@ static int sedf_adjust(const struct scheduler *ops, struct domain *p, struct xen
                 {
                     /* (Here and everywhere in the following) IRQs are already off,
                      * hence vcpu_spin_lock() is the one. */
-                    vcpu_schedule_lock(v);
+                    spinlock_t *lock = vcpu_schedule_lock(v);
+
                     EDOM_INFO(v)->extraweight = op->u.sedf.weight;
                     EDOM_INFO(v)->weight = 0;
                     EDOM_INFO(v)->slice = 0;
                     EDOM_INFO(v)->period = WEIGHT_PERIOD;
-                    vcpu_schedule_unlock(v);
+                    vcpu_schedule_unlock(lock, v);
                 }
             }
             else
             {
                 /* Weight-driven domains with real-time execution */
-                for_each_vcpu ( p, v ) {
-                    vcpu_schedule_lock(v);
+                for_each_vcpu ( p, v )
+                {
+                    spinlock_t *lock = vcpu_schedule_lock(v);
+
                     EDOM_INFO(v)->weight = op->u.sedf.weight;
-                    vcpu_schedule_unlock(v);
+                    vcpu_schedule_unlock(lock, v);
                 }
             }
         }
@@ -1453,14 +1447,15 @@ static int sedf_adjust(const struct scheduler *ops, struct domain *p, struct xen
             /* Time-driven domains */
             for_each_vcpu ( p, v )
             {
-                vcpu_schedule_lock(v);
+                spinlock_t *lock = vcpu_schedule_lock(v);
+
                 EDOM_INFO(v)->weight = 0;
                 EDOM_INFO(v)->extraweight = 0;
                 EDOM_INFO(v)->period_orig = 
                     EDOM_INFO(v)->period  = op->u.sedf.period;
                 EDOM_INFO(v)->slice_orig  = 
                     EDOM_INFO(v)->slice   = op->u.sedf.slice;
-                vcpu_schedule_unlock(v);
+                vcpu_schedule_unlock(lock, v);
             }
         }
 
@@ -1470,13 +1465,14 @@ static int sedf_adjust(const struct scheduler *ops, struct domain *p, struct xen
 
         for_each_vcpu ( p, v )
         {
-            vcpu_schedule_lock(v);
+            spinlock_t *lock = vcpu_schedule_lock(v);
+
             EDOM_INFO(v)->status  = 
                 (EDOM_INFO(v)->status &
                  ~EXTRA_AWARE) | (op->u.sedf.extratime & EXTRA_AWARE);
             EDOM_INFO(v)->latency = op->u.sedf.latency;
             extraq_check(v);
-            vcpu_schedule_unlock(v);
+            vcpu_schedule_unlock(lock, v);
         }
     }
     else if ( op->cmd == XEN_DOMCTL_SCHEDOP_getinfo )
@@ -1537,7 +1533,7 @@ const struct scheduler sched_sedf_def = {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -77,6 +77,7 @@
 
 #include <xen/bitmap.h>
 #include <xen/kernel.h>
+#include <xen/random.h>
 
 typedef struct cpumask{ DECLARE_BITMAP(bits, NR_CPUS); } cpumask_t;
 
@@ -245,7 +246,23 @@ static inline int cpumask_cycle(int n, const cpumask_t *srcp)
     return nxt;
 }
 
-#define cpumask_any(srcp) cpumask_first(srcp)
+static inline unsigned int cpumask_any(const cpumask_t *srcp)
+{
+    unsigned int cpu = cpumask_first(srcp);
+    unsigned int w = cpumask_weight(srcp);
+
+    if ( w > 1 && cpu < nr_cpu_ids )
+        for ( w = get_random() % w; w--; )
+        {
+            unsigned int next = cpumask_next(cpu, srcp);
+
+            if ( next >= nr_cpu_ids )
+                break;
+            cpu = next;
+        }
+
+    return cpu;
+}
 
 /*
  * Special-case data structure for "single bit set only" constant CPU masks.
@@ -424,8 +441,8 @@ extern cpumask_t cpu_present_map;
 #define for_each_present_cpu(cpu)  for_each_cpu(cpu, &cpu_present_map)
 
 /* Copy to/from cpumap provided by control tools. */
-struct xenctl_cpumap;
-int cpumask_to_xenctl_cpumap(struct xenctl_cpumap *, const cpumask_t *);
-int xenctl_cpumap_to_cpumask(cpumask_var_t *, const struct xenctl_cpumap *);
+struct xenctl_bitmap;
+int cpumask_to_xenctl_bitmap(struct xenctl_bitmap *, const cpumask_t *);
+int xenctl_bitmap_to_cpumask(cpumask_var_t *, const struct xenctl_bitmap *);
 
 #endif /* __XEN_CPUMASK_H */

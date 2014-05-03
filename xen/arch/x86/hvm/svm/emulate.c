@@ -152,7 +152,7 @@ static int fetch(struct vcpu *v, u8 *buf, unsigned long addr, int len)
 }
 
 int __get_instruction_length_from_list(struct vcpu *v,
-        enum instruction_index *list, unsigned int list_count)
+        const enum instruction_index *list, unsigned int list_count)
 {
     struct vmcb_struct *vmcb = v->arch.hvm_svm.vmcb;
     unsigned int i, j, inst_len = 0;
@@ -226,7 +226,7 @@ int __get_instruction_length_from_list(struct vcpu *v,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

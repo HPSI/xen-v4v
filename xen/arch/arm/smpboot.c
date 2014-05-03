@@ -28,29 +28,36 @@
 #include <xen/softirq.h>
 #include <xen/timer.h>
 #include <xen/irq.h>
-#include <asm/vfp.h>
-#include "gic.h"
+#include <xen/console.h>
+#include <asm/gic.h>
+#include <asm/psci.h>
 
 cpumask_t cpu_online_map;
-EXPORT_SYMBOL(cpu_online_map);
 cpumask_t cpu_present_map;
-EXPORT_SYMBOL(cpu_online_map);
 cpumask_t cpu_possible_map;
-EXPORT_SYMBOL(cpu_possible_map);
+
+struct cpuinfo_arm cpu_data[NR_CPUS];
+
+/* CPU logical map: map xen cpuid to an MPIDR */
+u32 __cpu_logical_map[NR_CPUS] = { [0 ... NR_CPUS-1] = MPIDR_INVALID };
+
+/* Fake one node for now. See also include/asm-arm/numa.h */
+nodemask_t __read_mostly node_online_map = { { [0] = 1UL } };
 
 /* Xen stack for bringing up the first CPU. */
 static unsigned char __initdata cpu0_boot_stack[STACK_SIZE]
        __attribute__((__aligned__(STACK_SIZE)));
 
-/* Pointer to the stack, used by head.S when entering C */
-unsigned char *init_stack = cpu0_boot_stack;
+/* Initial boot cpu data */
+struct init_info __initdata init_data =
+{
+    .stack = cpu0_boot_stack,
+};
 
 /* Shared state for coordinating CPU bringup */
-unsigned long smp_up_cpu = 0;
+unsigned long smp_up_cpu = MPIDR_INVALID;
+/* Shared state for coordinating CPU teardown */
 static bool_t cpu_is_dead = 0;
-
-/* Number of non-boot CPUs ready to enter C */
-unsigned long __initdata ready_cpus = 0;
 
 /* ID of the PCPU we're running on */
 DEFINE_PER_CPU(unsigned int, cpu_id);
@@ -64,71 +71,217 @@ static void setup_cpu_sibling_map(int cpu)
 {
     if ( !zalloc_cpumask_var(&per_cpu(cpu_sibling_mask, cpu)) ||
          !zalloc_cpumask_var(&per_cpu(cpu_core_mask, cpu)) )
-        panic("No memory for CPU sibling/core maps\n");
+        panic("No memory for CPU sibling/core maps");
 
     /* A CPU is a sibling with itself and is always on its own core. */
     cpumask_set_cpu(cpu, per_cpu(cpu_sibling_mask, cpu));
     cpumask_set_cpu(cpu, per_cpu(cpu_core_mask, cpu));
 }
 
+void __init
+smp_clear_cpu_maps (void)
+{
+    cpumask_clear(&cpu_possible_map);
+    cpumask_clear(&cpu_online_map);
+    cpumask_set_cpu(0, &cpu_online_map);
+    cpumask_set_cpu(0, &cpu_possible_map);
+    cpu_logical_map(0) = READ_SYSREG(MPIDR_EL1) & MPIDR_HWID_MASK;
+}
+
+/* Parse the device tree and build the logical map array containing
+ * MPIDR values related to logical cpus
+ * Code base on Linux arch/arm/kernel/devtree.c
+ */
+void __init smp_init_cpus(void)
+{
+    register_t mpidr;
+    struct dt_device_node *cpus = dt_find_node_by_path("/cpus");
+    struct dt_device_node *cpu;
+    unsigned int i, j;
+    unsigned int cpuidx = 1;
+    static u32 tmp_map[NR_CPUS] __initdata =
+    {
+        [0 ... NR_CPUS - 1] = MPIDR_INVALID
+    };
+    bool_t bootcpu_valid = 0;
+    int rc;
+
+    /* scan the DTB for a PSCI node and set a global variable */
+    psci_init();
+
+    if ( (rc = arch_smp_init()) < 0 )
+    {
+        printk(XENLOG_WARNING "SMP init failed (%d)\n"
+               "Using only 1 CPU\n", rc);
+        return;
+    }
+
+    mpidr = boot_cpu_data.mpidr.bits & MPIDR_HWID_MASK;
+
+    if ( !cpus )
+    {
+        printk(XENLOG_WARNING "WARNING: Can't find /cpus in the device tree.\n"
+               "Using only 1 CPU\n");
+        return;
+    }
+
+    dt_for_each_child_node( cpus, cpu )
+    {
+        const __be32 *prop;
+        u64 addr;
+        u32 reg_len, hwid;
+
+        if ( !dt_device_type_is_equal(cpu, "cpu") )
+            continue;
+
+        if ( dt_n_size_cells(cpu) != 0 )
+            printk(XENLOG_WARNING "cpu node `%s`: #size-cells %d\n",
+                   dt_node_full_name(cpu), dt_n_size_cells(cpu));
+
+        prop = dt_get_property(cpu, "reg", &reg_len);
+        if ( !prop )
+        {
+            printk(XENLOG_WARNING "cpu node `%s`: has no reg property\n",
+                   dt_node_full_name(cpu));
+            continue;
+        }
+
+        if ( reg_len < dt_cells_to_size(dt_n_addr_cells(cpu)) )
+        {
+            printk(XENLOG_WARNING "cpu node `%s`: reg property too short\n",
+                   dt_node_full_name(cpu));
+            continue;
+        }
+
+        addr = dt_read_number(prop, dt_n_addr_cells(cpu));
+
+        hwid = addr;
+        if ( hwid != addr )
+        {
+            printk(XENLOG_WARNING "cpu node `%s`: hwid overflow %"PRIx64"\n",
+                   dt_node_full_name(cpu), addr);
+            continue;
+        }
+
+        /*
+         * 8 MSBs must be set to 0 in the DT since the reg property
+         * defines the MPIDR[23:0]
+         */
+        if ( hwid & ~MPIDR_HWID_MASK )
+        {
+            printk(XENLOG_WARNING "cpu node `%s`: invalid hwid value (0x%x)\n",
+                   dt_node_full_name(cpu), hwid);
+            continue;
+        }
+
+        /*
+         * Duplicate MPIDRs are a recipe for disaster. Scan all initialized
+         * entries and check for duplicates. If any found just skip the node.
+         * temp values values are initialized to MPIDR_INVALID to avoid
+         * matching valid MPIDR[23:0] values.
+         */
+        for ( j = 0; j < cpuidx; j++ )
+        {
+            if ( tmp_map[j] == hwid )
+            {
+                printk(XENLOG_WARNING
+                       "cpu node `%s`: duplicate /cpu reg properties %"PRIx32" in the DT\n",
+                       dt_node_full_name(cpu), hwid);
+                break;
+            }
+        }
+        if ( j != cpuidx )
+            continue;
+
+        /*
+         * Build a stashed array of MPIDR values. Numbering scheme requires
+         * that if detected the boot CPU must be assigned logical id 0. Other
+         * CPUs get sequential indexes starting from 1. If a CPU node
+         * with a reg property matching the boot CPU MPIDR is detected,
+         * this is recorded and so that the logical map build from DT is
+         * validated and can be used to set the map.
+         */
+        if ( hwid == mpidr )
+        {
+            i = 0;
+            bootcpu_valid = 1;
+        }
+        else
+            i = cpuidx++;
+
+        if ( cpuidx > NR_CPUS )
+        {
+            printk(XENLOG_WARNING
+                   "DT /cpu %u node greater than max cores %u, capping them\n",
+                   cpuidx, NR_CPUS);
+            cpuidx = NR_CPUS;
+            break;
+        }
+
+        if ( (rc = arch_cpu_init(i, cpu)) < 0 )
+        {
+            printk("cpu%d init failed (hwid %x): %d\n", i, hwid, rc);
+            tmp_map[i] = MPIDR_INVALID;
+        }
+        else
+            tmp_map[i] = hwid;
+    }
+
+    if ( !bootcpu_valid )
+    {
+        printk(XENLOG_WARNING "DT missing boot CPU MPIDR[23:0]\n"
+               "Using only 1 CPU\n");
+        return;
+    }
+
+    for ( i = 0; i < cpuidx; i++ )
+    {
+        if ( tmp_map[i] == MPIDR_INVALID )
+            continue;
+        cpumask_set_cpu(i, &cpu_possible_map);
+        cpu_logical_map(i) = tmp_map[i];
+    }
+}
+
+int __init
+smp_get_max_cpus (void)
+{
+    int i, max_cpus = 0;
+
+    for ( i = 0; i < nr_cpu_ids; i++ )
+        if ( cpu_possible(i) )
+            max_cpus++;
+
+    return max_cpus;
+}
 
 void __init
 smp_prepare_cpus (unsigned int max_cpus)
 {
-    int i;
-
-    cpumask_clear(&cpu_online_map);
-    cpumask_set_cpu(0, &cpu_online_map);
-
-    cpumask_clear(&cpu_possible_map);
-    for ( i = 0; i < max_cpus; i++ )
-        cpumask_set_cpu(i, &cpu_possible_map);
     cpumask_copy(&cpu_present_map, &cpu_possible_map);
 
     setup_cpu_sibling_map(0);
 }
 
-void __init
-make_cpus_ready(unsigned int max_cpus, unsigned long boot_phys_offset)
-{
-    unsigned long *gate;
-    paddr_t gate_pa;
-    int i;
-
-    printk("Waiting for %i other CPUs to be ready\n", max_cpus - 1);
-    /* We use the unrelocated copy of smp_up_cpu as that's the one the
-     * others can see. */ 
-    gate_pa = ((paddr_t) (unsigned long) &smp_up_cpu) + boot_phys_offset;
-    gate = map_domain_page(gate_pa >> PAGE_SHIFT) + (gate_pa & ~PAGE_MASK); 
-    for ( i = 1; i < max_cpus; i++ )
-    {
-        /* Tell the next CPU to get ready */
-        /* TODO: handle boards where CPUIDs are not contiguous */
-        *gate = i;
-        asm volatile("dsb; isb; sev");
-        /* And wait for it to respond */
-        while ( ready_cpus < i )
-            smp_rmb();
-    }
-    unmap_domain_page(gate);
-}
-
 /* Boot the current CPU */
 void __cpuinit start_secondary(unsigned long boot_phys_offset,
-                               unsigned long arm_type,
-                               unsigned long atag_paddr,
-                               unsigned long cpuid)
+                               unsigned long fdt_paddr,
+                               unsigned long hwid)
 {
+    unsigned int cpuid = init_data.cpuid;
+
     memset(get_cpu_info(), 0, sizeof (struct cpu_info));
 
-    /* TODO: handle boards where CPUIDs are not contiguous */
     set_processor_id(cpuid);
 
-    /* Setup Hyp vector base */
-    WRITE_CP32((uint32_t) hyp_traps_vector, HVBAR);
+    current_cpu_data = boot_cpu_data;
+    identify_cpu(&current_cpu_data);
+
+    init_traps();
+
+    setup_virt_paging();
 
     mmu_init_secondary_cpu();
-    enable_vfp();
 
     gic_init_secondary_cpu();
 
@@ -145,15 +298,17 @@ void __cpuinit start_secondary(unsigned long boot_phys_offset,
 
     /* Run local notifiers */
     notify_cpu_starting(cpuid);
-    wmb();
+    smp_wmb();
 
     /* Now report this CPU is up */
+    smp_up_cpu = MPIDR_INVALID;
     cpumask_set_cpu(cpuid, &cpu_online_map);
-    wmb();
+    smp_wmb();
 
     local_irq_enable();
+    local_abort_enable();
 
-    dprintk(XENLOG_DEBUG, "CPU %u booted.\n", smp_processor_id());
+    printk(XENLOG_DEBUG "CPU %u booted.\n", smp_processor_id());
 
     startup_cpu_idle_loop();
 }
@@ -175,7 +330,7 @@ void __cpu_disable(void)
 
     if ( cpu_disable_scheduler(cpu) )
         BUG();
-    mb();
+    smp_mb();
 
     /* Return to caller; eventually the IPI mechanism will unwind and the 
      * scheduler will drop to the idle loop, which will call stop_cpu(). */
@@ -186,22 +341,54 @@ void stop_cpu(void)
     local_irq_disable();
     cpu_is_dead = 1;
     /* Make sure the write happens before we sleep forever */
-    dsb();
+    dsb(sy);
     isb();
-    while ( 1 ) 
-        asm volatile("wfi");
+    while ( 1 )
+        wfi();
+}
+
+int __init cpu_up_send_sgi(int cpu)
+{
+    /* We don't know the GIC ID of the CPU until it has woken up, so just
+     * signal everyone and rely on our own smp_up_cpu gate to ensure only
+     * the one we want gets through. */
+    send_SGI_allbutself(GIC_SGI_EVENT_CHECK);
+
+    return 0;
 }
 
 /* Bring up a remote CPU */
 int __cpu_up(unsigned int cpu)
 {
-    /* Tell the remote CPU which stack to boot on. */
-    init_stack = idle_vcpu[cpu]->arch.stack;
+    int rc;
 
-    /* Unblock the CPU.  It should be waiting in the loop in head.S
-     * for an event to arrive when smp_up_cpu matches its cpuid. */
-    smp_up_cpu = cpu;
-    asm volatile("dsb; isb; sev");
+    printk("Bringing up CPU%d\n", cpu);
+
+    rc = init_secondary_pagetables(cpu);
+    if ( rc < 0 )
+        return rc;
+
+    console_start_sync(); /* Secondary may use early_printk */
+
+    /* Tell the remote CPU which stack to boot on. */
+    init_data.stack = idle_vcpu[cpu]->arch.stack;
+
+    /* Tell the remote CPU what is it's logical CPU ID */
+    init_data.cpuid = cpu;
+
+    /* Open the gate for this CPU */
+    smp_up_cpu = cpu_logical_map(cpu);
+    clean_xen_dcache(smp_up_cpu);
+
+    rc = arch_cpu_up(cpu);
+
+    console_end_sync();
+
+    if ( rc < 0 )
+    {
+        printk("Failed to bring up CPU%d\n", cpu);
+        return rc;
+    }
 
     while ( !cpu_online(cpu) )
     {
@@ -224,17 +411,16 @@ void __cpu_die(unsigned int cpu)
         process_pending_softirqs();
         if ( (++i % 10) == 0 )
             printk(KERN_ERR "CPU %u still not dead...\n", cpu);
-        mb();
+        smp_mb();
     }
     cpu_is_dead = 0;
-    mb();
+    smp_mb();
 }
-
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

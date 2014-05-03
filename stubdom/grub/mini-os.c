@@ -126,6 +126,9 @@ biosdisk (int read, int drive, struct geometry *geometry,
     if (i >= blk_nb)
         return -1;
 
+    if (sector + nsec > geometry->total_sectors)
+      return -1;
+
     aiocb.aio_dev = blk_dev[i];
     aiocb.aio_buf = addr;
     aiocb.aio_nbytes = (size_t)nsec * blk_info[i].sector_size;
@@ -330,7 +333,7 @@ struct frame {
 static void minios_transmit (struct nic *nic, const char *d, unsigned int t,
                              unsigned int s, const char *p)
 {
-    struct frame *frame = alloca(sizeof(frame) + s);
+    struct frame *frame = alloca(sizeof(*frame) + s);
 
     memcpy(frame->dest, d, ETH_ALEN);
     memcpy(frame->src, nic->node_addr, ETH_ALEN);
@@ -732,8 +735,14 @@ void __attribute__ ((noreturn)) grub_reboot (void)
  * for grub's 32bit pointers to work */
 char grub_scratch_mem[SCRATCH_MEMSIZE] __attribute__((aligned(PAGE_SIZE)));
 
-int main(int argc, char *argv[])
+int main(int argc, char **argv)
 {
+    if (argc > 1 && memcmp(argv[1], "--vtpm-label=", 13) == 0) {
+        vtpm_label = argv[1] + 13;
+        argc--;
+        argv++;
+    }
+
     if (argc > 1) {
         strncpy(config_file, argv[1], sizeof(config_file) - 1);
         config_file[sizeof(config_file) - 1] = 0;

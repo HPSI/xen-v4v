@@ -27,6 +27,7 @@
 #include <asm/hvm/io.h>
 #include <asm/hvm/support.h>
 #include <asm/current.h>
+#include <xen/trace.h>
 
 #define USEC_PER_SEC    1000000UL
 #define NS_PER_USEC     1000UL
@@ -45,42 +46,130 @@
 #define epoch_year     1900
 #define get_year(x)    (x + epoch_year)
 
+enum rtc_mode {
+   rtc_mode_no_ack,
+   rtc_mode_strict
+};
+
+/* This must be in sync with how hvmloader sets the ACPI WAET flags. */
+#define mode_is(d, m) ((void)(d), rtc_mode_##m == rtc_mode_no_ack)
+#define rtc_mode_is(s, m) mode_is(vrtc_domain(s), m)
+
 static void rtc_copy_date(RTCState *s);
 static void rtc_set_time(RTCState *s);
 static inline int from_bcd(RTCState *s, int a);
 static inline int convert_hour(RTCState *s, int hour);
 
-static void rtc_periodic_cb(struct vcpu *v, void *opaque)
+static void rtc_update_irq(RTCState *s)
+{
+    ASSERT(spin_is_locked(&s->lock));
+
+    if ( rtc_mode_is(s, strict) && (s->hw.cmos_data[RTC_REG_C] & RTC_IRQF) )
+        return;
+
+    /* IRQ is raised if any source is both raised & enabled */
+    if ( !(s->hw.cmos_data[RTC_REG_B] &
+           s->hw.cmos_data[RTC_REG_C] &
+           (RTC_PF | RTC_AF | RTC_UF)) )
+        return;
+
+    s->hw.cmos_data[RTC_REG_C] |= RTC_IRQF;
+    if ( rtc_mode_is(s, no_ack) )
+        hvm_isa_irq_deassert(vrtc_domain(s), RTC_IRQ);
+    hvm_isa_irq_assert(vrtc_domain(s), RTC_IRQ);
+}
+
+/* Called by the VPT code after it's injected a PF interrupt for us.
+ * Fix up the register state to reflect what happened. */
+static void rtc_pf_callback(struct vcpu *v, void *opaque)
 {
     RTCState *s = opaque;
+
     spin_lock(&s->lock);
-    s->hw.cmos_data[RTC_REG_C] |= 0xc0;
+
+    if ( !rtc_mode_is(s, no_ack)
+         && (s->hw.cmos_data[RTC_REG_C] & RTC_IRQF)
+         && ++(s->pt_dead_ticks) >= 10 )
+    {
+        /* VM is ignoring its RTC; no point in running the timer */
+        TRACE_0D(TRC_HVM_EMUL_RTC_STOP_TIMER);
+        destroy_periodic_time(&s->pt);
+        s->period = 0;
+    }
+
+    s->hw.cmos_data[RTC_REG_C] |= RTC_PF|RTC_IRQF;
+
     spin_unlock(&s->lock);
+}
+
+/* Check whether the REG_C.PF bit should have been set by a tick since
+ * the last time we looked. This is used to track ticks when REG_B.PIE
+ * is clear; when PIE is set, PF ticks are handled by the VPT callbacks.  */
+static void check_for_pf_ticks(RTCState *s)
+{
+    s_time_t now;
+
+    if ( s->period == 0 || (s->hw.cmos_data[RTC_REG_B] & RTC_PIE) )
+        return;
+
+    now = NOW();
+    if ( (now - s->start_time) / s->period
+         != (s->check_ticks_since - s->start_time) / s->period )
+        s->hw.cmos_data[RTC_REG_C] |= RTC_PF;
+
+    s->check_ticks_since = now;
 }
 
 /* Enable/configure/disable the periodic timer based on the RTC_PIE and
  * RTC_RATE_SELECT settings */
 static void rtc_timer_update(RTCState *s)
 {
-    int period_code, period;
+    int period_code, period, delta;
     struct vcpu *v = vrtc_vcpu(s);
 
     ASSERT(spin_is_locked(&s->lock));
 
-    period_code = s->hw.cmos_data[RTC_REG_A] & RTC_RATE_SELECT;
-    if ( (period_code != 0) && (s->hw.cmos_data[RTC_REG_B] & RTC_PIE) )
-    {
-        if ( period_code <= 2 )
-            period_code += 7;
+    s->pt_dead_ticks = 0;
 
-        period = 1 << (period_code - 1); /* period in 32 Khz cycles */
-        period = DIV_ROUND((period * 1000000000ULL), 32768); /* period in ns */
-        create_periodic_time(v, &s->pt, period, period, RTC_IRQ,
-                             rtc_periodic_cb, s);
-    }
-    else
+    period_code = s->hw.cmos_data[RTC_REG_A] & RTC_RATE_SELECT;
+    switch ( s->hw.cmos_data[RTC_REG_A] & RTC_DIV_CTL )
     {
+    case RTC_REF_CLCK_32KHZ:
+        if ( (period_code != 0) && (period_code <= 2) )
+            period_code += 7;
+        /* fall through */
+    case RTC_REF_CLCK_1MHZ:
+    case RTC_REF_CLCK_4MHZ:
+        if ( period_code != 0 )
+        {
+            period = 1 << (period_code - 1); /* period in 32 Khz cycles */
+            period = DIV_ROUND(period * 1000000000ULL, 32768); /* in ns */
+            if ( period != s->period )
+            {
+                s_time_t now = NOW();
+
+                s->period = period;
+                if ( v->domain->arch.hvm_domain.params[HVM_PARAM_VPT_ALIGN] )
+                    delta = 0;
+                else
+                    delta = period - ((now - s->start_time) % period);
+                if ( s->hw.cmos_data[RTC_REG_B] & RTC_PIE )
+                {
+                    TRACE_2D(TRC_HVM_EMUL_RTC_START_TIMER, delta, period);
+                    create_periodic_time(v, &s->pt, delta, period,
+                                         RTC_IRQ, rtc_pf_callback, s);
+                }
+                else
+                    s->check_ticks_since = now;
+            }
+            break;
+        }
+        /* fall through */
+    default:
+        TRACE_0D(TRC_HVM_EMUL_RTC_STOP_TIMER);
         destroy_periodic_time(&s->pt);
+        s->period = 0;
+        break;
     }
 }
 
@@ -102,7 +191,7 @@ static void check_update_timer(RTCState *s)
         guest_usec = get_localtime_us(d) % USEC_PER_SEC;
         if (guest_usec >= (USEC_PER_SEC - 244))
         {
-            /* RTC is in update cycle when enabling UIE */
+            /* RTC is in update cycle */
             s->hw.cmos_data[RTC_REG_A] |= RTC_UIP;
             next_update_time = (USEC_PER_SEC - guest_usec) * NS_PER_USEC;
             expire_time = NOW() + next_update_time;
@@ -144,19 +233,13 @@ static void rtc_update_timer(void *opaque)
 static void rtc_update_timer2(void *opaque)
 {
     RTCState *s = opaque;
-    struct domain *d = vrtc_domain(s);
 
     spin_lock(&s->lock);
     if (!(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
     {
         s->hw.cmos_data[RTC_REG_C] |= RTC_UF;
         s->hw.cmos_data[RTC_REG_A] &= ~RTC_UIP;
-        if ((s->hw.cmos_data[RTC_REG_B] & RTC_UIE))
-        {
-            s->hw.cmos_data[RTC_REG_C] |= RTC_IRQF;
-            hvm_isa_irq_deassert(d, RTC_IRQ);
-            hvm_isa_irq_assert(d, RTC_IRQ);
-        }
+        rtc_update_irq(s);
         check_update_timer(s);
     }
     spin_unlock(&s->lock);
@@ -175,7 +258,7 @@ static void alarm_timer_update(RTCState *s)
 
     stop_timer(&s->alarm_timer);
 
-    if ((s->hw.cmos_data[RTC_REG_B] & RTC_AIE) &&
+    if (!(s->hw.cmos_data[RTC_REG_C] & RTC_AF) &&
             !(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
     {
         s->current_tm = gmtime(get_localtime(d));
@@ -183,13 +266,11 @@ static void alarm_timer_update(RTCState *s)
 
         alarm_sec = from_bcd(s, s->hw.cmos_data[RTC_SECONDS_ALARM]);
         alarm_min = from_bcd(s, s->hw.cmos_data[RTC_MINUTES_ALARM]);
-        alarm_hour = from_bcd(s, s->hw.cmos_data[RTC_HOURS_ALARM]);
-        alarm_hour = convert_hour(s, alarm_hour);
+        alarm_hour = convert_hour(s, s->hw.cmos_data[RTC_HOURS_ALARM]);
 
         cur_sec = from_bcd(s, s->hw.cmos_data[RTC_SECONDS]);
         cur_min = from_bcd(s, s->hw.cmos_data[RTC_MINUTES]);
-        cur_hour = from_bcd(s, s->hw.cmos_data[RTC_HOURS]);
-        cur_hour = convert_hour(s, cur_hour);
+        cur_hour = convert_hour(s, s->hw.cmos_data[RTC_HOURS]);
 
         next_update_time = USEC_PER_SEC - (get_localtime_us(d) % USEC_PER_SEC);
         next_update_time = next_update_time * NS_PER_USEC + NOW();
@@ -343,19 +424,12 @@ static void alarm_timer_update(RTCState *s)
 static void rtc_alarm_cb(void *opaque)
 {
     RTCState *s = opaque;
-    struct domain *d = vrtc_domain(s);
 
     spin_lock(&s->lock);
     if (!(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
     {
         s->hw.cmos_data[RTC_REG_C] |= RTC_AF;
-        /* alarm interrupt */
-        if (s->hw.cmos_data[RTC_REG_B] & RTC_AIE)
-        {
-            s->hw.cmos_data[RTC_REG_C] |= RTC_IRQF;
-            hvm_isa_irq_deassert(d, RTC_IRQ);
-            hvm_isa_irq_assert(d, RTC_IRQ);
-        }
+        rtc_update_irq(s);
         alarm_timer_update(s);
     }
     spin_unlock(&s->lock);
@@ -399,10 +473,17 @@ static int rtc_ioport_write(void *opaque, uint32_t addr, uint32_t data)
     case RTC_DAY_OF_MONTH:
     case RTC_MONTH:
     case RTC_YEAR:
-        s->hw.cmos_data[s->hw.cmos_index] = data;
-        /* if in set mode, do not update the time */
-        if ( !(s->hw.cmos_data[RTC_REG_B] & RTC_SET) )
+        /* if in set mode, just write the register */
+        if ( (s->hw.cmos_data[RTC_REG_B] & RTC_SET) )
+            s->hw.cmos_data[s->hw.cmos_index] = data;
+        else
+        {
+            /* Fetch the current time and update just this field. */
+            s->current_tm = gmtime(get_localtime(d));
+            rtc_copy_date(s);
+            s->hw.cmos_data[s->hw.cmos_index] = data;
             rtc_set_time(s);
+        }
         alarm_timer_update(s);
         break;
     case RTC_REG_A:
@@ -417,7 +498,7 @@ static int rtc_ioport_write(void *opaque, uint32_t addr, uint32_t data)
             /* set mode: reset UIP mode */
             s->hw.cmos_data[RTC_REG_A] &= ~RTC_UIP;
             /* adjust cmos before stopping */
-            if (!(s->hw.cmos_data[RTC_REG_B] & RTC_SET))
+            if (!(orig & RTC_SET))
             {
                 s->current_tm = gmtime(get_localtime(d));
                 rtc_copy_date(s);
@@ -426,22 +507,27 @@ static int rtc_ioport_write(void *opaque, uint32_t addr, uint32_t data)
         else
         {
             /* if disabling set mode, update the time */
-            if ( s->hw.cmos_data[RTC_REG_B] & RTC_SET )
+            if ( orig & RTC_SET )
                 rtc_set_time(s);
         }
-        /* if the interrupt is already set when the interrupt become
-         * enabled, raise an interrupt immediately*/
-        if ((data & RTC_UIE) && !(s->hw.cmos_data[RTC_REG_B] & RTC_UIE))
-            if (s->hw.cmos_data[RTC_REG_C] & RTC_UF)
-            {
-                hvm_isa_irq_deassert(d, RTC_IRQ);
-                hvm_isa_irq_assert(d, RTC_IRQ);
-            }
+        check_for_pf_ticks(s);
         s->hw.cmos_data[RTC_REG_B] = data;
+        /*
+         * If the interrupt is already set when the interrupt becomes
+         * enabled, raise an interrupt immediately.
+         */
+        rtc_update_irq(s);
         if ( (data ^ orig) & RTC_PIE )
+        {
+            TRACE_0D(TRC_HVM_EMUL_RTC_STOP_TIMER);
+            destroy_periodic_time(&s->pt);
+            s->period = 0;
             rtc_timer_update(s);
-        check_update_timer(s);
-        alarm_timer_update(s);
+        }
+        if ( (data ^ orig) & RTC_SET )
+            check_update_timer(s);
+        if ( (data ^ orig) & (RTC_24H | RTC_DM_BINARY | RTC_SET) )
+            alarm_timer_update(s);
         break;
     case RTC_REG_C:
     case RTC_REG_D:
@@ -456,7 +542,7 @@ static int rtc_ioport_write(void *opaque, uint32_t addr, uint32_t data)
 
 static inline int to_bcd(RTCState *s, int a)
 {
-    if ( s->hw.cmos_data[RTC_REG_B] & 0x04 )
+    if ( s->hw.cmos_data[RTC_REG_B] & RTC_DM_BINARY )
         return a;
     else
         return ((a / 10) << 4) | (a % 10);
@@ -464,7 +550,7 @@ static inline int to_bcd(RTCState *s, int a)
 
 static inline int from_bcd(RTCState *s, int a)
 {
-    if ( s->hw.cmos_data[RTC_REG_B] & 0x04 )
+    if ( s->hw.cmos_data[RTC_REG_B] & RTC_DM_BINARY )
         return a;
     else
         return ((a >> 4) * 10) + (a & 0x0f);
@@ -472,12 +558,14 @@ static inline int from_bcd(RTCState *s, int a)
 
 /* Hours in 12 hour mode are in 1-12 range, not 0-11.
  * So we need convert it before using it*/
-static inline int convert_hour(RTCState *s, int hour)
+static inline int convert_hour(RTCState *s, int raw)
 {
+    int hour = from_bcd(s, raw & 0x7f);
+
     if (!(s->hw.cmos_data[RTC_REG_B] & RTC_24H))
     {
         hour %= 12;
-        if (s->hw.cmos_data[RTC_HOURS] & 0x80)
+        if (raw & 0x80)
             hour += 12;
     }
     return hour;
@@ -496,8 +584,7 @@ static void rtc_set_time(RTCState *s)
     
     tm->tm_sec = from_bcd(s, s->hw.cmos_data[RTC_SECONDS]);
     tm->tm_min = from_bcd(s, s->hw.cmos_data[RTC_MINUTES]);
-    tm->tm_hour = from_bcd(s, s->hw.cmos_data[RTC_HOURS] & 0x7f);
-    tm->tm_hour = convert_hour(s, tm->tm_hour);
+    tm->tm_hour = convert_hour(s, s->hw.cmos_data[RTC_HOURS]);
     tm->tm_wday = from_bcd(s, s->hw.cmos_data[RTC_DAY_OF_WEEK]);
     tm->tm_mday = from_bcd(s, s->hw.cmos_data[RTC_DAY_OF_MONTH]);
     tm->tm_mon = from_bcd(s, s->hw.cmos_data[RTC_MONTH]) - 1;
@@ -590,10 +677,14 @@ static uint32_t rtc_ioport_read(RTCState *s, uint32_t addr)
             ret |= RTC_UIP;
         break;
     case RTC_REG_C:
+        check_for_pf_ticks(s);
         ret = s->hw.cmos_data[s->hw.cmos_index];
-        hvm_isa_irq_deassert(vrtc_domain(s), RTC_IRQ);
         s->hw.cmos_data[RTC_REG_C] = 0x00;
+        if ( ret & RTC_IRQF )
+            hvm_isa_irq_deassert(d, RTC_IRQ);
         check_update_timer(s);
+        alarm_timer_update(s);
+        s->pt_dead_ticks = 0;
         break;
     default:
         ret = s->hw.cmos_data[s->hw.cmos_index];
@@ -688,7 +779,9 @@ void rtc_reset(struct domain *d)
 {
     RTCState *s = domain_vrtc(d);
 
+    TRACE_0D(TRC_HVM_EMUL_RTC_STOP_TIMER);
     destroy_periodic_time(&s->pt);
+    s->period = 0;
     s->pt.source = PTSRC_isa;
 }
 
@@ -714,6 +807,7 @@ void rtc_init(struct domain *d)
     s->hw.cmos_data[RTC_REG_D] = RTC_VRT;
 
     s->current_tm = gmtime(get_localtime(d));
+    s->start_time = NOW();
 
     rtc_copy_date(s);
 
@@ -727,6 +821,7 @@ void rtc_deinit(struct domain *d)
 
     spin_barrier(&s->lock);
 
+    TRACE_0D(TRC_HVM_EMUL_RTC_STOP_TIMER);
     destroy_periodic_time(&s->pt);
     kill_timer(&s->update_timer);
     kill_timer(&s->update_timer2);
@@ -741,3 +836,12 @@ void rtc_update_clock(struct domain *d)
     s->current_tm = gmtime(get_localtime(d));
     spin_unlock(&s->lock);
 }
+
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

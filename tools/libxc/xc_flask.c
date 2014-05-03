@@ -19,7 +19,6 @@
 #include "xc_private.h"
 #include <unistd.h>
 #include <stdio.h>
-#include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -28,7 +27,6 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/ioctl.h>
-#include <stdint.h>
 
 #define OCON_ISID    0    /* initial SIDs */
 #define OCON_PIRQ    1    /* physical irqs */
@@ -422,10 +420,20 @@ int xc_flask_setavc_threshold(xc_interface *xch, int threshold)
     return xc_flask_op(xch, &op);
 }
 
+int xc_flask_relabel_domain(xc_interface *xch, int domid, uint32_t sid)
+{
+    DECLARE_FLASK_OP;
+    op.cmd = FLASK_RELABEL_DOMAIN;
+    op.u.relabel.domid = domid;
+    op.u.relabel.sid = sid;
+
+    return xc_flask_op(xch, &op);
+}
+
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -7,7 +7,7 @@
  *  it under the terms of the GNU General Public License version 2,
  *  as published by the Free Software Foundation.
  */
-
+#ifndef COMPAT
 #include <xen/errno.h>
 #include <xen/event.h>
 #include <xsm/xsm.h>
@@ -19,6 +19,10 @@
 #include <avc_ss.h>
 #include <objsec.h>
 #include <conditional.h>
+
+#define ret_t long
+#define _copy_to_guest copy_to_guest
+#define _copy_from_guest copy_from_guest
 
 #ifdef FLASK_DEVELOP
 int flask_enforcing = 0;
@@ -53,6 +57,7 @@ static DEFINE_SPINLOCK(sel_sem);
 /* global data for booleans */
 static int bool_num = 0;
 static int *bool_pending_values = NULL;
+static size_t bool_maxstr;
 static int flask_security_make_bools(void);
 
 extern int ss_initialized;
@@ -71,9 +76,15 @@ static int domain_has_security(struct domain *d, u32 perms)
                         perms, NULL);
 }
 
-static int flask_copyin_string(XEN_GUEST_HANDLE_PARAM(char) u_buf, char **buf, uint32_t size)
+static int flask_copyin_string(XEN_GUEST_HANDLE(char) u_buf, char **buf,
+                               size_t size, size_t max_size)
 {
-    char *tmp = xmalloc_bytes(size + 1);
+    char *tmp;
+
+    if ( size > max_size )
+        return -ENOENT;
+
+    tmp = xmalloc_array(char, size + 1);
     if ( !tmp )
         return -ENOMEM;
 
@@ -88,6 +99,8 @@ static int flask_copyin_string(XEN_GUEST_HANDLE_PARAM(char) u_buf, char **buf, u
     return 0;
 }
 
+#endif /* COMPAT */
+
 static int flask_security_user(struct xen_flask_userlist *arg)
 {
     char *user;
@@ -99,7 +112,7 @@ static int flask_security_user(struct xen_flask_userlist *arg)
     if ( rv )
         return rv;
 
-    rv = flask_copyin_string(arg->u.user, &user, arg->size);
+    rv = flask_copyin_string(arg->u.user, &user, arg->size, PAGE_SIZE);
     if ( rv )
         return rv;
 
@@ -112,7 +125,7 @@ static int flask_security_user(struct xen_flask_userlist *arg)
 
     arg->size = nsids;
 
-    if ( copy_to_guest(arg->u.sids, sids, nsids) )
+    if ( _copy_to_guest(arg->u.sids, sids, nsids) )
         rv = -EFAULT;
 
     xfree(sids);
@@ -120,6 +133,8 @@ static int flask_security_user(struct xen_flask_userlist *arg)
     xfree(user);
     return rv;
 }
+
+#ifndef COMPAT
 
 static int flask_security_relabel(struct xen_flask_transition *arg)
 {
@@ -201,6 +216,8 @@ static int flask_security_setenforce(struct xen_flask_setenforce *arg)
     return 0;
 }
 
+#endif /* COMPAT */
+
 static int flask_security_context(struct xen_flask_sid_context *arg)
 {
     int rv;
@@ -210,7 +227,7 @@ static int flask_security_context(struct xen_flask_sid_context *arg)
     if ( rv )
         return rv;
 
-    rv = flask_copyin_string(arg->context, &buf, arg->size);
+    rv = flask_copyin_string(arg->context, &buf, arg->size, PAGE_SIZE);
     if ( rv )
         return rv;
 
@@ -245,7 +262,7 @@ static int flask_security_sid(struct xen_flask_sid_context *arg)
 
     arg->size = len;
 
-    if ( !rv && copy_to_guest(arg->context, context, len) )
+    if ( !rv && _copy_to_guest(arg->context, context, len) )
         rv = -EFAULT;
 
     xfree(context);
@@ -253,7 +270,9 @@ static int flask_security_sid(struct xen_flask_sid_context *arg)
     return rv;
 }
 
-int flask_disable(void)
+#ifndef COMPAT
+
+static int flask_disable(void)
 {
     static int flask_disabled = 0;
 
@@ -295,6 +314,8 @@ static int flask_security_setavc_threshold(struct xen_flask_setavc_threshold *ar
     return rv;
 }
 
+#endif /* COMPAT */
+
 static int flask_security_resolve_bool(struct xen_flask_boolean *arg)
 {
     char *name;
@@ -303,7 +324,7 @@ static int flask_security_resolve_bool(struct xen_flask_boolean *arg)
     if ( arg->bool_id != -1 )
         return 0;
 
-    rv = flask_copyin_string(arg->name, &name, arg->size);
+    rv = flask_copyin_string(arg->name, &name, arg->size, bool_maxstr);
     if ( rv )
         return rv;
 
@@ -319,11 +340,11 @@ static int flask_security_set_bool(struct xen_flask_boolean *arg)
 {
     int rv;
 
-    rv = flask_security_resolve_bool(arg);
+    rv = domain_has_security(current->domain, SECURITY__SETBOOL);
     if ( rv )
         return rv;
 
-    rv = domain_has_security(current->domain, SECURITY__SETBOOL);
+    rv = flask_security_resolve_bool(arg);
     if ( rv )
         return rv;
 
@@ -334,12 +355,13 @@ static int flask_security_set_bool(struct xen_flask_boolean *arg)
         int num;
         int *values;
 
-        rv = security_get_bools(&num, NULL, &values);
+        rv = security_get_bools(&num, NULL, &values, NULL);
         if ( rv != 0 )
             goto out;
 
         if ( arg->bool_id >= num )
         {
+            xfree(values);
             rv = -ENOENT;
             goto out;
         }
@@ -356,9 +378,10 @@ static int flask_security_set_bool(struct xen_flask_boolean *arg)
     else
     {
         if ( !bool_pending_values )
-            flask_security_make_bools();
-
-        if ( arg->bool_id >= bool_num )
+            rv = flask_security_make_bools();
+        if ( !rv && arg->bool_id >= bool_num )
+            rv = -ENOENT;
+        if ( rv )
             goto out;
 
         bool_pending_values[arg->bool_id] = !!(arg->new_value);
@@ -368,24 +391,6 @@ static int flask_security_set_bool(struct xen_flask_boolean *arg)
         rv = 0;
     }
 
- out:
-    spin_unlock(&sel_sem);
-    return rv;
-}
-
-static int flask_security_commit_bools(void)
-{
-    int rv;
-
-    spin_lock(&sel_sem);
-
-    rv = domain_has_security(current->domain, SECURITY__SETBOOL);
-    if ( rv )
-        goto out;
-
-    if ( bool_pending_values )
-        rv = security_set_bools(bool_num, bool_pending_values);
-    
  out:
     spin_unlock(&sel_sem);
     return rv;
@@ -422,10 +427,30 @@ static int flask_security_get_bool(struct xen_flask_boolean *arg)
             rv = -ERANGE;
         arg->size = nameout_len;
  
-        if ( !rv && copy_to_guest(arg->name, nameout, nameout_len) )
+        if ( !rv && _copy_to_guest(arg->name, nameout, nameout_len) )
             rv = -EFAULT;
         xfree(nameout);
     }
+
+ out:
+    spin_unlock(&sel_sem);
+    return rv;
+}
+
+#ifndef COMPAT
+
+static int flask_security_commit_bools(void)
+{
+    int rv;
+
+    spin_lock(&sel_sem);
+
+    rv = domain_has_security(current->domain, SECURITY__SETBOOL);
+    if ( rv )
+        goto out;
+
+    if ( bool_pending_values )
+        rv = security_set_bools(bool_num, bool_pending_values);
 
  out:
     spin_unlock(&sel_sem);
@@ -440,7 +465,7 @@ static int flask_security_make_bools(void)
     
     xfree(bool_pending_values);
     
-    ret = security_get_bools(&num, NULL, &values);
+    ret = security_get_bools(&num, NULL, &values, &bool_maxstr);
     if ( ret != 0 )
         goto out;
 
@@ -457,7 +482,7 @@ static int flask_security_avc_cachestats(struct xen_flask_cache_stats *arg)
 {
     struct avc_cache_stats *st;
 
-    if ( arg->cpu > nr_cpu_ids )
+    if ( arg->cpu >= nr_cpu_ids )
         return -ENOENT;
     if ( !cpu_online(arg->cpu) )
         return -ENOENT;
@@ -475,6 +500,7 @@ static int flask_security_avc_cachestats(struct xen_flask_cache_stats *arg)
 }
 
 #endif
+#endif /* COMPAT */
 
 static int flask_security_load(struct xen_flask_load *load)
 {
@@ -492,7 +518,7 @@ static int flask_security_load(struct xen_flask_load *load)
     if ( !buf )
         return -ENOMEM;
 
-    if ( copy_from_guest(buf, load->buffer, load->size) )
+    if ( _copy_from_guest(buf, load->buffer, load->size) )
     {
         ret = -EFAULT;
         goto out_free;
@@ -514,6 +540,8 @@ static int flask_security_load(struct xen_flask_load *load)
     xfree(buf);
     return ret;
 }
+
+#ifndef COMPAT
 
 static int flask_ocontext_del(struct xen_flask_ocontext *arg)
 {
@@ -612,13 +640,24 @@ static int flask_relabel_domain(struct xen_flask_relabel *arg)
         goto out;
 
     dsec->sid = arg->sid;
+    dsec->self_sid = arg->sid;
+    security_transition_sid(dsec->sid, dsec->sid, SECCLASS_DOMAIN,
+                            &dsec->self_sid);
+    if ( d->target )
+    {
+        struct domain_security_struct *tsec = d->target->ssid;
+        security_transition_sid(tsec->sid, dsec->sid, SECCLASS_DOMAIN,
+                                &dsec->target_sid);
+    }
 
  out:
     rcu_unlock_domain(d);
     return rc;
 }
 
-long do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op)
+#endif /* !COMPAT */
+
+ret_t do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op)
 {
     xen_flask_op_t op;
     int rv;
@@ -745,3 +784,52 @@ long do_flask_op(XEN_GUEST_HANDLE_PARAM(xsm_op_t) u_flask_op)
  out:
     return rv;
 }
+
+#if defined(CONFIG_COMPAT) && !defined(COMPAT)
+#undef _copy_to_guest
+#define _copy_to_guest copy_to_compat
+#undef _copy_from_guest
+#define _copy_from_guest copy_from_compat
+
+#include <compat/event_channel.h>
+#include <compat/xsm/flask_op.h>
+
+CHECK_flask_access;
+CHECK_flask_cache_stats;
+CHECK_flask_hash_stats;
+CHECK_flask_ocontext;
+CHECK_flask_peersid;
+CHECK_flask_relabel;
+CHECK_flask_setavc_threshold;
+CHECK_flask_setenforce;
+CHECK_flask_transition;
+
+#define COMPAT
+#define flask_copyin_string(ch, pb, sz, mx) ({ \
+	XEN_GUEST_HANDLE_PARAM(char) gh; \
+	guest_from_compat_handle(gh, ch); \
+	flask_copyin_string(gh, pb, sz, mx); \
+})
+
+#define xen_flask_load compat_flask_load
+#define flask_security_load compat_security_load
+
+#define xen_flask_userlist compat_flask_userlist
+#define flask_security_user compat_security_user
+
+#define xen_flask_sid_context compat_flask_sid_context
+#define flask_security_context compat_security_context
+#define flask_security_sid compat_security_sid
+
+#define xen_flask_boolean compat_flask_boolean
+#define flask_security_resolve_bool compat_security_resolve_bool
+#define flask_security_get_bool compat_security_get_bool
+#define flask_security_set_bool compat_security_set_bool
+
+#define xen_flask_op_t compat_flask_op_t
+#undef ret_t
+#define ret_t int
+#define do_flask_op compat_flask_op
+
+#include "flask_op.c"
+#endif

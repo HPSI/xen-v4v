@@ -34,7 +34,7 @@
 #include "xen.h"
 #include "domctl.h"
 
-#define XEN_SYSCTL_INTERFACE_VERSION 0x00000009
+#define XEN_SYSCTL_INTERFACE_VERSION 0x0000000B
 
 /*
  * Read console content from Xen buffer ring.
@@ -71,7 +71,7 @@ struct xen_sysctl_tbuf_op {
 #define XEN_SYSCTL_TBUFOP_disable      5
     uint32_t cmd;
     /* IN/OUT variables */
-    struct xenctl_cpumap cpu_mask;
+    struct xenctl_bitmap cpu_mask;
     uint32_t             evt_mask;
     /* OUT variables */
     uint64_aligned_t buffer_mfn;
@@ -101,6 +101,7 @@ struct xen_sysctl_physinfo {
     uint64_aligned_t total_pages;
     uint64_aligned_t free_pages;
     uint64_aligned_t scrub_pages;
+    uint64_aligned_t outstanding_pages;
     uint32_t hw_cap[8];
 
     /* XEN_SYSCTL_PHYSCAP_??? */
@@ -225,13 +226,17 @@ struct pm_cx_stat {
     uint64_aligned_t idle_time;                 /* idle time from boot */
     XEN_GUEST_HANDLE_64(uint64) triggers;    /* Cx trigger counts */
     XEN_GUEST_HANDLE_64(uint64) residencies; /* Cx residencies */
-    uint64_aligned_t pc2;
-    uint64_aligned_t pc3;
-    uint64_aligned_t pc6;
-    uint64_aligned_t pc7;
-    uint64_aligned_t cc3;
-    uint64_aligned_t cc6;
-    uint64_aligned_t cc7;
+    uint32_t nr_pc;                          /* entry nr in pc[] */
+    uint32_t nr_cc;                          /* entry nr in cc[] */
+    /*
+     * These two arrays may (and generally will) have unused slots; slots not
+     * having a corresponding hardware register will not be written by the
+     * hypervisor. It is therefore up to the caller to put a suitable sentinel
+     * into all slots before invoking the function.
+     * Indexing is 1-biased (PC1/CC1 being at index 0).
+     */
+    XEN_GUEST_HANDLE_64(uint64) pc;
+    XEN_GUEST_HANDLE_64(uint64) cc;
 };
 
 struct xen_sysctl_get_pmstat {
@@ -532,7 +537,7 @@ struct xen_sysctl_cpupool_op {
     uint32_t domid;       /* IN: M              */
     uint32_t cpu;         /* IN: AR             */
     uint32_t n_dom;       /*            OUT: I  */
-    struct xenctl_cpumap cpumap; /*     OUT: IF */
+    struct xenctl_bitmap cpumap; /*     OUT: IF */
 };
 typedef struct xen_sysctl_cpupool_op xen_sysctl_cpupool_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_sysctl_cpupool_op_t);
@@ -596,6 +601,42 @@ struct xen_sysctl_scheduler_op {
 typedef struct xen_sysctl_scheduler_op xen_sysctl_scheduler_op_t;
 DEFINE_XEN_GUEST_HANDLE(xen_sysctl_scheduler_op_t);
 
+/* XEN_SYSCTL_coverage_op */
+/*
+ * Get total size of information, to help allocate
+ * the buffer. The pointer points to a 32 bit value.
+ */
+#define XEN_SYSCTL_COVERAGE_get_total_size 0
+
+/*
+ * Read coverage information in a single run
+ * You must use a tool to split them.
+ */
+#define XEN_SYSCTL_COVERAGE_read           1
+
+/*
+ * Reset all the coverage counters to 0
+ * No parameters.
+ */
+#define XEN_SYSCTL_COVERAGE_reset          2
+
+/*
+ * Like XEN_SYSCTL_COVERAGE_read but reset also
+ * counters to 0 in a single call.
+ */
+#define XEN_SYSCTL_COVERAGE_read_and_reset 3
+
+struct xen_sysctl_coverage_op {
+    uint32_t cmd;        /* XEN_SYSCTL_COVERAGE_* */
+    union {
+        uint32_t total_size; /* OUT */
+        XEN_GUEST_HANDLE_64(uint8)  raw_info;   /* OUT */
+    } u;
+};
+typedef struct xen_sysctl_coverage_op xen_sysctl_coverage_op_t;
+DEFINE_XEN_GUEST_HANDLE(xen_sysctl_coverage_op_t);
+
+
 struct xen_sysctl {
     uint32_t cmd;
 #define XEN_SYSCTL_readconsole                    1
@@ -616,6 +657,7 @@ struct xen_sysctl {
 #define XEN_SYSCTL_numainfo                      17
 #define XEN_SYSCTL_cpupool_op                    18
 #define XEN_SYSCTL_scheduler_op                  19
+#define XEN_SYSCTL_coverage_op                   20
     uint32_t interface_version; /* XEN_SYSCTL_INTERFACE_VERSION */
     union {
         struct xen_sysctl_readconsole       readconsole;
@@ -636,6 +678,7 @@ struct xen_sysctl {
         struct xen_sysctl_lockprof_op       lockprof_op;
         struct xen_sysctl_cpupool_op        cpupool_op;
         struct xen_sysctl_scheduler_op      scheduler_op;
+        struct xen_sysctl_coverage_op       coverage_op;
         uint8_t                             pad[128];
     } u;
 };
@@ -647,7 +690,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_sysctl_t);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

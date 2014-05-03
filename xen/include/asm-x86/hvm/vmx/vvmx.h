@@ -23,17 +23,40 @@
 #ifndef __ASM_X86_HVM_VVMX_H__
 #define __ASM_X86_HVM_VVMX_H__
 
+struct vvmcs_list {
+    unsigned long vvmcs_mfn;
+    struct list_head node;
+};
+
 struct nestedvmx {
     paddr_t    vmxon_region_pa;
     void       *iobitmap[2];		/* map (va) of L1 guest I/O bitmap */
+    void       *msrbitmap;		/* map (va) of L1 guest MSR bitmap */
     /* deferred nested interrupt */
     struct {
         unsigned long intr_info;
         u32           error_code;
+        u8            source;
     } intr;
+    struct {
+        bool_t   enabled;
+        uint32_t exit_reason;
+        uint32_t exit_qual;
+    } ept;
+    uint32_t guest_vpid;
+    struct list_head launched_list;
 };
 
 #define vcpu_2_nvmx(v)	(vcpu_nestedhvm(v).u.nvmx)
+
+/* bit 1, 2, 4 must be 1 */
+#define VMX_PINBASED_CTLS_DEFAULT1	0x16
+/* bit 1, 4-6,8,13-16,26 must be 1 */
+#define VMX_PROCBASED_CTLS_DEFAULT1	0x401e172
+/* bit 0-8, 10,11,13,14,16,17 must be 1 */
+#define VMX_EXIT_CTLS_DEFAULT1		0x36dff
+/* bit 0-8, and 12 must be 1 */
+#define VMX_ENTRY_CTLS_DEFAULT1		0x11ff
 
 /*
  * Encode of VMX instructions base on Table 24-11 & 24-12 of SDM 3B
@@ -89,15 +112,27 @@ int nvmx_vcpu_initialise(struct vcpu *v);
 void nvmx_vcpu_destroy(struct vcpu *v);
 int nvmx_vcpu_reset(struct vcpu *v);
 uint64_t nvmx_vcpu_guestcr3(struct vcpu *v);
-uint64_t nvmx_vcpu_hostcr3(struct vcpu *v);
+uint64_t nvmx_vcpu_eptp_base(struct vcpu *v);
 uint32_t nvmx_vcpu_asid(struct vcpu *v);
 enum hvm_intblk nvmx_intr_blocked(struct vcpu *v);
 int nvmx_intercepts_exception(struct vcpu *v, 
                               unsigned int trap, int error_code);
 void nvmx_domain_relinquish_resources(struct domain *d);
 
+bool_t nvmx_ept_enabled(struct vcpu *v);
+
 int nvmx_handle_vmxon(struct cpu_user_regs *regs);
 int nvmx_handle_vmxoff(struct cpu_user_regs *regs);
+
+#define EPT_TRANSLATE_SUCCEED       0
+#define EPT_TRANSLATE_VIOLATION     1
+#define EPT_TRANSLATE_MISCONFIG     2
+#define EPT_TRANSLATE_RETRY         3
+
+int
+nvmx_hap_walk_L1_p2m(struct vcpu *v, paddr_t L2_gpa, paddr_t *L1_gpa,
+                     unsigned int *page_order, uint8_t *p2m_acc,
+                     bool_t access_r, bool_t access_w, bool_t access_x);
 /*
  * Virtual VMCS layout
  *
@@ -117,8 +152,6 @@ int nvmx_handle_vmxoff(struct cpu_user_regs *regs);
  * lower range to non-indexed field like VMCS revision.
  *
  */
-
-#define VVMCS_REVISION 0x40000001u
 
 struct vvmcs_header {
     u32 revision;
@@ -151,8 +184,20 @@ enum vvmcs_encoding_type {
     VVMCS_TYPE_HSTATE,
 };
 
-u64 __get_vvmcs(void *vvmcs, u32 vmcs_encoding);
-void __set_vvmcs(void *vvmcs, u32 vmcs_encoding, u64 val);
+u64 __get_vvmcs_virtual(void *vvmcs, u32 vmcs_encoding);
+u64 __get_vvmcs_real(void *vvmcs, u32 vmcs_encoding);
+void __set_vvmcs_virtual(void *vvmcs, u32 vmcs_encoding, u64 val);
+void __set_vvmcs_real(void *vvmcs, u32 vmcs_encoding, u64 val);
+
+#define __get_vvmcs(_vvmcs, _vmcs_encoding) \
+  (cpu_has_vmx_vmcs_shadowing ? __get_vvmcs_real(_vvmcs, _vmcs_encoding) \
+                              : __get_vvmcs_virtual(_vvmcs, _vmcs_encoding))
+
+#define __set_vvmcs(_vvmcs, _vmcs_encoding, _val) \
+  (cpu_has_vmx_vmcs_shadowing ? __set_vvmcs_real(_vvmcs, _vmcs_encoding, _val) \
+                              : __set_vvmcs_virtual(_vvmcs, _vmcs_encoding, _val))
+
+uint64_t get_shadow_eptp(struct vcpu *v);
 
 void nvmx_destroy_vmcs(struct vcpu *v);
 int nvmx_handle_vmptrld(struct cpu_user_regs *regs);
@@ -162,6 +207,8 @@ int nvmx_handle_vmread(struct cpu_user_regs *regs);
 int nvmx_handle_vmwrite(struct cpu_user_regs *regs);
 int nvmx_handle_vmresume(struct cpu_user_regs *regs);
 int nvmx_handle_vmlaunch(struct cpu_user_regs *regs);
+int nvmx_handle_invept(struct cpu_user_regs *regs);
+int nvmx_handle_invvpid(struct cpu_user_regs *regs);
 int nvmx_msr_read_intercept(unsigned int msr,
                                 u64 *msr_content);
 int nvmx_msr_write_intercept(unsigned int msr,
@@ -176,6 +223,15 @@ void nvmx_idtv_handling(void);
 u64 nvmx_get_tsc_offset(struct vcpu *v);
 int nvmx_n2_vmexit_handler(struct cpu_user_regs *regs,
                           unsigned int exit_reason);
+void nvmx_set_cr_read_shadow(struct vcpu *v, unsigned int cr);
 
+uint64_t nept_get_ept_vpid_cap(void);
+
+int nept_translate_l2ga(struct vcpu *v, paddr_t l2ga,
+                        unsigned int *page_order, uint32_t rwx_acc,
+                        unsigned long *l1gfn, uint8_t *p2m_acc,
+                        uint64_t *exit_qual, uint32_t *exit_reason);
+int nvmx_cpu_up_prepare(unsigned int cpu);
+void nvmx_cpu_dead(unsigned int cpu);
 #endif /* __ASM_X86_HVM_VVMX_H__ */
 

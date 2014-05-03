@@ -1,8 +1,10 @@
 ########################################
 # x86-specific definitions
 
+HAS_IOPORTS := y
 HAS_ACPI := y
 HAS_VGA  := y
+HAS_VIDEO  := y
 HAS_CPUFREQ := y
 HAS_PCI := y
 HAS_PASSTHROUGH := y
@@ -18,14 +20,6 @@ xenoprof := y
 #
 supervisor_mode_kernel ?= n
 
-# Solaris grabs stdarg.h and friends from the system include directory.
-# Clang likewise.
-ifneq ($(XEN_OS),SunOS)
-CFLAGS-$(gcc) += -nostdinc
-endif
-
-CFLAGS += -fno-builtin -fno-common -Wredundant-decls
-CFLAGS += -iwithprefix include -Werror -Wno-pointer-arith -pipe
 CFLAGS += -I$(BASEDIR)/include 
 CFLAGS += -I$(BASEDIR)/include/asm-x86/mach-generic
 CFLAGS += -I$(BASEDIR)/include/asm-x86/mach-default
@@ -35,6 +29,9 @@ CFLAGS += -msoft-float
 
 $(call cc-options-add,CFLAGS,CC,$(EMBEDDED_EXTRA_CFLAGS))
 $(call cc-option-add,CFLAGS,CC,-Wnested-externs)
+$(call as-insn-check,CFLAGS,CC,"vmcall",-DHAVE_GAS_VMX)
+$(call as-insn-check,CFLAGS,CC,"invept (%rax)$$(comma)%rax",-DHAVE_GAS_EPT)
+$(call as-insn-check,CFLAGS,CC,"rdfsbase %rax",-DHAVE_GAS_FSGSBASE)
 
 ifeq ($(supervisor_mode_kernel),y)
 CFLAGS += -DCONFIG_X86_SUPERVISOR_MODE_KERNEL=1

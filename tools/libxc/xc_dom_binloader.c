@@ -123,10 +123,13 @@ static struct xen_bin_image_table *find_table(struct xc_dom_image *dom)
     uint32_t *probe_ptr;
     uint32_t *probe_end;
 
+    if ( dom->kernel_size < sizeof(*table) )
+        return NULL;
     probe_ptr = dom->kernel_blob;
-    probe_end = dom->kernel_blob + dom->kernel_size - sizeof(*table);
-    if ( (void*)probe_end > (dom->kernel_blob + 8192) )
+    if ( dom->kernel_size > (8192 + sizeof(*table)) )
         probe_end = dom->kernel_blob + 8192;
+    else
+        probe_end = dom->kernel_blob + dom->kernel_size - sizeof(*table);
 
     for ( table = NULL; probe_ptr < probe_end; probe_ptr++ )
     {
@@ -249,6 +252,7 @@ static int xc_dom_load_bin_kernel(struct xc_dom_image *dom)
     char *image = dom->kernel_blob;
     char *dest;
     size_t image_size = dom->kernel_size;
+    size_t dest_size;
     uint32_t start_addr;
     uint32_t load_end_addr;
     uint32_t bss_end_addr;
@@ -272,7 +276,29 @@ static int xc_dom_load_bin_kernel(struct xc_dom_image *dom)
     DOMPRINTF("  text_size: 0x%" PRIx32 "", text_size);
     DOMPRINTF("  bss_size:  0x%" PRIx32 "", bss_size);
 
-    dest = xc_dom_vaddr_to_ptr(dom, dom->kernel_seg.vstart);
+    dest = xc_dom_vaddr_to_ptr(dom, dom->kernel_seg.vstart, &dest_size);
+    if ( dest == NULL )
+    {
+        DOMPRINTF("%s: xc_dom_vaddr_to_ptr(dom, dom->kernel_seg.vstart)"
+                  " => NULL", __FUNCTION__);
+        return -EINVAL;
+    }
+
+    if ( dest_size < text_size ||
+         dest_size - text_size < bss_size )
+    {
+        DOMPRINTF("%s: mapped region is too small for image", __FUNCTION__);
+        return -EINVAL;
+    }
+
+    if ( image_size < skip ||
+         image_size - skip < text_size )
+    {
+        DOMPRINTF("%s: image is too small for declared text size",
+                  __FUNCTION__);
+        return -EINVAL;
+    }
+
     memcpy(dest, image + skip, text_size);
     memset(dest + text_size, 0, bss_size);
 
@@ -296,7 +322,7 @@ static void __init register_loader(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

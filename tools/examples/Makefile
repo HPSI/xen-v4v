@@ -1,30 +1,16 @@
 XEN_ROOT = $(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
-# Init scripts.
-XEND_INITD = init.d/xend
-XENDOMAINS_INITD = init.d/xendomains
-XENDOMAINS_SYSCONFIG = init.d/sysconfig.xendomains
-
 # Xen configuration dir and configs to go there.
 XEN_READMES = README
 XEN_READMES += README.incompatibilities
-XEN_CONFIGS = xend-config.sxp
-XEN_CONFIGS += xm-config.xml
-XEN_CONFIGS += xmexample1 
-XEN_CONFIGS += xmexample2
-XEN_CONFIGS += xmexample3
-XEN_CONFIGS += xmexample.hvm
-XEN_CONFIGS += xmexample.hvm-stubdom
-XEN_CONFIGS += xmexample.pv-grub
-XEN_CONFIGS += xmexample.nbd
-XEN_CONFIGS += xmexample.vti
+
 XEN_CONFIGS += xlexample.hvm
 XEN_CONFIGS += xlexample.pvlinux
-XEN_CONFIGS += xend-pci-quirks.sxp
-XEN_CONFIGS += xend-pci-permissive.sxp
 XEN_CONFIGS += xl.conf
 XEN_CONFIGS += cpupool
+
+XEN_CONFIGS += $(XEN_CONFIGS-y)
 
 .PHONY: all
 all:

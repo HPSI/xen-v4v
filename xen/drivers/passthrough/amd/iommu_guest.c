@@ -424,12 +424,17 @@ static int do_invalidate_dte(struct domain *d, cmd_entry_t *cmd)
                                         sizeof(dev_entry_t), gbdf);
     ASSERT(mfn_valid(dte_mfn));
 
+    /* Read guest dte information */
     dte_base = map_domain_page(dte_mfn);
 
     gdte = dte_base + gbdf % (PAGE_SIZE / sizeof(dev_entry_t));
 
     gdom_id  = get_domid_from_dte(gdte);
     gcr3_gfn = get_guest_cr3_from_dte(gdte);
+    glx      = get_glx_from_dte(gdte);
+    gv       = get_gv_from_dte(gdte);
+
+    unmap_domain_page(dte_base);
 
     /* Do not update host dte before gcr3 has been set */
     if ( gcr3_gfn == 0 )
@@ -440,7 +445,6 @@ static int do_invalidate_dte(struct domain *d, cmd_entry_t *cmd)
 
     ASSERT(mfn_valid(gcr3_mfn));
 
-    /* Read guest dte information */
     iommu = find_iommu_for_device(0, mbdf);
     if ( !iommu )
     {
@@ -448,11 +452,6 @@ static int do_invalidate_dte(struct domain *d, cmd_entry_t *cmd)
                         __func__, mbdf);
         return -ENODEV;
     }
-
-    glx = get_glx_from_dte(gdte);
-    gv = get_gv_from_dte(gdte);
-
-    unmap_domain_page(dte_base);
 
     /* Setup host device entry */
     hdom_id = host_domid(d, gdom_id);
@@ -728,6 +727,7 @@ static void guest_iommu_mmio_write64(struct guest_iommu *iommu,
         break;
     case IOMMU_EVENT_LOG_BASE_LOW_OFFSET:
         u64_to_reg(&iommu->event_log.reg_base, val);
+        break;
     case IOMMU_PPR_LOG_BASE_LOW_OFFSET:
         u64_to_reg(&iommu->ppr_log.reg_base, val);
         break;
@@ -754,7 +754,14 @@ static void guest_iommu_mmio_write64(struct guest_iommu *iommu,
         u64_to_reg(&iommu->ppr_log.reg_tail, val);
         break;
     case IOMMU_STATUS_MMIO_OFFSET:
-        u64_to_reg(&iommu->reg_status, val);
+        val &= IOMMU_STATUS_EVENT_OVERFLOW_MASK |
+               IOMMU_STATUS_EVENT_LOG_INT_MASK |
+               IOMMU_STATUS_COMP_WAIT_INT_MASK |
+               IOMMU_STATUS_PPR_LOG_OVERFLOW_MASK |
+               IOMMU_STATUS_PPR_LOG_INT_MASK |
+               IOMMU_STATUS_GAPIC_LOG_OVERFLOW_MASK |
+               IOMMU_STATUS_GAPIC_LOG_INT_MASK;
+        u64_to_reg(&iommu->reg_status, reg_to_u64(iommu->reg_status) & ~val);
         break;
 
     default:

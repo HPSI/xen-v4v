@@ -449,7 +449,7 @@ v4v_ringbuf_get_rx_ptr(struct domain *d, struct v4v_ring_info *ring_info,
     write_atomic(rx_ptr, ringp->rx_ptr);
     mb();
 
-    unmap_domain_page(mfn_x(ring_info->mfns[0]));
+    unmap_domain_page((void*)mfn_x(ring_info->mfns[0]));
     return 0;
 }
 
@@ -1782,8 +1782,6 @@ do_v4v_op(int cmd, XEN_GUEST_HANDLE(void) arg1,
                 XEN_GUEST_HANDLE(v4vtables_rule_t) rule_hnd =
                     guest_handle_cast(arg1, v4vtables_rule_t);
                 rc = -EPERM;
-                if ( !IS_PRIV(d) )
-                    goto out;
 
                 write_lock(&v4vtables_rules_lock);
                 rc = v4vtables_add(d, rule_hnd, position);
@@ -1796,8 +1794,6 @@ do_v4v_op(int cmd, XEN_GUEST_HANDLE(void) arg1,
                 XEN_GUEST_HANDLE(v4vtables_rule_t) rule_hnd =
                     guest_handle_cast(arg1, v4vtables_rule_t);
                 rc = -EPERM;
-                if ( !IS_PRIV(d) )
-                    goto out;
 
                 write_lock(&v4vtables_rules_lock);
                 rc = v4vtables_del(d, rule_hnd, position);
@@ -1809,8 +1805,6 @@ do_v4v_op(int cmd, XEN_GUEST_HANDLE(void) arg1,
                 XEN_GUEST_HANDLE(v4vtables_list_t) rules_list_hnd =
                     guest_handle_cast(arg1, v4vtables_list_t);
                 rc = -EPERM;
-                if ( !IS_PRIV(d) )
-                    goto out;
 
                 read_lock(&v4vtables_rules_lock);
                 rc = v4vtables_list(d, rules_list_hnd);
@@ -1887,7 +1881,7 @@ v4v_init(struct domain *d)
     if ( !v4v )
         return -ENOMEM;
 
-    rc = evtchn_alloc_unbound_domain(d, &port, d->domain_id);
+    rc = evtchn_alloc_unbound_domain(d, &port, d->domain_id, 0);
     if ( rc )
         return rc;
 

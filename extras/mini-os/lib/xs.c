@@ -29,9 +29,12 @@ struct xs_handle *xs_daemon_open()
 void xs_daemon_close(struct xs_handle *h)
 {
     int fd = _xs_fileno(h);
-    struct xenbus_event *event;
-    for (event = files[fd].xenbus.events; event; event = event->next)
+    struct xenbus_event *event, *next;
+    for (event = files[fd].xenbus.events; event; event = next)
+    {
+        next = event->next;
         free(event);
+    }
     files[fd].type = FTYPE_NONE;
 }
 
@@ -141,6 +144,7 @@ char **xs_directory(struct xs_handle *h, xs_transaction_t t,
     msg = xenbus_ls(t, path, &res);
     if (msg) {
 	printk("xs_directory(%s): %s\n", path, msg);
+	free(msg);
 	return NULL;
     }
 
@@ -160,6 +164,7 @@ char **xs_directory(struct xs_handle *h, xs_transaction_t t,
     }
 
     *num = n;
+    free(res);
     return entries;
 }
 

@@ -4,6 +4,7 @@
 #include <xen/sched.h>
 #include <xen/domain.h>
 #include <xen/delay.h>
+#include <xen/watchdog.h>
 #include <xen/shutdown.h>
 #include <xen/console.h>
 #ifdef CONFIG_KEXEC
@@ -16,7 +17,7 @@
 bool_t __read_mostly opt_noreboot;
 boolean_param("noreboot", opt_noreboot);
 
-static void maybe_reboot(void)
+static void noreturn maybe_reboot(void)
 {
     if ( opt_noreboot )
     {
@@ -31,7 +32,7 @@ static void maybe_reboot(void)
     }
 }
 
-void dom0_shutdown(u8 reason)
+void hwdom_shutdown(u8 reason)
 {
     switch ( reason )
     {
@@ -46,6 +47,9 @@ void dom0_shutdown(u8 reason)
     {
         debugger_trap_immediate();
         printk("Domain 0 crashed: ");
+#ifdef CONFIG_KEXEC
+        kexec_crash();
+#endif
         maybe_reboot();
         break; /* not reached */
     }

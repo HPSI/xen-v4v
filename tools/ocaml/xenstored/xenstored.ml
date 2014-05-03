@@ -50,9 +50,10 @@ let process_connection_fds store cons domains rset wset =
 
 let process_domains store cons domains =
 	let do_io_domain domain =
-		let con = Connections.find_domain cons (Domain.get_id domain) in
-		Process.do_input store cons domains con;
-		Process.do_output store cons domains con in
+		if not (Domain.is_bad_domain domain) then
+			let con = Connections.find_domain cons (Domain.get_id domain) in
+				Process.do_input store cons domains con;
+				Process.do_output store cons domains con in
 	Domains.iter domains do_io_domain
 
 let sigusr1_handler store =
@@ -87,13 +88,13 @@ let parse_config filename =
 		("quota-maxsize", Config.Set_int Quota.maxsize);
 		("test-eagain", Config.Set_bool Transaction.test_eagain);
 		("persistent", Config.Set_bool Disk.enable);
-		("xenstored-log-file", Config.Set_string Logging.xenstored_log_file);
+		("xenstored-log-file", Config.String Logging.set_xenstored_log_destination);
 		("xenstored-log-level", Config.String
 			(fun s -> Logging.xenstored_log_level := Logging.level_of_string s));
 		("xenstored-log-nb-files", Config.Set_int Logging.xenstored_log_nb_files);
 		("xenstored-log-nb-lines", Config.Set_int Logging.xenstored_log_nb_lines);
 		("xenstored-log-nb-chars", Config.Set_int Logging.xenstored_log_nb_chars);
-		("access-log-file", Config.Set_string Logging.access_log_file);
+		("access-log-file", Config.String Logging.set_access_log_destination);
 		("access-log-nb-files", Config.Set_int Logging.access_log_nb_files);
 		("access-log-nb-lines", Config.Set_int Logging.access_log_nb_lines);
 		("access-log-nb-chars", Config.Set_int Logging.access_log_nb_chars);
@@ -300,7 +301,7 @@ let _ =
 		and handle_eventchn fd =
 			let port = Event.pending eventchn in
 			finally (fun () ->
-				if port = eventchn.Event.virq_port then (
+				if Some port = eventchn.Event.virq_port then (
 					let (notify, deaddom) = Domains.cleanup xc domains in
 					List.iter (Connections.del_domain cons) deaddom;
 					if deaddom <> [] || notify then

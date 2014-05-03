@@ -63,10 +63,17 @@ dbg_hvm_va2mfn(dbgva_t vaddr, struct domain *dp, int toaddr,
     if ( p2m_is_readonly(gfntype) && toaddr )
     {
         DBGP2("kdb:p2m_is_readonly: gfntype:%x\n", gfntype);
-        return INVALID_MFN;
+        mfn = INVALID_MFN;
+    }
+    else
+        DBGP2("X: vaddr:%lx domid:%d mfn:%lx\n", vaddr, dp->domain_id, mfn);
+
+    if ( mfn == INVALID_MFN )
+    {
+        put_gfn(dp, *gfn);
+        *gfn = INVALID_GFN;
     }
 
-    DBGP2("X: vaddr:%lx domid:%d mfn:%lx\n", vaddr, dp->domain_id, mfn);
     return mfn;
 }
 
@@ -98,8 +105,9 @@ dbg_pv_va2mfn(dbgva_t vaddr, struct domain *dp, uint64_t pgd3val)
 
     if ( pgd3val == 0 )
     {
-        l4t = mfn_to_virt(mfn);
+        l4t = map_domain_page(mfn);
         l4e = l4t[l4_table_offset(vaddr)];
+        unmap_domain_page(l4t);
         mfn = l4e_get_pfn(l4e);
         DBGP2("l4t:%p l4to:%lx l4e:%lx mfn:%lx\n", l4t, 
               l4_table_offset(vaddr), l4e, mfn);
@@ -109,20 +117,23 @@ dbg_pv_va2mfn(dbgva_t vaddr, struct domain *dp, uint64_t pgd3val)
             return INVALID_MFN;
         }
 
-        l3t = mfn_to_virt(mfn);
+        l3t = map_domain_page(mfn);
         l3e = l3t[l3_table_offset(vaddr)];
+        unmap_domain_page(l3t);
         mfn = l3e_get_pfn(l3e);
         DBGP2("l3t:%p l3to:%lx l3e:%lx mfn:%lx\n", l3t, 
               l3_table_offset(vaddr), l3e, mfn);
-        if ( !(l3e_get_flags(l3e) & _PAGE_PRESENT) )
+        if ( !(l3e_get_flags(l3e) & _PAGE_PRESENT) ||
+             (l3e_get_flags(l3e) & _PAGE_PSE) )
         {
             DBGP1("l3 PAGE not present. vaddr:%lx cr3:%lx\n", vaddr, cr3);
             return INVALID_MFN;
         }
     }
 
-    l2t = mfn_to_virt(mfn);
+    l2t = map_domain_page(mfn);
     l2e = l2t[l2_table_offset(vaddr)];
+    unmap_domain_page(l2t);
     mfn = l2e_get_pfn(l2e);
     DBGP2("l2t:%p l2to:%lx l2e:%lx mfn:%lx\n", l2t, l2_table_offset(vaddr),
           l2e, mfn);
@@ -132,8 +143,9 @@ dbg_pv_va2mfn(dbgva_t vaddr, struct domain *dp, uint64_t pgd3val)
         DBGP1("l2 PAGE not present. vaddr:%lx cr3:%lx\n", vaddr, cr3);
         return INVALID_MFN;
     }
-    l1t = mfn_to_virt(mfn);
+    l1t = map_domain_page(mfn);
     l1e = l1t[l1_table_offset(vaddr)];
+    unmap_domain_page(l1t);
     mfn = l1e_get_pfn(l1e);
     DBGP2("l1t:%p l1to:%lx l1e:%lx mfn:%lx\n", l1t, l1_table_offset(vaddr),
           l1e, mfn);
@@ -153,7 +165,7 @@ dbg_rw_guest_mem(dbgva_t addr, dbgbyte_t *buf, int len, struct domain *dp,
 
         pagecnt = min_t(long, PAGE_SIZE - (addr & ~PAGE_MASK), len);
 
-        mfn = (dp->is_hvm
+        mfn = (has_hvm_container_domain(dp)
                ? dbg_hvm_va2mfn(addr, dp, toaddr, &gfn)
                : dbg_pv_va2mfn(addr, dp, pgd3));
         if ( mfn == INVALID_MFN ) 
@@ -218,3 +230,11 @@ dbg_rw_mem(dbgva_t addr, dbgbyte_t *buf, int len, domid_t domid, int toaddr,
     return len;
 }
 
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

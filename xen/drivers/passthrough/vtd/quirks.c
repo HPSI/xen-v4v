@@ -27,10 +27,12 @@
 #include <xen/softirq.h>
 #include <xen/time.h>
 #include <xen/pci.h>
+#include <xen/pci_ids.h>
 #include <xen/pci_regs.h>
 #include <xen/keyhandler.h>
 #include <asm/msi.h>
 #include <asm/irq.h>
+#include <asm/pci.h>
 #include <mach_apic.h>
 #include "iommu.h"
 #include "dmar.h"
@@ -47,7 +49,6 @@
 #define IS_CTG(id)    (id == 0x2a408086)
 #define IS_ILK(id)    (id == 0x00408086 || id == 0x00448086 || id== 0x00628086 || id == 0x006A8086)
 #define IS_CPT(id)    (id == 0x01008086 || id == 0x01048086)
-#define IS_SNB_GFX(id) (id == 0x01068086 || id == 0x01168086 || id == 0x01268086 || id == 0x01028086 || id == 0x01128086 || id == 0x01228086 || id == 0x010A8086)
 
 static u32 __read_mostly ioh_id;
 static u32 __initdata igd_id;
@@ -244,6 +245,29 @@ void vtd_ops_postamble_quirk(struct iommu* iommu)
     }
 }
 
+/* 5500/5520/X58 Chipset Interrupt remapping errata, for stepping B-3.
+ * Fixed in stepping C-2. */
+static void __init tylersburg_intremap_quirk(void)
+{
+    uint32_t bus, device;
+    uint8_t rev;
+
+    for ( bus = 0; bus < 0x100; bus++ )
+    {
+        /* Match on System Management Registers on Device 20 Function 0 */
+        device = pci_conf_read32(0, bus, 20, 0, PCI_VENDOR_ID);
+        rev = pci_conf_read8(0, bus, 20, 0, PCI_REVISION_ID);
+
+        if ( rev == 0x13 && device == 0x342e8086 )
+        {
+            printk(XENLOG_WARNING VTDPREFIX
+                   "Disabling IOMMU due to Intel 5500/5520/X58 Chipset errata #47, #53\n");
+            iommu_enable = 0;
+            break;
+        }
+    }
+}
+
 /* initialize platform identification flags */
 void __init platform_quirks_init(void)
 {
@@ -264,6 +288,10 @@ void __init platform_quirks_init(void)
 
     /* ioremap IGD MMIO+0x2000 page */
     map_igd_reg();
+
+    /* Tylersburg interrupt remap quirk */
+    if ( iommu_intremap )
+        tylersburg_intremap_quirk();
 }
 
 /*
@@ -288,7 +316,7 @@ static void map_me_phantom_function(struct domain *domain, u32 dev, int map)
     /* map or unmap ME phantom function */
     if ( map )
         domain_context_mapping_one(domain, drhd->iommu, 0,
-                                   PCI_DEVFN(dev, 7));
+                                   PCI_DEVFN(dev, 7), NULL);
     else
         domain_context_unmap_one(domain, drhd->iommu, 0,
                                  PCI_DEVFN(dev, 7));
@@ -357,18 +385,104 @@ void me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map)
  *   - This can cause system failure upon non-fatal VT-d faults
  *   - Potential security issue if malicious guest trigger VT-d faults
  */
-void __init pci_vtd_quirk(struct pci_dev *pdev)
+void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
 {
     int seg = pdev->seg;
     int bus = pdev->bus;
     int dev = PCI_SLOT(pdev->devfn);
     int func = PCI_FUNC(pdev->devfn);
-    int id, val;
+    int pos;
+    u32 val;
+    u64 bar;
+    paddr_t pa;
 
-    id = pci_conf_read32(seg, bus, dev, func, 0);
-    if ( id == 0x342e8086 || id == 0x3c288086 )
+    if ( pci_conf_read16(seg, bus, dev, func, PCI_VENDOR_ID) !=
+         PCI_VENDOR_ID_INTEL )
+        return;
+
+    switch ( pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID) )
     {
+    case 0x342e: /* Tylersburg chipset (Nehalem / Westmere systems) */
+    case 0x3c28: /* Sandybridge */
         val = pci_conf_read32(seg, bus, dev, func, 0x1AC);
         pci_conf_write32(seg, bus, dev, func, 0x1AC, val | (1 << 31));
+        break;
+
+    /* Tylersburg (EP)/Boxboro (MP) chipsets (NHM-EP/EX, WSM-EP/EX) */
+    case 0x3400 ... 0x3407: /* host bridges */
+    case 0x3408 ... 0x3411: case 0x3420 ... 0x3421: /* root ports */
+    /* JasperForest (Intel Xeon Processor C5500/C3500 */
+    case 0x3700 ... 0x370f: /* host bridges */
+    case 0x3720 ... 0x3724: /* root ports */
+    /* Sandybridge-EP (Romley) */
+    case 0x3c00: /* host bridge */
+    case 0x3c01 ... 0x3c0b: /* root ports */
+        pos = pci_find_ext_capability(seg, bus, pdev->devfn,
+                                      PCI_EXT_CAP_ID_ERR);
+        if ( !pos )
+        {
+            pos = pci_find_ext_capability(seg, bus, pdev->devfn,
+                                          PCI_EXT_CAP_ID_VNDR);
+            while ( pos )
+            {
+                val = pci_conf_read32(seg, bus, dev, func, pos + PCI_VNDR_HEADER);
+                if ( PCI_VNDR_HEADER_ID(val) == 4 && PCI_VNDR_HEADER_REV(val) == 1 )
+                {
+                    pos += PCI_VNDR_HEADER;
+                    break;
+                }
+                pos = pci_find_next_ext_capability(seg, bus, pdev->devfn, pos,
+                                                   PCI_EXT_CAP_ID_VNDR);
+            }
+        }
+        if ( !pos )
+        {
+            printk(XENLOG_WARNING "%04x:%02x:%02x.%u without AER capability?\n",
+                   seg, bus, dev, func);
+            break;
+        }
+
+        val = pci_conf_read32(seg, bus, dev, func, pos + PCI_ERR_UNCOR_MASK);
+        pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_UNCOR_MASK,
+                         val | PCI_ERR_UNC_UNSUP);
+        val = pci_conf_read32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK);
+        pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK,
+                         val | PCI_ERR_COR_ADV_NFAT);
+
+        /* XPUNCERRMSK Send Completion with Unsupported Request */
+        val = pci_conf_read32(seg, bus, dev, func, 0x20c);
+        pci_conf_write32(seg, bus, dev, func, 0x20c, val | (1 << 4));
+
+        printk(XENLOG_INFO "Masked UR signaling on %04x:%02x:%02x.%u\n",
+               seg, bus, dev, func);
+        break;
+
+    case 0x100: case 0x104: case 0x108: /* Sandybridge */
+    case 0x150: case 0x154: case 0x158: /* Ivybridge */
+    case 0xa04: /* Haswell ULT */
+    case 0xc00: case 0xc04: case 0xc08: /* Haswell */
+        bar = pci_conf_read32(seg, bus, dev, func, 0x6c);
+        bar = (bar << 32) | pci_conf_read32(seg, bus, dev, func, 0x68);
+        pa = bar & 0x7fffff000; /* bits 12...38 */
+        if ( (bar & 1) && pa &&
+             page_is_ram_type(paddr_to_pfn(pa), RAM_TYPE_RESERVED) )
+        {
+            u32 __iomem *va = ioremap(pa, PAGE_SIZE);
+
+            if ( va )
+            {
+                __set_bit(0x1c8 * 8 + 20, va);
+                iounmap(va);
+                printk(XENLOG_INFO "Masked UR signaling on %04x:%02x:%02x.%u\n",
+                       seg, bus, dev, func);
+            }
+            else
+                printk(XENLOG_ERR "Could not map %"PRIpaddr" for %04x:%02x:%02x.%u\n",
+                       pa, seg, bus, dev, func);
+        }
+        else
+            printk(XENLOG_WARNING "Bogus DMIBAR %#"PRIx64" on %04x:%02x:%02x.%u\n",
+                   bar, seg, bus, dev, func);
+        break;
     }
 }

@@ -22,8 +22,6 @@ MSGMERGE   = msgmerge
 # Allow git to be wrappered in the environment
 GIT        ?= git
 
-WGET       ?= wget -c
-
 INSTALL      = install
 INSTALL_DIR  = $(INSTALL) -d -m0755 -p
 INSTALL_DATA = $(INSTALL) -m0644 -p
@@ -43,22 +41,17 @@ XENFIRMWAREDIR = $(PREFIX)/lib/xen/boot
 PRIVATE_PREFIX = $(LIBDIR)/xen
 PRIVATE_BINDIR = $(PRIVATE_PREFIX)/bin
 
-ifeq ($(PREFIX),/usr)
 CONFIG_DIR = /etc
 XEN_LOCK_DIR = /var/lock
 XEN_RUN_DIR = /var/run/xen
 XEN_PAGING_DIR = /var/lib/xen/xenpaging
-else
-CONFIG_DIR = $(PREFIX)/etc
-XEN_LOCK_DIR = $(PREFIX)/var/lock
-XEN_RUN_DIR = $(PREFIX)/var/run/xen
-XEN_PAGING_DIR = $(PREFIX)/var/lib/xen/xenpaging
-endif
 
 SYSCONFIG_DIR = $(CONFIG_DIR)/$(CONFIG_LEAF_DIR)
 
 XEN_CONFIG_DIR = $(CONFIG_DIR)/xen
 XEN_SCRIPT_DIR = $(XEN_CONFIG_DIR)/scripts
+
+BOOT_DIR ?= /boot
 
 SOCKET_LIBS =
 UTIL_LIBS = -lutil

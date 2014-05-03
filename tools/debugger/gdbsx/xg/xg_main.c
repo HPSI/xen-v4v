@@ -34,6 +34,7 @@
  *  XGTRC(): generic trace utility
  */
 
+#include <sys/types.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdarg.h>
@@ -80,6 +81,7 @@ int xgtrc_on = 0;
 struct xen_domctl domctl;         /* just use a global domctl */
 
 static int     _hvm_guest;        /* hvm guest? 32bit HVMs have 64bit context */
+static int     _pvh_guest;        /* PV guest in HVM container */
 static domid_t _dom_id;           /* guest domid */
 static int     _max_vcpu_id;      /* thus max_vcpu_id+1 VCPUs */
 static int     _dom0_fd;          /* fd of /dev/privcmd */
@@ -308,6 +310,7 @@ xg_attach(int domid, int guest_bitness)
 
     _max_vcpu_id = domctl.u.getdomaininfo.max_vcpu_id;
     _hvm_guest = (domctl.u.getdomaininfo.flags & XEN_DOMINF_hvm_guest);
+    _pvh_guest = (domctl.u.getdomaininfo.flags & XEN_DOMINF_pvh_guest);
     return _max_vcpu_id;
 }
 
@@ -368,7 +371,7 @@ _change_TF(vcpuid_t which_vcpu, int guest_bitness, int setit)
     int sz = sizeof(anyc);
 
     /* first try the MTF for hvm guest. otherwise do manually */
-    if (_hvm_guest) {
+    if (_hvm_guest || _pvh_guest) {
         domctl.u.debug_op.vcpu = which_vcpu;
         domctl.u.debug_op.op = setit ? XEN_DOMCTL_DEBUG_OP_SINGLE_STEP_ON :
                                        XEN_DOMCTL_DEBUG_OP_SINGLE_STEP_OFF;
@@ -772,7 +775,7 @@ xg_read_mem(uint64_t guestva, char *tobuf, int tobuf_len, uint64_t pgd3val)
 {
     struct xen_domctl_gdbsx_memio *iop = &domctl.u.gdbsx_guest_memio;
     union {uint64_t llbuf8; char buf8[8];} u = {0};
-    int i;
+    int i, rc;
 
     XGTRC("E:gva:%llx tobuf:%lx len:%d\n", guestva, tobuf, tobuf_len);
 
@@ -783,7 +786,11 @@ xg_read_mem(uint64_t guestva, char *tobuf, int tobuf_len, uint64_t pgd3val)
     iop->len = tobuf_len;
     iop->gwr = 0;       /* not writing to guest */
 
-    _domctl_hcall(XEN_DOMCTL_gdbsx_guestmemio, tobuf, tobuf_len);
+    if ( (rc = _domctl_hcall(XEN_DOMCTL_gdbsx_guestmemio, tobuf, tobuf_len)) )
+    {
+        XGTRC("ERROR: failed to read bytes. errno:%d rc:%d\n", errno, rc);
+        return tobuf_len;
+    }
 
     for(i=0; i < XGMIN(8, tobuf_len); u.buf8[i]=tobuf[i], i++);
     XGTRC("X:remain:%d buf8:0x%llx\n", iop->remain, u.llbuf8);
@@ -813,8 +820,19 @@ xg_write_mem(uint64_t guestva, char *frombuf, int buflen, uint64_t pgd3val)
     iop->gwr = 1;       /* writing to guest */
 
     if ((rc=_domctl_hcall(XEN_DOMCTL_gdbsx_guestmemio, frombuf, buflen)))
-        XGERR("ERROR: failed to write %d bytes. errno:%d rc:%d\n", 
-              iop->remain, errno, rc);
+    {
+        XGERR("ERROR: failed to write bytes to %llx. errno:%d rc:%d\n",
+              guestva, errno, rc);
+        return buflen;
+    }
     return iop->remain;
 }
 
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

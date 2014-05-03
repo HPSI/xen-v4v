@@ -49,6 +49,42 @@
 #define NR_SPECIAL_PAGES     8
 #define special_pfn(x) (0xff000u - NR_SPECIAL_PAGES + (x))
 
+#define VGA_HOLE_SIZE (0x20)
+
+static int modules_init(struct xc_hvm_build_args *args,
+                        uint64_t vend, struct elf_binary *elf,
+                        uint64_t *mstart_out, uint64_t *mend_out)
+{
+#define MODULE_ALIGN 1UL << 7
+#define MB_ALIGN     1UL << 20
+#define MKALIGN(x, a) (((uint64_t)(x) + (a) - 1) & ~(uint64_t)((a) - 1))
+    uint64_t total_len = 0, offset1 = 0;
+
+    if ( (args->acpi_module.length == 0)&&(args->smbios_module.length == 0) )
+        return 0;
+
+    /* Find the total length for the firmware modules with a reasonable large
+     * alignment size to align each the modules.
+     */
+    total_len = MKALIGN(args->acpi_module.length, MODULE_ALIGN);
+    offset1 = total_len;
+    total_len += MKALIGN(args->smbios_module.length, MODULE_ALIGN);
+
+    /* Want to place the modules 1Mb+change behind the loader image. */
+    *mstart_out = MKALIGN(elf->pend, MB_ALIGN) + (MB_ALIGN);
+    *mend_out = *mstart_out + total_len;
+
+    if ( *mend_out > vend )    
+        return -1;
+
+    if ( args->acpi_module.length != 0 )
+        args->acpi_module.guest_addr_out = *mstart_out;
+    if ( args->smbios_module.length != 0 )
+        args->smbios_module.guest_addr_out = *mstart_out + offset1;
+
+    return 0;
+}
+
 static void build_hvm_info(void *hvm_info_page, uint64_t mem_size,
                            uint64_t mmio_start, uint64_t mmio_size)
 {
@@ -86,9 +122,8 @@ static void build_hvm_info(void *hvm_info_page, uint64_t mem_size,
     hvm_info->checksum = -sum;
 }
 
-static int loadelfimage(
-    xc_interface *xch,
-    struct elf_binary *elf, uint32_t dom, unsigned long *parray)
+static int loadelfimage(xc_interface *xch, struct elf_binary *elf,
+                        uint32_t dom, unsigned long *parray)
 {
     privcmd_mmap_entry_t *entries = NULL;
     unsigned long pfn_start = elf->pstart >> PAGE_SHIFT;
@@ -104,23 +139,85 @@ static int loadelfimage(
     for ( i = 0; i < pages; i++ )
         entries[i].mfn = parray[(elf->pstart >> PAGE_SHIFT) + i];
 
-    elf->dest = xc_map_foreign_ranges(
+    elf->dest_base = xc_map_foreign_ranges(
         xch, dom, pages << PAGE_SHIFT, PROT_READ | PROT_WRITE, 1 << PAGE_SHIFT,
         entries, pages);
-    if ( elf->dest == NULL )
+    if ( elf->dest_base == NULL )
         goto err;
+    elf->dest_size = pages * PAGE_SIZE;
 
-    elf->dest += elf->pstart & (PAGE_SIZE - 1);
+    ELF_ADVANCE_DEST(elf, elf->pstart & (PAGE_SIZE - 1));
 
     /* Load the initial elf image. */
     rc = elf_load_binary(elf);
     if ( rc < 0 )
         PERROR("Failed to load elf binary\n");
 
-    munmap(elf->dest, pages << PAGE_SHIFT);
-    elf->dest = NULL;
+    munmap(elf->dest_base, pages << PAGE_SHIFT);
+    elf->dest_base = NULL;
+    elf->dest_size = 0;
 
  err:
+    free(entries);
+
+    return rc;
+}
+
+static int loadmodules(xc_interface *xch,
+                       struct xc_hvm_build_args *args,
+                       uint64_t mstart, uint64_t mend,
+                       uint32_t dom, unsigned long *parray)
+{
+    privcmd_mmap_entry_t *entries = NULL;
+    unsigned long pfn_start;
+    unsigned long pfn_end;
+    size_t pages;
+    uint32_t i;
+    uint8_t *dest;
+    int rc = -1;
+
+    if ( (mstart == 0)||(mend == 0) )
+        return 0;
+
+    pfn_start = (unsigned long)(mstart >> PAGE_SHIFT);
+    pfn_end = (unsigned long)((mend + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    pages = pfn_end - pfn_start;
+
+    /* Map address space for module list. */
+    entries = calloc(pages, sizeof(privcmd_mmap_entry_t));
+    if ( entries == NULL )
+        goto error_out;
+
+    for ( i = 0; i < pages; i++ )
+        entries[i].mfn = parray[(mstart >> PAGE_SHIFT) + i];
+
+    dest = xc_map_foreign_ranges(
+        xch, dom, pages << PAGE_SHIFT, PROT_READ | PROT_WRITE, 1 << PAGE_SHIFT,
+        entries, pages);
+    if ( dest == NULL )
+        goto error_out;
+
+    /* Zero the range so padding is clear between modules */
+    memset(dest, 0, pages << PAGE_SHIFT);
+
+    /* Load modules into range */    
+    if ( args->acpi_module.length != 0 )
+    {
+        memcpy(dest,
+               args->acpi_module.data,
+               args->acpi_module.length);
+    }
+    if ( args->smbios_module.length != 0 )
+    {
+        memcpy(dest + (args->smbios_module.guest_addr_out - mstart),
+               args->smbios_module.data,
+               args->smbios_module.length);
+    }
+
+    munmap(dest, pages << PAGE_SHIFT);
+    rc = 0;
+
+ error_out:
     free(entries);
 
     return rc;
@@ -140,7 +237,7 @@ static int check_mmio_hole(uint64_t start, uint64_t memsize,
 }
 
 static int setup_guest(xc_interface *xch,
-                       uint32_t dom, const struct xc_hvm_build_args *args,
+                       uint32_t dom, struct xc_hvm_build_args *args,
                        char *image, unsigned long image_size)
 {
     xen_pfn_t *page_array = NULL;
@@ -153,11 +250,13 @@ static int setup_guest(xc_interface *xch,
     uint32_t *ident_pt;
     struct elf_binary elf;
     uint64_t v_start, v_end;
+    uint64_t m_start = 0, m_end = 0;
     int rc;
     xen_capabilities_info_t caps;
     unsigned long stat_normal_pages = 0, stat_2mb_pages = 0, 
         stat_1gb_pages = 0;
     int pod_mode = 0;
+    int claim_enabled = args->claim_enabled;
 
     if ( nr_pages > target_pages )
         pod_mode = XENMEMF_populate_on_demand;
@@ -178,11 +277,19 @@ static int setup_guest(xc_interface *xch,
         goto error_out;
     }
 
-    IPRINTF("VIRTUAL MEMORY ARRANGEMENT:\n"
+    if ( modules_init(args, v_end, &elf, &m_start, &m_end) != 0 )
+    {
+        ERROR("Insufficient space to load modules.");
+        goto error_out;
+    }
+
+    DPRINTF("VIRTUAL MEMORY ARRANGEMENT:\n"
             "  Loader:        %016"PRIx64"->%016"PRIx64"\n"
+            "  Modules:       %016"PRIx64"->%016"PRIx64"\n"
             "  TOTAL:         %016"PRIx64"->%016"PRIx64"\n"
             "  ENTRY ADDRESS: %016"PRIx64"\n",
             elf.pstart, elf.pend,
+            m_start, m_end,
             v_start, v_end,
             elf_uval(&elf, elf.ehdr, e_entry));
 
@@ -197,14 +304,31 @@ static int setup_guest(xc_interface *xch,
     for ( i = mmio_start >> PAGE_SHIFT; i < nr_pages; i++ )
         page_array[i] += mmio_size >> PAGE_SHIFT;
 
+    /*
+     * Try to claim pages for early warning of insufficient memory available.
+     * This should go before xc_domain_set_pod_target, becuase that function
+     * actually allocates memory for the guest. Claiming after memory has been
+     * allocated is pointless.
+     */
+    if ( claim_enabled ) {
+        rc = xc_domain_claim_pages(xch, dom, target_pages - VGA_HOLE_SIZE);
+        if ( rc != 0 )
+        {
+            PERROR("Could not allocate memory for HVM guest as we cannot claim memory!");
+            goto error_out;
+        }
+    }
+
     if ( pod_mode )
     {
         /*
-         * Subtract 0x20 from target_pages for the VGA "hole".  Xen will
-         * adjust the PoD cache size so that domain tot_pages will be
-         * target_pages - 0x20 after this call.
+         * Subtract VGA_HOLE_SIZE from target_pages for the VGA
+         * "hole".  Xen will adjust the PoD cache size so that domain
+         * tot_pages will be target_pages - VGA_HOLE_SIZE after
+         * this call.
          */
-        rc = xc_domain_set_pod_target(xch, dom, target_pages - 0x20,
+        rc = xc_domain_set_pod_target(xch, dom,
+                                      target_pages - VGA_HOLE_SIZE,
                                       NULL, NULL, NULL);
         if ( rc != 0 )
         {
@@ -227,6 +351,7 @@ static int setup_guest(xc_interface *xch,
         xch, dom, 0xa0, 0, pod_mode, &page_array[0x00]);
     cur_pages = 0xc0;
     stat_normal_pages = 0xc0;
+
     while ( (rc == 0) && (nr_pages > cur_pages) )
     {
         /* Clip count to maximum 1GB extent. */
@@ -328,7 +453,7 @@ static int setup_guest(xc_interface *xch,
         goto error_out;
     }
 
-    IPRINTF("PHYSICAL MEMORY ALLOCATION:\n"
+    DPRINTF("PHYSICAL MEMORY ALLOCATION:\n"
             "  4KB PAGES: 0x%016lx\n"
             "  2MB PAGES: 0x%016lx\n"
             "  1GB PAGES: 0x%016lx\n",
@@ -336,6 +461,9 @@ static int setup_guest(xc_interface *xch,
     
     if ( loadelfimage(xch, &elf, dom, page_array) != 0 )
         goto error_out;
+
+    if ( loadmodules(xch, args, m_start, m_end, dom, page_array) != 0 )
+        goto error_out;    
 
     if ( (hvm_info_page = xc_map_foreign_range(
               xch, dom, PAGE_SIZE, PROT_READ | PROT_WRITE,
@@ -401,19 +529,26 @@ static int setup_guest(xc_interface *xch,
         munmap(page0, PAGE_SIZE);
     }
 
-    free(page_array);
-    return 0;
-
+    rc = 0;
+    goto out;
  error_out:
+    rc = -1;
+ out:
+    if ( elf_check_broken(&elf) )
+        ERROR("HVM ELF broken: %s", elf_check_broken(&elf));
+
+    /* ensure no unclaimed pages are left unused */
+    xc_domain_claim_pages(xch, dom, 0 /* cancels the claim */);
+
     free(page_array);
-    return -1;
+    return rc;
 }
 
 /* xc_hvm_build:
  * Create a domain for a virtualized Linux, using files/filenames.
  */
 int xc_hvm_build(xc_interface *xch, uint32_t domid,
-                 const struct xc_hvm_build_args *hvm_args)
+                 struct xc_hvm_build_args *hvm_args)
 {
     struct xc_hvm_build_args args = *hvm_args;
     void *image;
@@ -441,6 +576,15 @@ int xc_hvm_build(xc_interface *xch, uint32_t domid,
 
     sts = setup_guest(xch, domid, &args, image, image_size);
 
+    if (!sts)
+    {
+        /* Return module load addresses to caller */
+        hvm_args->acpi_module.guest_addr_out = 
+            args.acpi_module.guest_addr_out;
+        hvm_args->smbios_module.guest_addr_out = 
+            args.smbios_module.guest_addr_out;
+    }
+
     free(image);
 
     return sts;
@@ -461,6 +605,7 @@ int xc_hvm_build_target_mem(xc_interface *xch,
 {
     struct xc_hvm_build_args args = {};
 
+    memset(&args, 0, sizeof(struct xc_hvm_build_args));
     args.mem_size = (uint64_t)memsize << 20;
     args.mem_target = (uint64_t)target << 20;
     args.image_file_name = image_name;
@@ -471,7 +616,7 @@ int xc_hvm_build_target_mem(xc_interface *xch,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

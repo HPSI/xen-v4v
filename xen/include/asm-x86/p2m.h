@@ -70,6 +70,7 @@ typedef enum {
     p2m_ram_paging_in = 11,       /* Memory that is being paged in */
     p2m_ram_shared = 12,          /* Shared or sharable memory */
     p2m_ram_broken = 13,          /* Broken page, access cause domain crash */
+    p2m_map_foreign  = 14,        /* ram pages from foreign domain */
 } p2m_type_t;
 
 /*
@@ -180,6 +181,7 @@ typedef unsigned int p2m_query_t;
 #define p2m_is_sharable(_t) (p2m_to_mask(_t) & P2M_SHARABLE_TYPES)
 #define p2m_is_shared(_t)   (p2m_to_mask(_t) & P2M_SHARED_TYPES)
 #define p2m_is_broken(_t)   (p2m_to_mask(_t) & P2M_BROKEN_TYPES)
+#define p2m_is_foreign(_t)  (p2m_to_mask(_t) & p2m_to_mask(p2m_map_foreign))
 
 /* Per-p2m-table state */
 struct p2m_domain {
@@ -197,17 +199,17 @@ struct p2m_domain {
 
     struct domain     *domain;   /* back pointer to domain */
 
-    /* Nested p2ms only: nested-CR3 value that this p2m shadows. 
-     * This can be cleared to CR3_EADDR under the per-p2m lock but
+    /* Nested p2ms only: nested p2m base value that this p2m shadows.
+     * This can be cleared to P2M_BASE_EADDR under the per-p2m lock but
      * needs both the per-p2m lock and the per-domain nestedp2m lock
      * to set it to any other value. */
-#define CR3_EADDR     (~0ULL)
-    uint64_t           cr3;
+#define P2M_BASE_EADDR     (~0ULL)
+    uint64_t           np2m_base;
 
     /* Nested p2ms: linked list of n2pms allocated to this domain. 
      * The host p2m hasolds the head of the list and the np2ms are 
      * threaded on in LRU order. */
-    struct list_head np2m_list; 
+    struct list_head   np2m_list;
 
 
     /* Host p2m: when this flag is set, don't flush all the nested-p2m 
@@ -233,11 +235,11 @@ struct p2m_domain {
     void               (*change_entry_type_global)(struct p2m_domain *p2m,
                                                    p2m_type_t ot,
                                                    p2m_type_t nt);
+    void               (*memory_type_changed)(struct p2m_domain *p2m);
     
     void               (*write_p2m_entry)(struct p2m_domain *p2m,
                                           unsigned long gfn, l1_pgentry_t *p,
-                                          mfn_t table_mfn, l1_pgentry_t new,
-                                          unsigned int level);
+                                          l1_pgentry_t new, unsigned int level);
     long               (*audit_p2m)(struct p2m_domain *p2m);
 
     /* Default P2M access type for each page in the the domain: new pages,
@@ -277,16 +279,20 @@ struct p2m_domain {
         mm_lock_t        lock;         /* Locking of private pod structs,   *
                                         * not relying on the p2m lock.      */
     } pod;
+    union {
+        struct ept_data ept;
+        /* NPT-equivalent structure could be added here. */
+    };
 };
 
 /* get host p2m table */
 #define p2m_get_hostp2m(d)      ((d)->arch.p2m)
 
-/* Get p2m table (re)usable for specified cr3.
+/* Get p2m table (re)usable for specified np2m base.
  * Automatically destroys and re-initializes a p2m if none found.
- * If cr3 == 0 then v->arch.hvm_vcpu.guest_cr[3] is used.
+ * If np2m_base == 0 then v->arch.hvm_vcpu.guest_cr[3] is used.
  */
-struct p2m_domain *p2m_get_nestedp2m(struct vcpu *v, uint64_t cr3);
+struct p2m_domain *p2m_get_nestedp2m(struct vcpu *v, uint64_t np2m_base);
 
 /* If vcpu is in host mode then behaviour matches p2m_get_hostp2m().
  * If vcpu is in guest mode then behaviour matches p2m_get_nestedp2m().
@@ -384,7 +390,7 @@ static inline struct page_info *get_page_from_gfn(
     if (t)
         *t = p2m_ram_rw;
     page = __mfn_to_page(gfn);
-    return get_page(page, d) ? page : NULL;
+    return mfn_valid(gfn) && get_page(page, d) ? page : NULL;
 }
 
 
@@ -502,6 +508,9 @@ void p2m_change_type_range(struct domain *d,
 p2m_type_t p2m_change_type(struct domain *d, unsigned long gfn,
                            p2m_type_t ot, p2m_type_t nt);
 
+/* Report a change affecting memory types. */
+void p2m_memory_type_changed(struct domain *d);
+
 /* Set mmio addresses in the p2m table (for pass-through) */
 int set_mmio_p2m_entry(struct domain *d, unsigned long gfn, mfn_t mfn);
 int clear_mmio_p2m_entry(struct domain *d, unsigned long gfn);
@@ -572,13 +581,13 @@ void p2m_mem_access_resume(struct domain *d);
 
 /* Set access type for a region of pfns.
  * If start_pfn == -1ul, sets the default access type */
-int p2m_set_mem_access(struct domain *d, unsigned long start_pfn, 
-                       uint32_t nr, hvmmem_access_t access);
+long p2m_set_mem_access(struct domain *d, unsigned long start_pfn, uint32_t nr,
+                        uint32_t start, uint32_t mask, xenmem_access_t access);
 
 /* Get access type for a pfn
  * If pfn == -1ul, gets the default access type */
-int p2m_get_mem_access(struct domain *d, unsigned long pfn, 
-                       hvmmem_access_t *access);
+int p2m_get_mem_access(struct domain *d, unsigned long pfn,
+                       xenmem_access_t *access);
 
 /* 
  * Internal functions, only called by other p2m code
@@ -589,14 +598,18 @@ void p2m_free_ptp(struct p2m_domain *p2m, struct page_info *pg);
 
 /* Directly set a p2m entry: only for use by p2m code. Does not need
  * a call to put_gfn afterwards/ */
-int set_p2m_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn, 
+int p2m_set_entry(struct p2m_domain *p2m, unsigned long gfn, mfn_t mfn,
                   unsigned int page_order, p2m_type_t p2mt, p2m_access_t p2ma);
 
 /* Set up function pointers for PT implementation: only for use by p2m code */
 extern void p2m_pt_init(struct p2m_domain *p2m);
 
 /* Debugging and auditing of the P2M code? */
+#ifndef NDEBUG
 #define P2M_AUDIT     1
+#else
+#define P2M_AUDIT     0
+#endif
 #define P2M_DEBUGGING 0
 
 #if P2M_AUDIT
@@ -607,15 +620,15 @@ extern void audit_p2m(struct domain *d,
 #endif /* P2M_AUDIT */
 
 /* Printouts */
-#define P2M_PRINTK(_f, _a...)                                \
-    debugtrace_printk("p2m: %s(): " _f, __func__, ##_a)
-#define P2M_ERROR(_f, _a...)                                 \
-    printk("pg error: %s(): " _f, __func__, ##_a)
+#define P2M_PRINTK(f, a...)                                \
+    debugtrace_printk("p2m: %s(): " f, __func__, ##a)
+#define P2M_ERROR(f, a...)                                 \
+    printk(XENLOG_G_ERR "pg error: %s(): " f, __func__, ##a)
 #if P2M_DEBUGGING
-#define P2M_DEBUG(_f, _a...)                                 \
-    debugtrace_printk("p2mdebug: %s(): " _f, __func__, ##_a)
+#define P2M_DEBUG(f, a...)                                 \
+    debugtrace_printk("p2mdebug: %s(): " f, __func__, ##a)
 #else
-#define P2M_DEBUG(_f, _a...) do { (void)(_f); } while(0)
+#define P2M_DEBUG(f, a...) do { (void)(f); } while(0)
 #endif
 
 /* Called by p2m code when demand-populating a PoD page */
@@ -650,14 +663,14 @@ void p2m_flush(struct vcpu *v, struct p2m_domain *p2m);
 void p2m_flush_nestedp2m(struct domain *d);
 
 void nestedp2m_write_p2m_entry(struct p2m_domain *p2m, unsigned long gfn,
-    l1_pgentry_t *p, mfn_t table_mfn, l1_pgentry_t new, unsigned int level);
+    l1_pgentry_t *p, l1_pgentry_t new, unsigned int level);
 
 #endif /* _XEN_P2M_H */
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

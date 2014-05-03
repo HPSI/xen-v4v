@@ -20,33 +20,8 @@
 
 LIST_HEAD(ats_devices);
 
-static void parse_ats_param(char *s);
-custom_param("ats", parse_ats_param);
-
 bool_t __read_mostly ats_enabled = 1;
-
-static void __init parse_ats_param(char *s)
-{
-    char *ss;
-
-    do {
-        ss = strchr(s, ',');
-        if ( ss )
-            *ss = '\0';
-
-        switch ( parse_bool(s) )
-        {
-        case 0:
-            ats_enabled = 0;
-            break;
-        case 1:
-            ats_enabled = 1;
-            break;
-        }
-
-        s = ss + 1;
-    } while ( ss );
-}
+boolean_param("ats", ats_enabled);
 
 int enable_ats_device(int seg, int bus, int devfn)
 {
@@ -93,7 +68,8 @@ int enable_ats_device(int seg, int bus, int devfn)
         pdev->devfn = devfn;
         value = pci_conf_read16(seg, bus, PCI_SLOT(devfn),
                                 PCI_FUNC(devfn), pos + ATS_REG_CAP);
-        pdev->ats_queue_depth = value & ATS_QUEUE_DEPTH_MASK;
+        pdev->ats_queue_depth = value & ATS_QUEUE_DEPTH_MASK ?:
+                                ATS_QUEUE_DEPTH_MASK + 1;
         list_add(&pdev->list, &ats_devices);
     }
 

@@ -31,7 +31,7 @@
 
 #ifdef DEBUG_RECEIVED
 #  define DEBUG_REPORT_RECEIVED(buf, len) \
-    LIBXL__LOG(qmp->ctx, LIBXL__LOG_DEBUG, "received: '%.*s'", len, buf)
+    LOG(DEBUG, "received: '%.*s'", len, buf)
 #else
 #  define DEBUG_REPORT_RECEIVED(buf, len) ((void)0)
 #endif
@@ -101,7 +101,7 @@ static int store_serial_port_info(libxl__qmp_handler *qmp,
     }
 
     path = libxl__xs_get_dompath(gc, qmp->domid);
-    path = libxl__sprintf(gc, "%s/serial/%d/tty", path, port);
+    path = GCSPRINTF("%s/serial/%d/tty", path, port);
 
     ret = libxl__xs_write(gc, XBT_NULL, path, "%s", chardev + 4);
 
@@ -160,7 +160,7 @@ static int qmp_write_domain_console_item(libxl__gc *gc, int domid,
     char *path;
 
     path = libxl__xs_get_dompath(gc, domid);
-    path = libxl__sprintf(gc, "%s/console/%s", path, item);
+    path = GCSPRINTF("%s/console/%s", path, item);
 
     return libxl__xs_write(gc, XBT_NULL, path, "%s", value);
 }
@@ -190,8 +190,7 @@ static int qmp_register_vnc_callback(libxl__qmp_handler *qmp,
     port = libxl__json_object_get_string(obj);
 
     if (!addr || !port) {
-        LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR,
-                   "Failed to retreive VNC connect information.");
+        LOG(ERROR, "Failed to retreive VNC connect information.");
         goto out;
     }
 
@@ -261,7 +260,7 @@ static callback_id_pair *qmp_get_callback_from_id(libxl__qmp_handler *qmp,
     return NULL;
 }
 
-static void qmp_handle_error_response(libxl__qmp_handler *qmp,
+static void qmp_handle_error_response(libxl__gc *gc, libxl__qmp_handler *qmp,
                                       const libxl__json_object *resp)
 {
     callback_id_pair *pp = qmp_get_callback_from_id(qmp, resp);
@@ -284,19 +283,17 @@ static void qmp_handle_error_response(libxl__qmp_handler *qmp,
         free(pp);
     }
 
-    LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR,
-               "received an error message from QMP server: %s",
-               libxl__json_object_get_string(resp));
+    LOG(ERROR, "received an error message from QMP server: %s",
+        libxl__json_object_get_string(resp));
 }
 
-static int qmp_handle_response(libxl__qmp_handler *qmp,
+static int qmp_handle_response(libxl__gc *gc, libxl__qmp_handler *qmp,
                                const libxl__json_object *resp)
 {
     libxl__qmp_message_type type = LIBXL__QMP_MESSAGE_TYPE_INVALID;
 
     type = qmp_response_type(qmp, resp);
-    LIBXL__LOG(qmp->ctx, LIBXL__LOG_DEBUG,
-               "message type: %s", libxl__qmp_message_type_to_string(type));
+    LOG(DEBUG, "message type: %s", libxl__qmp_message_type_to_string(type));
 
     switch (type) {
     case LIBXL__QMP_MESSAGE_TYPE_QMP:
@@ -318,14 +315,14 @@ static int qmp_handle_response(libxl__qmp_handler *qmp,
                 /* tell that the id have been processed */
                 qmp->wait_for_id = 0;
             }
-            LIBXL_STAILQ_REMOVE(
-                &qmp->callback_list, pp, callback_id_pair, next);
+            LIBXL_STAILQ_REMOVE(&qmp->callback_list, pp, callback_id_pair,
+                                next);
             free(pp);
         }
         return 0;
     }
     case LIBXL__QMP_MESSAGE_TYPE_ERROR:
-        qmp_handle_error_response(qmp, resp);
+        qmp_handle_error_response(gc, qmp, resp);
         return -1;
     case LIBXL__QMP_MESSAGE_TYPE_EVENT:
         return 0;
@@ -345,11 +342,10 @@ static libxl__qmp_handler *qmp_init_handler(libxl__gc *gc, uint32_t domid)
 
     qmp = calloc(1, sizeof (libxl__qmp_handler));
     if (qmp == NULL) {
-        LIBXL__LOG_ERRNO(libxl__gc_owner(gc), LIBXL__LOG_ERROR,
-                         "Failed to allocate qmp_handler");
+        LOGE(ERROR, "Failed to allocate qmp_handler");
         return NULL;
     }
-    qmp->ctx = libxl__gc_owner(gc);
+    qmp->ctx = CTX;
     qmp->domid = domid;
     qmp->timeout = 5;
 
@@ -378,7 +374,7 @@ static int qmp_open(libxl__qmp_handler *qmp, const char *qmp_socket_path,
     ret = libxl_fd_set_cloexec(qmp->ctx, qmp->qmp_fd, 1);
     if (ret) return -1;
 
-    memset(&qmp->addr, 0, sizeof (&qmp->addr));
+    memset(&qmp->addr, 0, sizeof (qmp->addr));
     qmp->addr.sun_family = AF_UNIX;
     strncpy(qmp->addr.sun_path, qmp_socket_path,
             sizeof (qmp->addr.sun_path));
@@ -406,12 +402,10 @@ static void qmp_close(libxl__qmp_handler *qmp)
 
     close(qmp->qmp_fd);
     LIBXL_STAILQ_FOREACH(pp, &qmp->callback_list, next) {
-        if (tmp)
-            free(tmp);
+        free(tmp);
         tmp = pp;
     }
-    if (tmp)
-        free(tmp);
+    free(tmp);
 }
 
 static int qmp_next(libxl__gc *gc, libxl__qmp_handler *qmp)
@@ -437,21 +431,21 @@ static int qmp_next(libxl__gc *gc, libxl__qmp_handler *qmp)
 
         ret = select(qmp->qmp_fd + 1, &rfds, NULL, NULL, &timeout);
         if (ret == 0) {
-            LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR, "timeout");
+            LOG(ERROR, "timeout");
             return -1;
         } else if (ret < 0) {
             if (errno == EINTR)
                 continue;
-            LIBXL__LOG_ERRNO(qmp->ctx, LIBXL__LOG_ERROR, "Select error");
+            LOGE(ERROR, "Select error");
             return -1;
         }
 
         rd = read(qmp->qmp_fd, qmp->buffer, QMP_RECEIVE_BUFFER_SIZE);
         if (rd == 0) {
-            LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR, "Unexpected end of socket");
+            LOG(ERROR, "Unexpected end of socket");
             return -1;
         } else if (rd < 0) {
-            LIBXL__LOG_ERRNO(qmp->ctx, LIBXL__LOG_ERROR, "Socket read error");
+            LOGE(ERROR, "Socket read error");
             return rd;
         }
 
@@ -484,10 +478,9 @@ static int qmp_next(libxl__gc *gc, libxl__qmp_handler *qmp)
                 o = libxl__json_parse(gc, s);
 
                 if (o) {
-                    rc = qmp_handle_response(qmp, o);
+                    rc = qmp_handle_response(gc, qmp, o);
                 } else {
-                    LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR,
-                               "Parse error of : %s\n", s);
+                    LOG(ERROR, "Parse error of : %s\n", s);
                     return -1;
                 }
 
@@ -533,15 +526,13 @@ static char *qmp_send_prepare(libxl__gc *gc, libxl__qmp_handler *qmp,
     s = yajl_gen_get_buf(hand, &buf, &len);
 
     if (s) {
-        LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR,
-                   "Failed to generate a qmp command");
+        LOG(ERROR, "Failed to generate a qmp command");
         goto out;
     }
 
     elm = malloc(sizeof (callback_id_pair));
     if (elm == NULL) {
-        LIBXL__LOG_ERRNO(qmp->ctx, LIBXL__LOG_ERROR,
-                         "Failed to allocate a QMP callback");
+        LOGE(ERROR, "Failed to allocate a QMP callback");
         goto out;
     }
     elm->id = qmp->last_id_used;
@@ -552,7 +543,7 @@ static char *qmp_send_prepare(libxl__gc *gc, libxl__qmp_handler *qmp,
 
     ret = libxl__strndup(gc, (const char*)buf, len);
 
-    LIBXL__LOG(qmp->ctx, LIBXL__LOG_DEBUG, "next qmp command: '%s'", buf);
+    LOG(DEBUG, "next qmp command: '%s'", buf);
 
 out:
     yajl_gen_free(hand);
@@ -566,9 +557,9 @@ static int qmp_send(libxl__qmp_handler *qmp,
 {
     char *buf = NULL;
     int rc = -1;
-    libxl__gc gc; LIBXL_INIT_GC(gc,qmp->ctx);
+    GC_INIT(qmp->ctx);
 
-    buf = qmp_send_prepare(&gc, qmp, cmd, args, callback, opaque, context);
+    buf = qmp_send_prepare(gc, qmp, cmd, args, callback, opaque, context);
 
     if (buf == NULL) {
         goto out;
@@ -583,7 +574,7 @@ static int qmp_send(libxl__qmp_handler *qmp,
 
     rc = qmp->last_id_used;
 out:
-    libxl__free_all(&gc);
+    GC_FREE;
     return rc;
 }
 
@@ -637,7 +628,7 @@ static void qmp_parameters_common_add(libxl__gc *gc,
         *param = libxl__json_object_alloc(gc, JSON_MAP);
     }
 
-    arg = libxl__zalloc(gc, sizeof(*arg));
+    GCNEW(arg);
 
     arg->map_key = libxl__strdup(gc, name);
     arg->obj = obj;
@@ -668,9 +659,20 @@ static void qmp_parameters_add_bool(libxl__gc *gc,
     qmp_parameters_common_add(gc, param, name, obj);
 }
 
+static void qmp_parameters_add_integer(libxl__gc *gc,
+                                       libxl__json_object **param,
+                                       const char *name, const int i)
+{
+    libxl__json_object *obj;
+
+    obj = libxl__json_object_alloc(gc, JSON_INTEGER);
+    obj->u.i = i;
+
+    qmp_parameters_common_add(gc, param, name, obj);
+}
+
 #define QMP_PARAMETERS_SPRINTF(args, name, format, ...) \
-    qmp_parameters_add_string(gc, args, name, \
-                              libxl__sprintf(gc, format, __VA_ARGS__))
+    qmp_parameters_add_string(gc, args, name, GCSPRINTF(format, __VA_ARGS__))
 
 /*
  * API
@@ -684,15 +686,14 @@ libxl__qmp_handler *libxl__qmp_initialize(libxl__gc *gc, uint32_t domid)
 
     qmp = qmp_init_handler(gc, domid);
 
-    qmp_socket = libxl__sprintf(gc, "%s/qmp-libxl-%d",
-                                libxl__run_dir_path(), domid);
+    qmp_socket = GCSPRINTF("%s/qmp-libxl-%d", libxl__run_dir_path(), domid);
     if ((ret = qmp_open(qmp, qmp_socket, QMP_SOCKET_CONNECT_TIMEOUT)) < 0) {
-        LIBXL__LOG_ERRNO(qmp->ctx, LIBXL__LOG_ERROR, "Connection error");
+        LOGE(ERROR, "Connection error");
         qmp_free_handler(qmp);
         return NULL;
     }
 
-    LIBXL__LOG(qmp->ctx, LIBXL__LOG_DEBUG, "connected to %s", qmp_socket);
+    LOG(DEBUG, "connected to %s", qmp_socket);
 
     /* Wait for the response to qmp_capabilities */
     while (!qmp->connected) {
@@ -702,7 +703,7 @@ libxl__qmp_handler *libxl__qmp_initialize(libxl__gc *gc, uint32_t domid)
     }
 
     if (!qmp->connected) {
-        LIBXL__LOG(qmp->ctx, LIBXL__LOG_ERROR, "Failed to connect to QMP");
+        LOG(ERROR, "Failed to connect to QMP");
         libxl__qmp_close(qmp);
         return NULL;
     }
@@ -719,16 +720,12 @@ void libxl__qmp_close(libxl__qmp_handler *qmp)
 
 void libxl__qmp_cleanup(libxl__gc *gc, uint32_t domid)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
     char *qmp_socket;
 
-    qmp_socket = libxl__sprintf(gc, "%s/qmp-libxl-%d",
-                                libxl__run_dir_path(), domid);
+    qmp_socket = GCSPRINTF("%s/qmp-libxl-%d", libxl__run_dir_path(), domid);
     if (unlink(qmp_socket) == -1) {
         if (errno != ENOENT) {
-            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR,
-                             "Failed to remove QMP socket file %s",
-                             qmp_socket);
+            LOGE(ERROR, "Failed to remove QMP socket file %s", qmp_socket);
         }
     }
 }
@@ -754,8 +751,8 @@ static int pci_add_callback(libxl__qmp_handler *qmp,
     const libxl__json_object *bus = NULL;
     GC_INIT(qmp->ctx);
     int i, j, rc = -1;
-    char *asked_id = libxl__sprintf(gc, PCI_PT_QDEV_ID,
-                                    pcidev->bus, pcidev->dev, pcidev->func);
+    char *asked_id = GCSPRINTF(PCI_PT_QDEV_ID,
+                               pcidev->bus, pcidev->dev, pcidev->func);
 
     for (i = 0; (bus = libxl__json_array_get(response, i)); i++) {
         const libxl__json_object *devices = NULL;
@@ -823,8 +820,8 @@ int libxl__qmp_pci_add(libxl__gc *gc, int domid, libxl_device_pci *pcidev)
     if (!qmp)
         return -1;
 
-    hostaddr = libxl__sprintf(gc, "%04x:%02x:%02x.%01x", pcidev->domain,
-                              pcidev->bus, pcidev->dev, pcidev->func);
+    hostaddr = GCSPRINTF("%04x:%02x:%02x.%01x", pcidev->domain,
+                         pcidev->bus, pcidev->dev, pcidev->func);
     if (!hostaddr)
         return -1;
 
@@ -860,10 +857,14 @@ int libxl__qmp_pci_del(libxl__gc *gc, int domid, libxl_device_pci *pcidev)
 {
     char *id = NULL;
 
-    id = libxl__sprintf(gc, PCI_PT_QDEV_ID,
-                        pcidev->bus, pcidev->dev, pcidev->func);
+    id = GCSPRINTF(PCI_PT_QDEV_ID, pcidev->bus, pcidev->dev, pcidev->func);
 
     return qmp_device_del(gc, domid, id);
+}
+
+int libxl__qmp_system_wakeup(libxl__gc *gc, int domid)
+{
+    return qmp_run_command(gc, domid, "system_wakeup", NULL, NULL, NULL);
 }
 
 int libxl__qmp_save(libxl__gc *gc, int domid, const char *filename)
@@ -927,6 +928,15 @@ int libxl__qmp_insert_cdrom(libxl__gc *gc, int domid,
         qmp_parameters_add_string(gc, &args, "target", disk->pdev_path);
         return qmp_run_command(gc, domid, "change", args, NULL, NULL);
     }
+}
+
+int libxl__qmp_cpu_add(libxl__gc *gc, int domid, int idx)
+{
+    libxl__json_object *args = NULL;
+
+    qmp_parameters_add_integer(gc, &args, "id", idx);
+
+    return qmp_run_command(gc, domid, "cpu-add", args, NULL, NULL);
 }
 
 int libxl__qmp_initializations(libxl__gc *gc, uint32_t domid,

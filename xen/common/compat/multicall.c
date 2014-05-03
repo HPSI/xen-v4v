@@ -29,7 +29,7 @@ DEFINE_XEN_GUEST_HANDLE(multicall_entry_compat_t);
 
 static void __trace_multicall_call(multicall_entry_t *call)
 {
-    unsigned long args[6];
+    xen_ulong_t args[6];
     int i;
 
     for ( i = 0; i < ARRAY_SIZE(args); i++ )
@@ -43,7 +43,7 @@ static void __trace_multicall_call(multicall_entry_t *call)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

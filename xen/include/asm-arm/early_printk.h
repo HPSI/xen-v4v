@@ -12,16 +12,12 @@
 
 #include <xen/config.h>
 
-#ifdef EARLY_UART_ADDRESS
+#ifdef CONFIG_EARLY_PRINTK
 
-void early_printk(const char *fmt, ...);
-void early_panic(const char *fmt, ...);
+/* need to add the uart address offset in page to the fixmap address */
+#define EARLY_UART_VIRTUAL_ADDRESS \
+    (FIXMAP_ADDR(FIXMAP_CONSOLE) +(EARLY_UART_BASE_ADDRESS & ~PAGE_MASK))
 
-#else
-
-static inline void early_printk(const char *fmt, ...) {}
-static inline void early_panic(const char *fmt, ...) {}
-
-#endif
+#endif /* !CONFIG_EARLY_PRINTK */
 
 #endif

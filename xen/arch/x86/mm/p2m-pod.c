@@ -242,7 +242,8 @@ p2m_pod_set_cache_target(struct p2m_domain *p2m, unsigned long pod_target, int p
 
         p2m_pod_cache_add(p2m, page, order);
 
-        if ( hypercall_preempt_check() && preemptible )
+        if ( preemptible && pod_target != p2m->pod.count &&
+             hypercall_preempt_check() )
         {
             ret = -EAGAIN;
             goto out;
@@ -286,7 +287,8 @@ p2m_pod_set_cache_target(struct p2m_domain *p2m, unsigned long pod_target, int p
 
             put_page(page+i);
 
-            if ( hypercall_preempt_check() && preemptible )
+            if ( preemptible && pod_target != p2m->pod.count &&
+                 hypercall_preempt_check() )
             {
                 ret = -EAGAIN;
                 goto out;
@@ -459,7 +461,8 @@ p2m_pod_offline_or_broken_hit(struct page_info *p)
 
 pod_hit:
     lock_page_alloc(p2m);
-    page_list_add_tail(p, &d->arch.relmem_list);
+    /* Insertion must be at list head (see iommu_populate_page_table()). */
+    page_list_add(p, &d->arch.relmem_list);
     unlock_page_alloc(p2m);
     pod_unlock(p2m);
     return 1;
@@ -553,7 +556,8 @@ recount:
     {
         /* All PoD: Mark the whole region invalid and tell caller
          * we're done. */
-        set_p2m_entry(p2m, gpfn, _mfn(INVALID_MFN), order, p2m_invalid, p2m->default_access);
+        p2m_set_entry(p2m, gpfn, _mfn(INVALID_MFN), order, p2m_invalid,
+                      p2m->default_access);
         p2m->pod.entry_count-=(1<<order);
         BUG_ON(p2m->pod.entry_count < 0);
         ret = 1;
@@ -586,7 +590,8 @@ recount:
         mfn = p2m->get_entry(p2m, gpfn + i, &t, &a, 0, NULL);
         if ( t == p2m_populate_on_demand )
         {
-            set_p2m_entry(p2m, gpfn + i, _mfn(INVALID_MFN), 0, p2m_invalid, p2m->default_access);
+            p2m_set_entry(p2m, gpfn + i, _mfn(INVALID_MFN), 0, p2m_invalid,
+                          p2m->default_access);
             p2m->pod.entry_count--;
             BUG_ON(p2m->pod.entry_count < 0);
             pod--;
@@ -599,7 +604,8 @@ recount:
 
             page = mfn_to_page(mfn);
 
-            set_p2m_entry(p2m, gpfn + i, _mfn(INVALID_MFN), 0, p2m_invalid, p2m->default_access);
+            p2m_set_entry(p2m, gpfn + i, _mfn(INVALID_MFN), 0, p2m_invalid,
+                          p2m->default_access);
             set_gpfn_from_mfn(mfn_x(mfn), INVALID_M2P_ENTRY);
 
             p2m_pod_cache_add(p2m, page, 0);
@@ -718,7 +724,7 @@ p2m_pod_zero_check_superpage(struct p2m_domain *p2m, unsigned long gfn)
     }
 
     /* Try to remove the page, restoring old mapping if it fails. */
-    set_p2m_entry(p2m, gfn, _mfn(0), PAGE_ORDER_2M,
+    p2m_set_entry(p2m, gfn, _mfn(0), PAGE_ORDER_2M,
                   p2m_populate_on_demand, p2m->default_access);
 
     /* Make none of the MFNs are used elsewhere... for example, mapped
@@ -776,7 +782,7 @@ p2m_pod_zero_check_superpage(struct p2m_domain *p2m, unsigned long gfn)
 
 out_reset:
     if ( reset )
-        set_p2m_entry(p2m, gfn, mfn0, 9, type0, p2m->default_access);
+        p2m_set_entry(p2m, gfn, mfn0, 9, type0, p2m->default_access);
     
 out:
     gfn_unlock(p2m, gfn, SUPERPAGE_ORDER);
@@ -834,7 +840,7 @@ p2m_pod_zero_check(struct p2m_domain *p2m, unsigned long *gfns, int count)
         }
 
         /* Try to remove the page, restoring old mapping if it fails. */
-        set_p2m_entry(p2m, gfns[i], _mfn(0), PAGE_ORDER_4K,
+        p2m_set_entry(p2m, gfns[i], _mfn(0), PAGE_ORDER_4K,
                       p2m_populate_on_demand, p2m->default_access);
 
         /* See if the page was successfully unmapped.  (Allow one refcount
@@ -844,7 +850,7 @@ p2m_pod_zero_check(struct p2m_domain *p2m, unsigned long *gfns, int count)
             unmap_domain_page(map[i]);
             map[i] = NULL;
 
-            set_p2m_entry(p2m, gfns[i], mfns[i], PAGE_ORDER_4K,
+            p2m_set_entry(p2m, gfns[i], mfns[i], PAGE_ORDER_4K,
                 types[i], p2m->default_access);
 
             continue;
@@ -867,7 +873,7 @@ p2m_pod_zero_check(struct p2m_domain *p2m, unsigned long *gfns, int count)
          * check timing.  */
         if ( j < PAGE_SIZE/sizeof(*map[i]) )
         {
-            set_p2m_entry(p2m, gfns[i], mfns[i], PAGE_ORDER_4K,
+            p2m_set_entry(p2m, gfns[i], mfns[i], PAGE_ORDER_4K,
                 types[i], p2m->default_access);
         }
         else
@@ -997,15 +1003,15 @@ p2m_pod_demand_populate(struct p2m_domain *p2m, unsigned long gfn,
     {
         pod_unlock(p2m);
         gfn_aligned = (gfn >> order) << order;
-        /* Note that we are supposed to call set_p2m_entry() 512 times to 
+        /* Note that we are supposed to call p2m_set_entry() 512 times to
          * split 1GB into 512 2MB pages here. But We only do once here because
-         * set_p2m_entry() should automatically shatter the 1GB page into 
+         * p2m_set_entry() should automatically shatter the 1GB page into
          * 512 2MB pages. The rest of 511 calls are unnecessary.
          *
          * NOTE: In a fine-grained p2m locking scenario this operation
          * may need to promote its locking from gfn->1g superpage
          */
-        set_p2m_entry(p2m, gfn_aligned, _mfn(0), PAGE_ORDER_2M,
+        p2m_set_entry(p2m, gfn_aligned, _mfn(0), PAGE_ORDER_2M,
                       p2m_populate_on_demand, p2m->default_access);
         return 0;
     }
@@ -1034,7 +1040,8 @@ p2m_pod_demand_populate(struct p2m_domain *p2m, unsigned long gfn,
 
     gfn_aligned = (gfn >> order) << order;
 
-    set_p2m_entry(p2m, gfn_aligned, mfn, order, p2m_ram_rw, p2m->default_access);
+    p2m_set_entry(p2m, gfn_aligned, mfn, order, p2m_ram_rw,
+                  p2m->default_access);
 
     for( i = 0; i < (1UL << order); i++ )
     {
@@ -1088,7 +1095,7 @@ remap_and_retry:
      * need promoting the gfn lock from gfn->2M superpage */
     gfn_aligned = (gfn>>order)<<order;
     for(i=0; i<(1<<order); i++)
-        set_p2m_entry(p2m, gfn_aligned+i, _mfn(0), PAGE_ORDER_4K,
+        p2m_set_entry(p2m, gfn_aligned+i, _mfn(0), PAGE_ORDER_4K,
                       p2m_populate_on_demand, p2m->default_access);
     if ( tb_init_done )
     {
@@ -1131,8 +1138,7 @@ guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn,
         omfn = p2m->get_entry(p2m, gfn + i, &ot, &a, 0, NULL);
         if ( p2m_is_ram(ot) )
         {
-            printk("%s: gfn_to_mfn returned type %d!\n",
-                   __func__, ot);
+            P2M_DEBUG("gfn_to_mfn returned type %d!\n", ot);
             rc = -EBUSY;
             goto out;
         }
@@ -1144,10 +1150,9 @@ guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn,
     }
 
     /* Now, actually do the two-way mapping */
-    if ( !set_p2m_entry(p2m, gfn, _mfn(0), order,
-                        p2m_populate_on_demand, p2m->default_access) )
-        rc = -EINVAL;
-    else
+    rc = p2m_set_entry(p2m, gfn, _mfn(0), order, p2m_populate_on_demand,
+                       p2m->default_access);
+    if ( rc == 0 )
     {
         pod_lock(p2m);
         p2m->pod.entry_count += 1 << order;
@@ -1156,9 +1161,9 @@ guest_physmap_mark_populate_on_demand(struct domain *d, unsigned long gfn,
         pod_unlock(p2m);
     }
 
+out:
     gfn_unlock(p2m, gfn, order);
 
-out:
     return rc;
 }
 

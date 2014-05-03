@@ -100,7 +100,7 @@ static void __init parse_dom0_max_vcpus(const char *s)
 }
 custom_param("dom0_max_vcpus", parse_dom0_max_vcpus);
 
-struct vcpu *__init alloc_dom0_vcpu0(void)
+struct vcpu *__init alloc_dom0_vcpu0(struct domain *dom0)
 {
     unsigned max_vcpus;
 
@@ -302,9 +302,190 @@ static void __init process_dom0_ioports_disable(void)
         printk("Disabling dom0 access to ioport range %04lx-%04lx\n",
             io_from, io_to);
 
-        if ( ioports_deny_access(dom0, io_from, io_to) != 0 )
+        if ( ioports_deny_access(hardware_domain, io_from, io_to) != 0 )
             BUG();
     }
+}
+
+static __init void mark_pv_pt_pages_rdonly(struct domain *d,
+                                           l4_pgentry_t *l4start,
+                                           unsigned long vpt_start,
+                                           unsigned long nr_pt_pages)
+{
+    unsigned long count;
+    struct page_info *page;
+    l4_pgentry_t *pl4e;
+    l3_pgentry_t *pl3e;
+    l2_pgentry_t *pl2e;
+    l1_pgentry_t *pl1e;
+
+    pl4e = l4start + l4_table_offset(vpt_start);
+    pl3e = l4e_to_l3e(*pl4e);
+    pl3e += l3_table_offset(vpt_start);
+    pl2e = l3e_to_l2e(*pl3e);
+    pl2e += l2_table_offset(vpt_start);
+    pl1e = l2e_to_l1e(*pl2e);
+    pl1e += l1_table_offset(vpt_start);
+    for ( count = 0; count < nr_pt_pages; count++ )
+    {
+        l1e_remove_flags(*pl1e, _PAGE_RW);
+        page = mfn_to_page(l1e_get_pfn(*pl1e));
+
+        /* Read-only mapping + PGC_allocated + page-table page. */
+        page->count_info         = PGC_allocated | 3;
+        page->u.inuse.type_info |= PGT_validated | 1;
+
+        /* Top-level p.t. is pinned. */
+        if ( (page->u.inuse.type_info & PGT_type_mask) ==
+             (!is_pv_32on64_domain(d) ?
+              PGT_l4_page_table : PGT_l3_page_table) )
+        {
+            page->count_info        += 1;
+            page->u.inuse.type_info += 1 | PGT_pinned;
+        }
+
+        /* Iterate. */
+        if ( !((unsigned long)++pl1e & (PAGE_SIZE - 1)) )
+        {
+            if ( !((unsigned long)++pl2e & (PAGE_SIZE - 1)) )
+            {
+                if ( !((unsigned long)++pl3e & (PAGE_SIZE - 1)) )
+                    pl3e = l4e_to_l3e(*++pl4e);
+                pl2e = l3e_to_l2e(*pl3e);
+            }
+            pl1e = l2e_to_l1e(*pl2e);
+        }
+    }
+}
+
+static __init void setup_pv_physmap(struct domain *d, unsigned long pgtbl_pfn,
+                                    unsigned long v_start, unsigned long v_end,
+                                    unsigned long vphysmap_start,
+                                    unsigned long vphysmap_end,
+                                    unsigned long nr_pages)
+{
+    struct page_info *page = NULL;
+    l4_pgentry_t *pl4e, *l4start = map_domain_page(pgtbl_pfn);
+    l3_pgentry_t *pl3e = NULL;
+    l2_pgentry_t *pl2e = NULL;
+    l1_pgentry_t *pl1e = NULL;
+
+    if ( v_start <= vphysmap_end && vphysmap_start <= v_end )
+        panic("DOM0 P->M table overlaps initial mapping");
+
+    while ( vphysmap_start < vphysmap_end )
+    {
+        if ( d->tot_pages + ((round_pgup(vphysmap_end) - vphysmap_start)
+                             >> PAGE_SHIFT) + 3 > nr_pages )
+            panic("Dom0 allocation too small for initial P->M table");
+
+        if ( pl1e )
+        {
+            unmap_domain_page(pl1e);
+            pl1e = NULL;
+        }
+        if ( pl2e )
+        {
+            unmap_domain_page(pl2e);
+            pl2e = NULL;
+        }
+        if ( pl3e )
+        {
+            unmap_domain_page(pl3e);
+            pl3e = NULL;
+        }
+        pl4e = l4start + l4_table_offset(vphysmap_start);
+        if ( !l4e_get_intpte(*pl4e) )
+        {
+            page = alloc_domheap_page(d, 0);
+            if ( !page )
+                break;
+
+            /* No mapping, PGC_allocated + page-table page. */
+            page->count_info = PGC_allocated | 2;
+            page->u.inuse.type_info = PGT_l3_page_table | PGT_validated | 1;
+            pl3e = __map_domain_page(page);
+            clear_page(pl3e);
+            *pl4e = l4e_from_page(page, L4_PROT);
+        } else
+            pl3e = map_domain_page(l4e_get_pfn(*pl4e));
+
+        pl3e += l3_table_offset(vphysmap_start);
+        if ( !l3e_get_intpte(*pl3e) )
+        {
+            if ( cpu_has_page1gb &&
+                 !(vphysmap_start & ((1UL << L3_PAGETABLE_SHIFT) - 1)) &&
+                 vphysmap_end >= vphysmap_start + (1UL << L3_PAGETABLE_SHIFT) &&
+                 (page = alloc_domheap_pages(d,
+                                             L3_PAGETABLE_SHIFT - PAGE_SHIFT,
+                                             0)) != NULL )
+            {
+                *pl3e = l3e_from_page(page, L1_PROT|_PAGE_DIRTY|_PAGE_PSE);
+                vphysmap_start += 1UL << L3_PAGETABLE_SHIFT;
+                continue;
+            }
+            if ( (page = alloc_domheap_page(d, 0)) == NULL )
+                break;
+
+            /* No mapping, PGC_allocated + page-table page. */
+            page->count_info = PGC_allocated | 2;
+            page->u.inuse.type_info = PGT_l2_page_table | PGT_validated | 1;
+            pl2e = __map_domain_page(page);
+            clear_page(pl2e);
+            *pl3e = l3e_from_page(page, L3_PROT);
+        }
+        else
+           pl2e = map_domain_page(l3e_get_pfn(*pl3e));
+
+        pl2e += l2_table_offset(vphysmap_start);
+        if ( !l2e_get_intpte(*pl2e) )
+        {
+            if ( !(vphysmap_start & ((1UL << L2_PAGETABLE_SHIFT) - 1)) &&
+                 vphysmap_end >= vphysmap_start + (1UL << L2_PAGETABLE_SHIFT) &&
+                 (page = alloc_domheap_pages(d,
+                                             L2_PAGETABLE_SHIFT - PAGE_SHIFT,
+                                             0)) != NULL )
+            {
+                *pl2e = l2e_from_page(page, L1_PROT|_PAGE_DIRTY|_PAGE_PSE);
+                if ( opt_allow_superpage )
+                    get_superpage(page_to_mfn(page), d);
+                vphysmap_start += 1UL << L2_PAGETABLE_SHIFT;
+                continue;
+            }
+            if ( (page = alloc_domheap_page(d, 0)) == NULL )
+                break;
+
+            /* No mapping, PGC_allocated + page-table page. */
+            page->count_info = PGC_allocated | 2;
+            page->u.inuse.type_info = PGT_l1_page_table | PGT_validated | 1;
+            pl1e = __map_domain_page(page);
+            clear_page(pl1e);
+            *pl2e = l2e_from_page(page, L2_PROT);
+        }
+        else
+            pl1e = map_domain_page(l2e_get_pfn(*pl2e));
+
+        pl1e += l1_table_offset(vphysmap_start);
+        BUG_ON(l1e_get_intpte(*pl1e));
+        page = alloc_domheap_page(d, 0);
+        if ( !page )
+            break;
+
+        *pl1e = l1e_from_page(page, L1_PROT|_PAGE_DIRTY);
+        vphysmap_start += PAGE_SIZE;
+        vphysmap_start &= PAGE_MASK;
+    }
+    if ( !page )
+        panic("Not enough RAM for DOM0 P->M table");
+
+    if ( pl1e )
+        unmap_domain_page(pl1e);
+    if ( pl2e )
+        unmap_domain_page(pl2e);
+    if ( pl3e )
+        unmap_domain_page(pl3e);
+
+    unmap_domain_page(l4start);
 }
 
 int __init construct_dom0(
@@ -380,7 +561,7 @@ int __init construct_dom0(
 #endif
     elf_parse_binary(&elf);
     if ( (rc = elf_xen_parse(&elf, &parms)) != 0 )
-        return rc;
+        goto out;
 
     /* compatibility check */
     compatible = 0;
@@ -408,14 +589,16 @@ int __init construct_dom0(
     if ( !compatible )
     {
         printk("Mismatch between Xen and DOM0 kernel\n");
-        return -EINVAL;
+        rc = -EINVAL;
+        goto out;
     }
 
     if ( parms.elf_notes[XEN_ELFNOTE_SUPPORTED_FEATURES].type != XEN_ENT_NONE &&
          !test_bit(XENFEAT_dom0, parms.f_supported) )
     {
         printk("Kernel does not support Dom0 operation\n");
-        return -EINVAL;
+        rc = -EINVAL;
+        goto out;
     }
 
     if ( compat32 )
@@ -437,7 +620,7 @@ int __init construct_dom0(
         value = (parms.virt_hv_start_low + mask) & ~mask;
         BUG_ON(!is_pv_32bit_domain(d));
         if ( value > __HYPERVISOR_COMPAT_VIRT_START )
-            panic("Domain 0 expects too high a hypervisor start address.\n");
+            panic("Domain 0 expects too high a hypervisor start address");
         HYPERVISOR_COMPAT_VIRT_START(d) =
             max_t(unsigned int, m2p_compat_vstart, value);
     }
@@ -507,7 +690,7 @@ int __init construct_dom0(
         count -= PAGE_ALIGN(initrd_len);
     order = get_order_from_bytes(count);
     if ( (1UL << order) + PFN_UP(initrd_len) > nr_pages )
-        panic("Domain 0 allocation is too small for kernel image.\n");
+        panic("Domain 0 allocation is too small for kernel image");
 
     if ( parms.p2m_base != UNSET_ADDR )
     {
@@ -516,7 +699,7 @@ int __init construct_dom0(
     }
     page = alloc_domheap_pages(d, order, 0);
     if ( page == NULL )
-        panic("Not enough RAM for domain 0 allocation.\n");
+        panic("Not enough RAM for domain 0 allocation");
     alloc_spfn = page_to_mfn(page);
     alloc_epfn = alloc_spfn + d->tot_pages;
 
@@ -533,7 +716,7 @@ int __init construct_dom0(
             order = get_order_from_pages(count);
             page = alloc_domheap_pages(d, order, 0);
             if ( !page )
-                panic("Not enough RAM for domain 0 initrd.\n");
+                panic("Not enough RAM for domain 0 initrd");
             for ( count = -count; order--; )
                 if ( count & (1UL << order) )
                 {
@@ -596,7 +779,8 @@ int __init construct_dom0(
          (v_end > HYPERVISOR_COMPAT_VIRT_START(d)) )
     {
         printk("DOM0 image overlaps with Xen private area.\n");
-        return -EINVAL;
+        rc = -EINVAL;
+        goto out;
     }
 
     if ( is_pv_32on64_domain(d) )
@@ -615,18 +799,14 @@ int __init construct_dom0(
     {
         page = alloc_domheap_page(NULL, 0);
         if ( !page )
-            panic("Not enough RAM for domain 0 PML4.\n");
+            panic("Not enough RAM for domain 0 PML4");
         page->u.inuse.type_info = PGT_l4_page_table|PGT_validated|1;
         l4start = l4tab = page_to_virt(page);
         maddr_to_page(mpt_alloc)->u.inuse.type_info = PGT_l3_page_table;
         l3start = __va(mpt_alloc); mpt_alloc += PAGE_SIZE;
     }
-    copy_page(l4tab, idle_pg_table);
-    l4tab[0] = l4e_empty(); /* zap trampoline mapping */
-    l4tab[l4_table_offset(LINEAR_PT_VIRT_START)] =
-        l4e_from_paddr(__pa(l4start), __PAGE_HYPERVISOR);
-    l4tab[l4_table_offset(PERDOMAIN_VIRT_START)] =
-        l4e_from_paddr(__pa(d->arch.mm_perdomain_l3), __PAGE_HYPERVISOR);
+    clear_page(l4tab);
+    init_guest_l4_table(l4tab, d);
     v->arch.guest_table = pagetable_from_paddr(__pa(l4start));
     if ( is_pv_32on64_domain(d) )
         v->arch.guest_table_user = v->arch.guest_table;
@@ -707,43 +887,8 @@ int __init construct_dom0(
     }
 
     /* Pages that are part of page tables must be read only. */
-    l4tab = l4start + l4_table_offset(vpt_start);
-    l3start = l3tab = l4e_to_l3e(*l4tab);
-    l3tab += l3_table_offset(vpt_start);
-    l2start = l2tab = l3e_to_l2e(*l3tab);
-    l2tab += l2_table_offset(vpt_start);
-    l1start = l1tab = l2e_to_l1e(*l2tab);
-    l1tab += l1_table_offset(vpt_start);
-    for ( count = 0; count < nr_pt_pages; count++ ) 
-    {
-        l1e_remove_flags(*l1tab, _PAGE_RW);
-        page = mfn_to_page(l1e_get_pfn(*l1tab));
-
-        /* Read-only mapping + PGC_allocated + page-table page. */
-        page->count_info         = PGC_allocated | 3;
-        page->u.inuse.type_info |= PGT_validated | 1;
-
-        /* Top-level p.t. is pinned. */
-        if ( (page->u.inuse.type_info & PGT_type_mask) ==
-             (!is_pv_32on64_domain(d) ?
-              PGT_l4_page_table : PGT_l3_page_table) )
-        {
-            page->count_info        += 1;
-            page->u.inuse.type_info += 1 | PGT_pinned;
-        }
-
-        /* Iterate. */
-        if ( !((unsigned long)++l1tab & (PAGE_SIZE - 1)) )
-        {
-            if ( !((unsigned long)++l2tab & (PAGE_SIZE - 1)) )
-            {
-                if ( !((unsigned long)++l3tab & (PAGE_SIZE - 1)) )
-                    l3start = l3tab = l4e_to_l3e(*++l4tab);
-                l2start = l2tab = l3e_to_l2e(*l3tab);
-            }
-            l1start = l1tab = l2e_to_l1e(*l2tab);
-        }
-    }
+    if  ( is_pv_domain(d) )
+        mark_pv_pt_pages_rdonly(d, l4start, vpt_start, nr_pt_pages);
 
     /* Mask all upcalls... */
     for ( i = 0; i < XEN_LEGACY_MAX_VCPUS; i++ )
@@ -766,14 +911,16 @@ int __init construct_dom0(
 
     /* We run on dom0's page tables for the final part of the build process. */
     write_ptbase(v);
+    mapcache_override_current(v);
 
     /* Copy the OS image and free temporary buffer. */
-    elf.dest = (void*)vkern_start;
+    elf.dest_base = (void*)vkern_start;
+    elf.dest_size = vkern_end - vkern_start;
     rc = elf_load_binary(&elf);
     if ( rc < 0 )
     {
         printk("Failed to load the kernel binary\n");
-        return rc;
+        goto out;
     }
     bootstrap_map(NULL);
 
@@ -782,9 +929,11 @@ int __init construct_dom0(
         if ( (parms.virt_hypercall < v_start) ||
              (parms.virt_hypercall >= v_end) )
         {
+            mapcache_override_current(NULL);
             write_ptbase(current);
             printk("Invalid HYPERCALL_PAGE field in ELF notes.\n");
-            return -1;
+            rc = -1;
+            goto out;
         }
         hypercall_page_initialise(
             d, (void *)(unsigned long)parms.virt_hypercall);
@@ -811,104 +960,13 @@ int __init construct_dom0(
              elf_64bit(&elf) ? 64 : 32, parms.pae ? "p" : "");
 
     count = d->tot_pages;
+
     /* Set up the phys->machine table if not part of the initial mapping. */
-    if ( parms.p2m_base != UNSET_ADDR )
+    if ( is_pv_domain(d) && parms.p2m_base != UNSET_ADDR )
     {
-        unsigned long va = vphysmap_start;
-
-        if ( v_start <= vphysmap_end && vphysmap_start <= v_end )
-            panic("DOM0 P->M table overlaps initial mapping");
-
-        while ( va < vphysmap_end )
-        {
-            if ( d->tot_pages + ((round_pgup(vphysmap_end) - va)
-                                 >> PAGE_SHIFT) + 3 > nr_pages )
-                panic("Dom0 allocation too small for initial P->M table.\n");
-
-            l4tab = l4start + l4_table_offset(va);
-            if ( !l4e_get_intpte(*l4tab) )
-            {
-                page = alloc_domheap_page(d, 0);
-                if ( !page )
-                    break;
-                /* No mapping, PGC_allocated + page-table page. */
-                page->count_info = PGC_allocated | 2;
-                page->u.inuse.type_info =
-                    PGT_l3_page_table | PGT_validated | 1;
-                clear_page(page_to_virt(page));
-                *l4tab = l4e_from_page(page, L4_PROT);
-            }
-            l3tab = page_to_virt(l4e_get_page(*l4tab));
-            l3tab += l3_table_offset(va);
-            if ( !l3e_get_intpte(*l3tab) )
-            {
-                if ( cpu_has_page1gb &&
-                     !(va & ((1UL << L3_PAGETABLE_SHIFT) - 1)) &&
-                     vphysmap_end >= va + (1UL << L3_PAGETABLE_SHIFT) &&
-                     (page = alloc_domheap_pages(d,
-                                                 L3_PAGETABLE_SHIFT -
-                                                     PAGE_SHIFT,
-                                                 0)) != NULL )
-                {
-                    *l3tab = l3e_from_page(page,
-                                           L1_PROT|_PAGE_DIRTY|_PAGE_PSE);
-                    va += 1UL << L3_PAGETABLE_SHIFT;
-                    continue;
-                }
-                if ( (page = alloc_domheap_page(d, 0)) == NULL )
-                    break;
-                else
-                {
-                    /* No mapping, PGC_allocated + page-table page. */
-                    page->count_info = PGC_allocated | 2;
-                    page->u.inuse.type_info =
-                        PGT_l2_page_table | PGT_validated | 1;
-                    clear_page(page_to_virt(page));
-                    *l3tab = l3e_from_page(page, L3_PROT);
-                }
-            }
-            l2tab = page_to_virt(l3e_get_page(*l3tab));
-            l2tab += l2_table_offset(va);
-            if ( !l2e_get_intpte(*l2tab) )
-            {
-                if ( !(va & ((1UL << L2_PAGETABLE_SHIFT) - 1)) &&
-                     vphysmap_end >= va + (1UL << L2_PAGETABLE_SHIFT) &&
-                     (page = alloc_domheap_pages(d,
-                                                 L2_PAGETABLE_SHIFT -
-                                                     PAGE_SHIFT,
-                                                 0)) != NULL )
-                {
-                    *l2tab = l2e_from_page(page,
-                                           L1_PROT|_PAGE_DIRTY|_PAGE_PSE);
-                    if ( opt_allow_superpage )
-                        get_superpage(page_to_mfn(page), d);
-                    va += 1UL << L2_PAGETABLE_SHIFT;
-                    continue;
-                }
-                if ( (page = alloc_domheap_page(d, 0)) == NULL )
-                    break;
-                else
-                {
-                    /* No mapping, PGC_allocated + page-table page. */
-                    page->count_info = PGC_allocated | 2;
-                    page->u.inuse.type_info =
-                        PGT_l1_page_table | PGT_validated | 1;
-                    clear_page(page_to_virt(page));
-                    *l2tab = l2e_from_page(page, L2_PROT);
-                }
-            }
-            l1tab = page_to_virt(l2e_get_page(*l2tab));
-            l1tab += l1_table_offset(va);
-            BUG_ON(l1e_get_intpte(*l1tab));
-            page = alloc_domheap_page(d, 0);
-            if ( !page )
-                break;
-            *l1tab = l1e_from_page(page, L1_PROT|_PAGE_DIRTY);
-            va += PAGE_SIZE;
-            va &= PAGE_MASK;
-        }
-        if ( !page )
-            panic("Not enough RAM for DOM0 P->M table.\n");
+        pfn = pagetable_get_pfn(v->arch.guest_table);
+        setup_pv_physmap(d, pfn, v_start, v_end, vphysmap_start, vphysmap_end,
+                         nr_pages);
     }
 
     /* Write the phys->machine and machine->phys table entries. */
@@ -961,7 +1019,7 @@ int __init construct_dom0(
     while ( pfn < nr_pages )
     {
         if ( (page = alloc_chunk(d, nr_pages - d->tot_pages)) == NULL )
-            panic("Not enough RAM for DOM0 reservation.\n");
+            panic("Not enough RAM for DOM0 reservation");
         while ( pfn < d->tot_pages )
         {
             mfn = page_to_mfn(page);
@@ -1000,6 +1058,7 @@ int __init construct_dom0(
         xlat_start_info(si, XLAT_start_info_console_dom0);
 
     /* Return to idle domain's page tables. */
+    mapcache_override_current(NULL);
     write_ptbase(current);
 
     update_domain_wallclock_time(d);
@@ -1042,37 +1101,38 @@ int __init construct_dom0(
         printk("Dom0 runs in ring 0 (supervisor mode)\n");
         if ( !test_bit(XENFEAT_supervisor_mode_kernel,
                        parms.f_supported) )
-            panic("Dom0 does not support supervisor-mode execution\n");
+            panic("Dom0 does not support supervisor-mode execution");
     }
     else
     {
         if ( test_bit(XENFEAT_supervisor_mode_kernel, parms.f_required) )
-            panic("Dom0 requires supervisor-mode execution\n");
+            panic("Dom0 requires supervisor-mode execution");
     }
 
     rc = 0;
 
-    /* DOM0 is permitted full I/O capabilities. */
-    rc |= ioports_permit_access(dom0, 0, 0xFFFF);
-    rc |= iomem_permit_access(dom0, 0UL, ~0UL);
-    rc |= irqs_permit_access(dom0, 0, d->nr_pirqs - 1);
+    /* The hardware domain is initially permitted full I/O capabilities. */
+    rc |= ioports_permit_access(hardware_domain, 0, 0xFFFF);
+    rc |= iomem_permit_access(hardware_domain, 0UL, ~0UL);
+    rc |= irqs_permit_access(hardware_domain, 1, nr_irqs_gsi - 1);
 
     /*
      * Modify I/O port access permissions.
      */
     /* Master Interrupt Controller (PIC). */
-    rc |= ioports_deny_access(dom0, 0x20, 0x21);
+    rc |= ioports_deny_access(hardware_domain, 0x20, 0x21);
     /* Slave Interrupt Controller (PIC). */
-    rc |= ioports_deny_access(dom0, 0xA0, 0xA1);
+    rc |= ioports_deny_access(hardware_domain, 0xA0, 0xA1);
     /* Interval Timer (PIT). */
-    rc |= ioports_deny_access(dom0, 0x40, 0x43);
+    rc |= ioports_deny_access(hardware_domain, 0x40, 0x43);
     /* PIT Channel 2 / PC Speaker Control. */
-    rc |= ioports_deny_access(dom0, 0x61, 0x61);
+    rc |= ioports_deny_access(hardware_domain, 0x61, 0x61);
     /* ACPI PM Timer. */
     if ( pmtmr_ioport )
-        rc |= ioports_deny_access(dom0, pmtmr_ioport, pmtmr_ioport + 3);
+        rc |= ioports_deny_access(hardware_domain, pmtmr_ioport,
+		                          pmtmr_ioport + 3);
     /* PCI configuration space (NB. 0xcf8 has special treatment). */
-    rc |= ioports_deny_access(dom0, 0xcfc, 0xcff);
+    rc |= ioports_deny_access(hardware_domain, 0xcfc, 0xcff);
     /* Command-line I/O ranges. */
     process_dom0_ioports_disable();
 
@@ -1083,15 +1143,23 @@ int __init construct_dom0(
     if ( mp_lapic_addr != 0 )
     {
         mfn = paddr_to_pfn(mp_lapic_addr);
-        rc |= iomem_deny_access(dom0, mfn, mfn);
+        rc |= iomem_deny_access(hardware_domain, mfn, mfn);
     }
     /* I/O APICs. */
     for ( i = 0; i < nr_ioapics; i++ )
     {
         mfn = paddr_to_pfn(mp_ioapics[i].mpc_apicaddr);
-        if ( smp_found_config )
-            rc |= iomem_deny_access(dom0, mfn, mfn);
+        if ( !rangeset_contains_singleton(mmio_ro_ranges, mfn) )
+            rc |= iomem_deny_access(hardware_domain, mfn, mfn);
     }
+    /* MSI range. */
+    rc |= iomem_deny_access(hardware_domain, paddr_to_pfn(MSI_ADDR_BASE_LO),
+                            paddr_to_pfn(MSI_ADDR_BASE_LO +
+                                         MSI_ADDR_DEST_ID_MASK));
+    /* HyperTransport range. */
+    if ( boot_cpu_data.x86_vendor == X86_VENDOR_AMD )
+        rc |= iomem_deny_access(hardware_domain, paddr_to_pfn(0xfdULL << 32),
+                                paddr_to_pfn((1ULL << 40) - 1));
 
     /* Remove access to E820_UNUSABLE I/O regions above 1MB. */
     for ( i = 0; i < e820.nr_map; i++ )
@@ -1102,20 +1170,32 @@ int __init construct_dom0(
         if ( (e820.map[i].type == E820_UNUSABLE) &&
              (e820.map[i].size != 0) &&
              (sfn <= efn) )
-            rc |= iomem_deny_access(dom0, sfn, efn);
+            rc |= iomem_deny_access(hardware_domain, sfn, efn);
     }
 
     BUG_ON(rc != 0);
 
-    iommu_dom0_init(dom0);
+    if ( elf_check_broken(&elf) )
+        printk(" Xen warning: dom0 kernel broken ELF: %s\n",
+               elf_check_broken(&elf));
+
+    if ( d->domain_id == hardware_domid )
+        iommu_hwdom_init(d);
 
     return 0;
+
+out:
+    if ( elf_check_broken(&elf) )
+        printk(" Xen dom0 kernel broken ELF: %s\n",
+               elf_check_broken(&elf));
+
+    return rc;
 }
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

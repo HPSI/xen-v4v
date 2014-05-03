@@ -14,7 +14,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 #ifndef __LIBELF_PRIVATE_H__
-#define __LIBELF_PRIVATE_H_
+#define __LIBELF_PRIVATE_H__
 
 #ifdef __XEN__
 
@@ -77,7 +77,7 @@
 #define elf_err(elf, fmt, args ... )                    \
     elf_call_log_callback(elf, 1, fmt , ## args );
 
-void elf_call_log_callback(struct elf_binary*, int iserr, const char *fmt,...);
+void elf_call_log_callback(struct elf_binary*, bool iserr, const char *fmt,...);
 
 #define safe_strcpy(d,s)                        \
 do { strncpy((d),(s),sizeof((d))-1);            \
@@ -86,12 +86,25 @@ do { strncpy((d),(s),sizeof((d))-1);            \
 
 #endif
 
-#endif /* __LIBELF_PRIVATE_H_ */
+#undef memcpy
+#undef memset
+#undef memmove
+#undef strcpy
+
+#define memcpy  MISTAKE_unspecified_memcpy
+#define memset  MISTAKE_unspecified_memset
+#define memmove MISTAKE_unspecified_memmove
+#define strcpy  MISTAKE_unspecified_strcpy
+  /* This prevents libelf from using these undecorated versions
+   * of memcpy, memset, memmove and strcpy.  Every call site
+   * must either use elf_mem*_unchecked, or elf_mem*_safe. */
+
+#endif /* __LIBELF_PRIVATE_H__ */
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

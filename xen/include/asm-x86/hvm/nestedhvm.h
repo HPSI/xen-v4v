@@ -52,6 +52,8 @@ bool_t nestedhvm_vcpu_in_guestmode(struct vcpu *v);
 #define NESTEDHVM_PAGEFAULT_L1_ERROR   2
 #define NESTEDHVM_PAGEFAULT_L0_ERROR   3
 #define NESTEDHVM_PAGEFAULT_MMIO       4
+#define NESTEDHVM_PAGEFAULT_RETRY      5
+#define NESTEDHVM_PAGEFAULT_DIRECT_MMIO 6
 int nestedhvm_hap_nested_page_fault(struct vcpu *v, paddr_t *L2_gpa,
     bool_t access_r, bool_t access_w, bool_t access_x);
 
@@ -66,5 +68,13 @@ unsigned long *nestedhvm_vcpu_iomap_get(bool_t ioport_80, bool_t ioport_ed);
 void nestedhvm_vmcx_flushtlb(struct p2m_domain *p2m);
 
 bool_t nestedhvm_is_n2(struct vcpu *v);
+
+static inline void nestedhvm_set_cr(struct vcpu *v, unsigned int cr,
+                                    unsigned long value)
+{
+    if ( !nestedhvm_vmswitch_in_progress(v) &&
+         nestedhvm_vcpu_in_guestmode(v) )
+        v->arch.hvm_vcpu.nvcpu.guest_cr[cr] = value;
+}
 
 #endif /* _HVM_NESTEDHVM_H */

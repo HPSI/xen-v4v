@@ -1,7 +1,7 @@
 XEN_ROOT = $(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
-MAJOR    = 4.2
+MAJOR    = 4.4
 MINOR    = 0
 
 CTRL_SRCS-y       :=
@@ -31,6 +31,7 @@ CTRL_SRCS-y       += xc_mem_access.c
 CTRL_SRCS-y       += xc_memshr.c
 CTRL_SRCS-y       += xc_hcall_buf.c
 CTRL_SRCS-y       += xc_foreign_memory.c
+CTRL_SRCS-y       += xc_kexec.c
 CTRL_SRCS-y       += xtl_core.c
 CTRL_SRCS-y       += xtl_logger_stdio.c
 CTRL_SRCS-$(CONFIG_X86) += xc_pagetab.c
@@ -51,13 +52,19 @@ endif
 vpath %.c ../../xen/common/libelf
 CFLAGS += -I../../xen/common/libelf
 
-GUEST_SRCS-y += libelf-tools.c libelf-loader.c
-GUEST_SRCS-y += libelf-dominfo.c libelf-relocate.c
+ELF_SRCS-y += libelf-tools.c libelf-loader.c
+ELF_SRCS-y += libelf-dominfo.c
+
+GUEST_SRCS-y += $(ELF_SRCS-y)
+
+$(patsubst %.c,%.o,$(ELF_SRCS-y)): CFLAGS += -Wno-pointer-sign
+$(patsubst %.c,%.opic,$(ELF_SRCS-y)): CFLAGS += -Wno-pointer-sign
 
 # new domain builder
 GUEST_SRCS-y                 += xc_dom_core.c xc_dom_boot.c
 GUEST_SRCS-y                 += xc_dom_elfloader.c
 GUEST_SRCS-$(CONFIG_X86)     += xc_dom_bzimageloader.c
+GUEST_SRCS-$(CONFIG_X86)     += xc_dom_decompress_lz4.c
 GUEST_SRCS-$(CONFIG_ARM)     += xc_dom_armzimageloader.c
 GUEST_SRCS-y                 += xc_dom_binloader.c
 GUEST_SRCS-y                 += xc_dom_compat_linux.c
@@ -67,6 +74,14 @@ GUEST_SRCS-$(CONFIG_X86)     += xc_cpuid_x86.c
 GUEST_SRCS-$(CONFIG_X86)     += xc_hvm_build_x86.c
 GUEST_SRCS-$(CONFIG_ARM)     += xc_dom_arm.c
 GUEST_SRCS-$(CONFIG_ARM)     += xc_hvm_build_arm.c
+
+ifeq ($(CONFIG_LIBXC_MINIOS),y)
+GUEST_SRCS-y                 += xc_dom_decompress_unsafe.c
+GUEST_SRCS-y                 += xc_dom_decompress_unsafe_bzip2.c
+GUEST_SRCS-y                 += xc_dom_decompress_unsafe_lzma.c
+GUEST_SRCS-y                 += xc_dom_decompress_unsafe_lzo1x.c
+GUEST_SRCS-y                 += xc_dom_decompress_unsafe_xz.c
+endif
 
 OSDEP_SRCS-y                 += xenctrl_osdep_ENOSYS.c
 
@@ -79,10 +94,6 @@ CFLAGS   += -I. $(CFLAGS_xeninclude)
 CFLAGS-$(CONFIG_Linux) += -D_GNU_SOURCE
 
 CFLAGS	+= $(PTHREAD_CFLAGS)
-
-# Define this to make it possible to run valgrind on code linked with these
-# libraries.
-#CFLAGS   += -DVALGRIND -O0 -ggdb3
 
 CTRL_LIB_OBJS := $(patsubst %.c,%.o,$(CTRL_SRCS-y))
 CTRL_PIC_OBJS := $(patsubst %.c,%.opic,$(CTRL_SRCS-y))

@@ -35,7 +35,7 @@ static int __initdata nr_amd_iommus;
 
 static struct tasklet amd_iommu_irq_tasklet;
 
-unsigned short ivrs_bdf_entries;
+unsigned int __read_mostly ivrs_bdf_entries;
 static struct radix_tree_root ivrs_maps;
 struct list_head amd_iommu_head;
 struct table_struct device_table;
@@ -48,19 +48,10 @@ static int iommu_has_ht_flag(struct amd_iommu *iommu, u8 mask)
 
 static int __init map_iommu_mmio_region(struct amd_iommu *iommu)
 {
-    unsigned long mfn;
-
-    if ( nr_amd_iommus > MAX_AMD_IOMMUS )
-    {
-        AMD_IOMMU_DEBUG("nr_amd_iommus %d > MAX_IOMMUS\n", nr_amd_iommus);
+    iommu->mmio_base = ioremap(iommu->mmio_base_phys,
+                               IOMMU_MMIO_REGION_LENGTH);
+    if ( !iommu->mmio_base )
         return -ENOMEM;
-    }
-
-    iommu->mmio_base = (void *)fix_to_virt(
-        FIX_IOMMU_MMIO_BASE_0 + nr_amd_iommus * MMIO_PAGES_PER_IOMMU);
-    mfn = (unsigned long)(iommu->mmio_base_phys >> PAGE_SHIFT);
-    map_pages_to_xen((unsigned long)iommu->mmio_base, mfn,
-                     MMIO_PAGES_PER_IOMMU, PAGE_HYPERVISOR_NOCACHE);
 
     memset(iommu->mmio_base, 0, IOMMU_MMIO_REGION_LENGTH);
 
@@ -254,8 +245,8 @@ static void set_iommu_command_buffer_control(struct amd_iommu *iommu,
     /*reset head and tail pointer manually before enablement */
     if ( enable )
     {
-        writel(0x0, iommu->mmio_base + IOMMU_CMD_BUFFER_HEAD_OFFSET);
-        writel(0x0, iommu->mmio_base + IOMMU_CMD_BUFFER_TAIL_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_CMD_BUFFER_HEAD_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_CMD_BUFFER_TAIL_OFFSET);
 
         iommu_set_bit(&entry, IOMMU_CONTROL_COMMAND_BUFFER_ENABLE_SHIFT);
     }
@@ -313,8 +304,8 @@ static void set_iommu_event_log_control(struct amd_iommu *iommu,
     /*reset head and tail pointer manually before enablement */
     if ( enable )
     {
-        writel(0x0, iommu->mmio_base + IOMMU_EVENT_LOG_HEAD_OFFSET);
-        writel(0x0, iommu->mmio_base + IOMMU_EVENT_LOG_TAIL_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_EVENT_LOG_HEAD_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_EVENT_LOG_TAIL_OFFSET);
 
         iommu_set_bit(&entry, IOMMU_CONTROL_EVENT_LOG_INT_SHIFT);
         iommu_set_bit(&entry, IOMMU_CONTROL_EVENT_LOG_ENABLE_SHIFT);
@@ -340,17 +331,17 @@ static void set_iommu_ppr_log_control(struct amd_iommu *iommu,
     /*reset head and tail pointer manually before enablement */
     if ( enable )
     {
-        writel(0x0, iommu->mmio_base + IOMMU_PPR_LOG_HEAD_OFFSET);
-        writel(0x0, iommu->mmio_base + IOMMU_PPR_LOG_TAIL_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_PPR_LOG_HEAD_OFFSET);
+        writeq(0, iommu->mmio_base + IOMMU_PPR_LOG_TAIL_OFFSET);
 
         iommu_set_bit(&entry, IOMMU_CONTROL_PPR_ENABLE_SHIFT);
-        iommu_set_bit(&entry, IOMMU_CONTROL_PPR_INT_SHIFT);
+        iommu_set_bit(&entry, IOMMU_CONTROL_PPR_LOG_INT_SHIFT);
         iommu_set_bit(&entry, IOMMU_CONTROL_PPR_LOG_ENABLE_SHIFT);
     }
     else
     {
         iommu_clear_bit(&entry, IOMMU_CONTROL_PPR_ENABLE_SHIFT);
-        iommu_clear_bit(&entry, IOMMU_CONTROL_PPR_INT_SHIFT);
+        iommu_clear_bit(&entry, IOMMU_CONTROL_PPR_LOG_INT_SHIFT);
         iommu_clear_bit(&entry, IOMMU_CONTROL_PPR_LOG_ENABLE_SHIFT);
     }
 
@@ -410,7 +401,7 @@ static void iommu_reset_log(struct amd_iommu *iommu,
                             void (*ctrl_func)(struct amd_iommu *iommu, int))
 {
     u32 entry;
-    int log_run, run_bit, of_bit;
+    int log_run, run_bit;
     int loop_count = 1000;
 
     BUG_ON(!iommu || ((log != &iommu->event_log) && (log != &iommu->ppr_log)));
@@ -418,10 +409,6 @@ static void iommu_reset_log(struct amd_iommu *iommu,
     run_bit = ( log == &iommu->event_log ) ?
         IOMMU_STATUS_EVENT_LOG_RUN_SHIFT :
         IOMMU_STATUS_PPR_LOG_RUN_SHIFT;
-
-    of_bit = ( log == &iommu->event_log ) ?
-        IOMMU_STATUS_EVENT_OVERFLOW_SHIFT :
-        IOMMU_STATUS_PPR_LOG_OVERFLOW_SHIFT;
 
     /* wait until EventLogRun bit = 0 */
     do {
@@ -439,9 +426,10 @@ static void iommu_reset_log(struct amd_iommu *iommu,
 
     ctrl_func(iommu, IOMMU_CONTROL_DISABLED);
 
-    /*clear overflow bit */
-    iommu_clear_bit(&entry, of_bit);
-    writel(entry, iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+    /* RW1C overflow bit */
+    writel(log == &iommu->event_log ? IOMMU_STATUS_EVENT_OVERFLOW_MASK
+                                    : IOMMU_STATUS_PPR_LOG_OVERFLOW_MASK,
+           iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
 
     /*reset event log base address */
     log->head = 0;
@@ -449,42 +437,10 @@ static void iommu_reset_log(struct amd_iommu *iommu,
     ctrl_func(iommu, IOMMU_CONTROL_ENABLED);
 }
 
-static void iommu_msi_set_affinity(struct irq_desc *desc, const cpumask_t *mask)
-{
-    struct msi_msg msg;
-    unsigned int dest;
-    struct amd_iommu *iommu = desc->action->dev_id;
-    u16 seg = iommu->seg;
-    u8 bus = PCI_BUS(iommu->bdf);
-    u8 dev = PCI_SLOT(iommu->bdf);
-    u8 func = PCI_FUNC(iommu->bdf);
-
-    dest = set_desc_affinity(desc, mask);
-
-    if ( dest == BAD_APICID )
-    {
-        dprintk(XENLOG_ERR, "Set iommu interrupt affinity error!\n");
-        return;
-    }
-
-    msi_compose_msg(desc, &msg);
-    /* Is this override really needed? */
-    msg.address_lo &= ~MSI_ADDR_DEST_ID_MASK;
-    msg.address_lo |= MSI_ADDR_DEST_ID(dest & 0xff);
-
-    pci_conf_write32(seg, bus, dev, func,
-        iommu->msi_cap + PCI_MSI_DATA_64, msg.data);
-    pci_conf_write32(seg, bus, dev, func,
-        iommu->msi_cap + PCI_MSI_ADDRESS_LO, msg.address_lo);
-    pci_conf_write32(seg, bus, dev, func,
-        iommu->msi_cap + PCI_MSI_ADDRESS_HI, msg.address_hi);
-    
-}
-
 static void amd_iommu_msi_enable(struct amd_iommu *iommu, int flag)
 {
     __msi_set_enable(iommu->seg, PCI_BUS(iommu->bdf), PCI_SLOT(iommu->bdf),
-                     PCI_FUNC(iommu->bdf), iommu->msi_cap, flag);
+                     PCI_FUNC(iommu->bdf), iommu->msi.msi_attrib.pos, flag);
 }
 
 static void iommu_msi_unmask(struct irq_desc *desc)
@@ -495,6 +451,7 @@ static void iommu_msi_unmask(struct irq_desc *desc)
     spin_lock_irqsave(&iommu->lock, flags);
     amd_iommu_msi_enable(iommu, IOMMU_CONTROL_ENABLED);
     spin_unlock_irqrestore(&iommu->lock, flags);
+    iommu->msi.msi_attrib.masked = 0;
 }
 
 static void iommu_msi_mask(struct irq_desc *desc)
@@ -507,6 +464,7 @@ static void iommu_msi_mask(struct irq_desc *desc)
     spin_lock_irqsave(&iommu->lock, flags);
     amd_iommu_msi_enable(iommu, IOMMU_CONTROL_DISABLED);
     spin_unlock_irqrestore(&iommu->lock, flags);
+    iommu->msi.msi_attrib.masked = 1;
 }
 
 static unsigned int iommu_msi_startup(struct irq_desc *desc)
@@ -530,7 +488,7 @@ static hw_irq_controller iommu_msi_type = {
     .disable = iommu_msi_mask,
     .ack = iommu_msi_mask,
     .end = iommu_msi_end,
-    .set_affinity = iommu_msi_set_affinity,
+    .set_affinity = set_msi_affinity,
 };
 
 static unsigned int iommu_maskable_msi_startup(struct irq_desc *desc)
@@ -561,12 +519,13 @@ static hw_irq_controller iommu_maskable_msi_type = {
     .disable = mask_msi_irq,
     .ack = iommu_maskable_msi_ack,
     .end = iommu_maskable_msi_end,
-    .set_affinity = iommu_msi_set_affinity,
+    .set_affinity = set_msi_affinity,
 };
 
 static void parse_event_log_entry(struct amd_iommu *iommu, u32 entry[])
 {
-    u16 domain_id, device_id, bdf, cword, flags;
+    u16 domain_id, device_id, flags;
+    unsigned int bdf;
     u32 code;
     u64 *addr;
     int count = 0;
@@ -620,18 +579,10 @@ static void parse_event_log_entry(struct amd_iommu *iommu, u32 entry[])
                "fault address = %#"PRIx64", flags = %#x\n",
                event_str[code-1], domain_id, device_id, *addr, flags);
 
-        /* Tell the device to stop DMAing; we can't rely on the guest to
-         * control it for us. */
         for ( bdf = 0; bdf < ivrs_bdf_entries; bdf++ )
             if ( get_dma_requestor_id(iommu->seg, bdf) == device_id )
-            {
-                cword = pci_conf_read16(iommu->seg, PCI_BUS(bdf),
-                                        PCI_SLOT(bdf), PCI_FUNC(bdf),
-                                        PCI_COMMAND);
-                pci_conf_write16(iommu->seg, PCI_BUS(bdf), PCI_SLOT(bdf),
-                                 PCI_FUNC(bdf), PCI_COMMAND, 
-                                 cword & ~PCI_COMMAND_MASTER);
-            }
+                pci_check_disable_device(iommu->seg, PCI_BUS(bdf),
+                                         PCI_DEVFN2(bdf));
     }
     else
     {
@@ -649,22 +600,41 @@ static void iommu_check_event_log(struct amd_iommu *iommu)
     u32 entry;
     unsigned long flags;
 
+    /* RW1C interrupt status bit */
+    writel(IOMMU_STATUS_EVENT_LOG_INT_MASK,
+           iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+
     iommu_read_log(iommu, &iommu->event_log,
                    sizeof(event_entry_t), parse_event_log_entry);
 
     spin_lock_irqsave(&iommu->lock, flags);
     
-    /*check event overflow */
+    /* Check event overflow. */
     entry = readl(iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
-
     if ( iommu_get_bit(entry, IOMMU_STATUS_EVENT_OVERFLOW_SHIFT) )
         iommu_reset_log(iommu, &iommu->event_log, set_iommu_event_log_control);
+    else
+    {
+        entry = readl(iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
+        if ( !(entry & IOMMU_CONTROL_EVENT_LOG_INT_MASK) )
+        {
+            entry |= IOMMU_CONTROL_EVENT_LOG_INT_MASK;
+            writel(entry, iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
+            /*
+             * Re-schedule the tasklet to handle eventual log entries added
+             * between reading the log above and re-enabling the interrupt.
+             */
+            tasklet_schedule(&amd_iommu_irq_tasklet);
+        }
+    }
 
-    /* reset interrupt status bit */
+    /*
+     * Workaround for erratum787:
+     * Re-check to make sure the bit has been cleared.
+     */
     entry = readl(iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
-    iommu_set_bit(&entry, IOMMU_STATUS_EVENT_LOG_INT_SHIFT);
-
-    writel(entry, iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+    if ( entry & IOMMU_STATUS_EVENT_LOG_INT_MASK )
+        tasklet_schedule(&amd_iommu_irq_tasklet);
 
     spin_unlock_irqrestore(&iommu->lock, flags);
 }
@@ -705,7 +675,7 @@ void parse_ppr_log_entry(struct amd_iommu *iommu, u32 entry[])
     devfn = PCI_DEVFN2(device_id);
 
     spin_lock(&pcidevs_lock);
-    pdev = pci_get_pdev(iommu->seg, bus, devfn);
+    pdev = pci_get_real_pdev(iommu->seg, bus, devfn);
     spin_unlock(&pcidevs_lock);
 
     if ( pdev )
@@ -719,22 +689,41 @@ static void iommu_check_ppr_log(struct amd_iommu *iommu)
     u32 entry;
     unsigned long flags;
 
+    /* RW1C interrupt status bit */
+    writel(IOMMU_STATUS_PPR_LOG_INT_MASK,
+           iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+
     iommu_read_log(iommu, &iommu->ppr_log,
                    sizeof(ppr_entry_t), parse_ppr_log_entry);
     
     spin_lock_irqsave(&iommu->lock, flags);
 
-    /*check event overflow */
+    /* Check event overflow. */
     entry = readl(iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
-
     if ( iommu_get_bit(entry, IOMMU_STATUS_PPR_LOG_OVERFLOW_SHIFT) )
         iommu_reset_log(iommu, &iommu->ppr_log, set_iommu_ppr_log_control);
+    else
+    {
+        entry = readl(iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
+        if ( !(entry & IOMMU_CONTROL_PPR_LOG_INT_MASK) )
+        {
+            entry |= IOMMU_CONTROL_PPR_LOG_INT_MASK;
+            writel(entry, iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
+            /*
+             * Re-schedule the tasklet to handle eventual log entries added
+             * between reading the log above and re-enabling the interrupt.
+             */
+            tasklet_schedule(&amd_iommu_irq_tasklet);
+        }
+    }
 
-    /* reset interrupt status bit */
+    /*
+     * Workaround for erratum787:
+     * Re-check to make sure the bit has been cleared.
+     */
     entry = readl(iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
-    iommu_set_bit(&entry, IOMMU_STATUS_PPR_LOG_INT_SHIFT);
-
-    writel(entry, iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
+    if ( entry & IOMMU_STATUS_PPR_LOG_INT_MASK )
+        tasklet_schedule(&amd_iommu_irq_tasklet);
 
     spin_unlock_irqrestore(&iommu->lock, flags);
 }
@@ -771,11 +760,14 @@ static void iommu_interrupt_handler(int irq, void *dev_id,
 
     spin_lock_irqsave(&iommu->lock, flags);
 
-    /* Silence interrupts from both event and PPR logging */
-    entry = readl(iommu->mmio_base + IOMMU_STATUS_MMIO_OFFSET);
-    iommu_clear_bit(&entry, IOMMU_STATUS_EVENT_LOG_INT_SHIFT);
-    iommu_clear_bit(&entry, IOMMU_STATUS_PPR_LOG_INT_SHIFT);
-    writel(entry, iommu->mmio_base+IOMMU_STATUS_MMIO_OFFSET);
+    /*
+     * Silence interrupts from both event and PPR by clearing the
+     * enable logging bits in the control register
+     */
+    entry = readl(iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
+    iommu_clear_bit(&entry, IOMMU_CONTROL_EVENT_LOG_INT_SHIFT);
+    iommu_clear_bit(&entry, IOMMU_CONTROL_PPR_LOG_INT_SHIFT);
+    writel(entry, iommu->mmio_base + IOMMU_CONTROL_MMIO_OFFSET);
 
     spin_unlock_irqrestore(&iommu->lock, flags);
 
@@ -783,9 +775,11 @@ static void iommu_interrupt_handler(int irq, void *dev_id,
     tasklet_schedule(&amd_iommu_irq_tasklet);
 }
 
-static int __init set_iommu_interrupt_handler(struct amd_iommu *iommu)
+static bool_t __init set_iommu_interrupt_handler(struct amd_iommu *iommu)
 {
     int irq, ret;
+    hw_irq_controller *handler;
+    unsigned long flags;
     u16 control;
 
     irq = create_irq(NUMA_NO_NODE);
@@ -794,28 +788,86 @@ static int __init set_iommu_interrupt_handler(struct amd_iommu *iommu)
         dprintk(XENLOG_ERR, "IOMMU: no irqs\n");
         return 0;
     }
-    
+
+    spin_lock_irqsave(&pcidevs_lock, flags);
+    iommu->msi.dev = pci_get_pdev(iommu->seg, PCI_BUS(iommu->bdf),
+                                  PCI_DEVFN2(iommu->bdf));
+    spin_unlock_irqrestore(&pcidevs_lock, flags);
+    if ( !iommu->msi.dev )
+    {
+        AMD_IOMMU_DEBUG("IOMMU: no pdev for %04x:%02x:%02x.%u\n",
+                        iommu->seg, PCI_BUS(iommu->bdf),
+                        PCI_SLOT(iommu->bdf), PCI_FUNC(iommu->bdf));
+        return 0;
+    }
     control = pci_conf_read16(iommu->seg, PCI_BUS(iommu->bdf),
                               PCI_SLOT(iommu->bdf), PCI_FUNC(iommu->bdf),
-                              iommu->msi_cap + PCI_MSI_FLAGS);
-    irq_desc[irq].handler = control & PCI_MSI_FLAGS_MASKBIT ?
-                            &iommu_maskable_msi_type : &iommu_msi_type;
-    ret = request_irq(irq, iommu_interrupt_handler, 0, "amd_iommu", iommu);
+                              iommu->msi.msi_attrib.pos + PCI_MSI_FLAGS);
+    iommu->msi.msi.nvec = 1;
+    if ( is_mask_bit_support(control) )
+    {
+        iommu->msi.msi_attrib.maskbit = 1;
+        iommu->msi.msi.mpos = msi_mask_bits_reg(iommu->msi.msi_attrib.pos,
+                                                is_64bit_address(control));
+        handler = &iommu_maskable_msi_type;
+    }
+    else
+        handler = &iommu_msi_type;
+    ret = __setup_msi_irq(irq_to_desc(irq), &iommu->msi, handler);
+    if ( !ret )
+        ret = request_irq(irq, iommu_interrupt_handler, "amd_iommu", iommu);
     if ( ret )
     {
-        irq_desc[irq].handler = &no_irq_type;
         destroy_irq(irq);
         AMD_IOMMU_DEBUG("can't request irq\n");
         return 0;
     }
 
-    iommu->irq = irq;
-    return irq;
+    iommu->msi.irq = irq;
+
+    return 1;
+}
+
+/*
+ * Family15h Model 10h-1fh erratum 746 (IOMMU Logging May Stall Translations)
+ * Workaround:
+ *     BIOS should disable L2B micellaneous clock gating by setting
+ *     L2_L2B_CK_GATE_CONTROL[CKGateL2BMiscDisable](D0F2xF4_x90[2]) = 1b
+ */
+static void amd_iommu_erratum_746_workaround(struct amd_iommu *iommu)
+{
+    u32 value;
+    u8 bus = PCI_BUS(iommu->bdf);
+    u8 dev = PCI_SLOT(iommu->bdf);
+    u8 func = PCI_FUNC(iommu->bdf);
+
+    if ( (boot_cpu_data.x86 != 0x15) ||
+         (boot_cpu_data.x86_model < 0x10) ||
+         (boot_cpu_data.x86_model > 0x1f) )
+        return;
+
+    pci_conf_write32(iommu->seg, bus, dev, func, 0xf0, 0x90);
+    value = pci_conf_read32(iommu->seg, bus, dev, func, 0xf4);
+
+    if ( value & (1 << 2) )
+        return;
+
+    /* Select NB indirect register 0x90 and enable writing */
+    pci_conf_write32(iommu->seg, bus, dev, func, 0xf0, 0x90 | (1 << 8));
+
+    pci_conf_write32(iommu->seg, bus, dev, func, 0xf4, value | (1 << 2));
+    printk(XENLOG_INFO
+           "AMD-Vi: Applying erratum 746 workaround for IOMMU at %04x:%02x:%02x.%u\n",
+           iommu->seg, bus, dev, func);
+
+    /* Clear the enable writing bit */
+    pci_conf_write32(iommu->seg, bus, dev, func, 0xf0, 0x90);
 }
 
 static void enable_iommu(struct amd_iommu *iommu)
 {
     unsigned long flags;
+    struct irq_desc *desc;
 
     spin_lock_irqsave(&iommu->lock, flags);
 
@@ -825,6 +877,8 @@ static void enable_iommu(struct amd_iommu *iommu)
         return;
     }
 
+    amd_iommu_erratum_746_workaround(iommu);
+
     register_iommu_dev_table_in_mmio_space(iommu);
     register_iommu_cmd_buffer_in_mmio_space(iommu);
     register_iommu_event_log_in_mmio_space(iommu);
@@ -833,7 +887,11 @@ static void enable_iommu(struct amd_iommu *iommu)
     if ( iommu_has_feature(iommu, IOMMU_EXT_FEATURE_PPRSUP_SHIFT) )
         register_iommu_ppr_log_in_mmio_space(iommu);
 
-    iommu_msi_set_affinity(irq_to_desc(iommu->irq), &cpu_online_map);
+    desc = irq_to_desc(iommu->msi.irq);
+    spin_lock(&desc->lock);
+    set_msi_affinity(desc, &cpu_online_map);
+    spin_unlock(&desc->lock);
+
     amd_iommu_msi_enable(iommu, IOMMU_CONTROL_ENABLED);
 
     set_iommu_ht_flags(iommu);
@@ -955,7 +1013,7 @@ static int __init amd_iommu_init_one(struct amd_iommu *iommu)
         if ( allocate_ppr_log(iommu) == NULL )
             goto error_out;
 
-    if ( set_iommu_interrupt_handler(iommu) == 0 )
+    if ( !set_iommu_interrupt_handler(iommu) )
         goto error_out;
 
     /* To make sure that device_table.buffer has been successfully allocated */
@@ -1046,7 +1104,7 @@ int iterate_ivrs_entries(int (*handler)(u16 seg, struct ivrs_mappings *))
 
     do {
         struct ivrs_mappings *map;
-        int bdf;
+        unsigned int bdf;
 
         if ( !radix_tree_gang_lookup(&ivrs_maps, (void **)&map, seg, 1) )
             break;
@@ -1061,7 +1119,7 @@ int iterate_ivrs_entries(int (*handler)(u16 seg, struct ivrs_mappings *))
 static int __init alloc_ivrs_mappings(u16 seg)
 {
     struct ivrs_mappings *ivrs_mappings;
-    int bdf;
+    unsigned int bdf;
 
     BUG_ON( !ivrs_bdf_entries );
 
@@ -1099,7 +1157,7 @@ static int __init alloc_ivrs_mappings(u16 seg)
 static int __init amd_iommu_setup_device_table(
     u16 seg, struct ivrs_mappings *ivrs_mappings)
 {
-    int bdf;
+    unsigned int bdf;
     void *intr_tb, *dte;
 
     BUG_ON( (ivrs_bdf_entries == 0) );
@@ -1136,11 +1194,45 @@ static int __init amd_iommu_setup_device_table(
     return 0;
 }
 
+/* Check whether SP5100 SATA Combined mode is on */
+static bool_t __init amd_sp5100_erratum28(void)
+{
+    u32 bus, id;
+    u16 vendor_id, dev_id;
+    u8 byte;
+
+    for (bus = 0; bus < 256; bus++)
+    {
+        id = pci_conf_read32(0, bus, 0x14, 0, PCI_VENDOR_ID);
+
+        vendor_id = id & 0xffff;
+        dev_id = (id >> 16) & 0xffff;
+
+        /* SP5100 SMBus module sets Combined mode on */
+        if (vendor_id != 0x1002 || dev_id != 0x4385)
+            continue;
+
+        byte = pci_conf_read8(0, bus, 0x14, 0, 0xad);
+        if ( (byte >> 3) & 1 )
+        {
+            printk(XENLOG_WARNING "AMD-Vi: SP5100 erratum 28 detected, disabling IOMMU.\n"
+                   "If possible, disable SATA Combined mode in BIOS or contact your vendor for BIOS update.\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 int __init amd_iommu_init(void)
 {
     struct amd_iommu *iommu;
 
     BUG_ON( !iommu_found() );
+
+    if ( iommu_intremap && amd_iommu_perdev_intremap &&
+         amd_sp5100_erratum28() )
+        goto error_out;
 
     ivrs_bdf_entries = amd_iommu_get_ivrs_dev_entries();
 
@@ -1156,7 +1248,7 @@ int __init amd_iommu_init(void)
         goto error_out;
 
     /* initialize io-apic interrupt remapping entries */
-    if ( amd_iommu_setup_ioapic_remapping() != 0 )
+    if ( iommu_intremap && amd_iommu_setup_ioapic_remapping() != 0 )
         goto error_out;
 
     /* allocate and initialize a global device table shared by all iommus */
@@ -1215,7 +1307,8 @@ static void invalidate_all_domain_pages(void)
 static int _invalidate_all_devices(
     u16 seg, struct ivrs_mappings *ivrs_mappings)
 {
-    int bdf, req_id;
+    unsigned int bdf; 
+    u16 req_id;
     unsigned long flags;
     struct amd_iommu *iommu;
 

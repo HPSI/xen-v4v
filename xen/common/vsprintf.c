@@ -17,7 +17,9 @@
  */
 
 #include <xen/ctype.h>
+#include <xen/symbols.h>
 #include <xen/lib.h>
+#include <xen/sched.h>
 #include <asm/div64.h>
 #include <asm/page.h>
 
@@ -235,6 +237,96 @@ static char *number(
     return buf;
 }
 
+static char *string(char *str, char *end, const char *s,
+                    int field_width, int precision, int flags)
+{
+    int i, len = (precision < 0) ? strlen(s) : strnlen(s, precision);
+
+    if (!(flags & LEFT)) {
+        while (len < field_width--) {
+            if (str <= end)
+                *str = ' ';
+            ++str;
+        }
+    }
+    for (i = 0; i < len; ++i) {
+        if (str <= end)
+            *str = *s;
+        ++str; ++s;
+    }
+    while (len < field_width--) {
+        if (str <= end)
+            *str = ' ';
+        ++str;
+    }
+
+    return str;
+}
+
+static char *pointer(char *str, char *end, const char **fmt_ptr,
+                     const void *arg, int field_width, int precision,
+                     int flags)
+{
+    const char *fmt = *fmt_ptr, *s;
+
+    /* Custom %p suffixes. See XEN_ROOT/docs/misc/printk-formats.txt */
+    switch ( fmt[1] )
+    {
+    case 's': /* Symbol name with offset and size (iff offset != 0) */
+    case 'S': /* Symbol name unconditionally with offset and size */
+    {
+        unsigned long sym_size, sym_offset;
+        char namebuf[KSYM_NAME_LEN+1];
+
+        /* Advance parents fmt string, as we have consumed 's' or 'S' */
+        ++*fmt_ptr;
+
+        s = symbols_lookup((unsigned long)arg, &sym_size, &sym_offset, namebuf);
+
+        /* If the symbol is not found, fall back to printing the address */
+        if ( !s )
+            break;
+
+        /* Print symbol name */
+        str = string(str, end, s, -1, -1, 0);
+
+        if ( fmt[1] == 'S' || sym_offset != 0 )
+        {
+            /* Print '+<offset>/<len>' */
+            str = number(str, end, sym_offset, 16, -1, -1, SPECIAL|SIGN|PLUS);
+            if ( str <= end )
+                *str = '/';
+            ++str;
+            str = number(str, end, sym_size, 16, -1, -1, SPECIAL);
+        }
+
+        return str;
+    }
+
+    case 'v': /* d<domain-id>v<vcpu-id> from a struct vcpu */
+    {
+        const struct vcpu *v = arg;
+
+        ++*fmt_ptr;
+        if ( str <= end )
+            *str = 'd';
+        str = number(str + 1, end, v->domain->domain_id, 10, -1, -1, 0);
+        if ( str <= end )
+            *str = 'v';
+        return number(str + 1, end, v->vcpu_id, 10, -1, -1, 0);
+    }
+    }
+
+    if ( field_width == -1 )
+    {
+        field_width = 2 * sizeof(void *);
+        flags |= ZEROPAD;
+    }
+
+    return number(str, end, (unsigned long)arg,
+                  16, field_width, precision, flags);
+}
+
 /**
  * vsnprintf - Format a string and place it in a buffer
  * @buf: The buffer to place the result into
@@ -255,9 +347,8 @@ static char *number(
  */
 int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 {
-    int len;
     unsigned long long num;
-    int i, base;
+    int base;
     char *str, *end, c;
     const char *s;
 
@@ -370,35 +461,13 @@ int vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
             if ((unsigned long)s < PAGE_SIZE)
                 s = "<NULL>";
 
-            len = strnlen(s, precision);
-
-            if (!(flags & LEFT)) {
-                while (len < field_width--) {
-                    if (str <= end)
-                        *str = ' ';
-                    ++str;
-                }
-            }
-            for (i = 0; i < len; ++i) {
-                if (str <= end)
-                    *str = *s;
-                ++str; ++s;
-            }
-            while (len < field_width--) {
-                if (str <= end)
-                    *str = ' ';
-                ++str;
-            }
+            str = string(str, end, s, field_width, precision, flags);
             continue;
 
         case 'p':
-            if (field_width == -1) {
-                field_width = 2*sizeof(void *);
-                flags |= ZEROPAD;
-            }
-            str = number(str, end,
-                         (unsigned long) va_arg(args, void *),
-                         16, field_width, precision, flags);
+            /* pointer() might advance fmt (%pS for example) */
+            str = pointer(str, end, &fmt, va_arg(args, const void *),
+                          field_width, precision, flags);
             continue;
 
 
@@ -565,7 +634,7 @@ EXPORT_SYMBOL(scnprintf);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

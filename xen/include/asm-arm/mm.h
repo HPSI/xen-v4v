@@ -110,18 +110,26 @@ struct page_info
 extern unsigned long xenheap_mfn_start, xenheap_mfn_end;
 extern unsigned long xenheap_virt_end;
 
+#ifdef CONFIG_ARM_32
 #define is_xen_heap_page(page) is_xen_heap_mfn(page_to_mfn(page))
 #define is_xen_heap_mfn(mfn) ({                                 \
     unsigned long _mfn = (mfn);                                 \
     (_mfn >= xenheap_mfn_start && _mfn < xenheap_mfn_end);      \
 })
-#define is_xen_fixed_mfn(mfn) is_xen_heap_mfn(mfn)
+#else
+#define is_xen_heap_page(page) ((page)->count_info & PGC_xen_heap)
+#define is_xen_heap_mfn(mfn) \
+    (mfn_valid(mfn) && is_xen_heap_page(__mfn_to_page(mfn)))
+#endif
+
+#define is_xen_fixed_mfn(mfn)                                   \
+    ((pfn_to_paddr(mfn) >= virt_to_maddr(&_start)) &&       \
+     (pfn_to_paddr(mfn) <= virt_to_maddr(&_end)))
 
 #define page_get_owner(_p)    (_p)->v.inuse.domain
 #define page_set_owner(_p,_d) ((_p)->v.inuse.domain = (_d))
 
 #define maddr_get_owner(ma)   (page_get_owner(maddr_to_page((ma))))
-#define vaddr_get_owner(va)   (page_get_owner(virt_to_page((va))))
 
 #define XENSHARE_writable 0
 #define XENSHARE_readonly 1
@@ -139,8 +147,15 @@ extern unsigned long total_pages;
 
 /* Boot-time pagetable setup */
 extern void setup_pagetables(unsigned long boot_phys_offset, paddr_t xen_paddr);
-/* MMU setup for seccondary CPUS (which already have paging enabled) */
+/* Remove early mappings */
+extern void remove_early_mappings(void);
+/* Allocate and initialise pagetables for a secondary CPU. Sets init_ttbr to the
+ * new page table */
+extern int __cpuinit init_secondary_pagetables(int cpu);
+/* Switch secondary CPUS to its own pagetables and finalise MMU setup */
 extern void __cpuinit mmu_init_secondary_cpu(void);
+/* Second stage paging setup, to be called on all CPUs */
+extern void __cpuinit setup_virt_paging(void);
 /* Set up the xenheap: up to 1GB of contiguous, always-mapped memory.
  * Base must be 32MB aligned and size a multiple of 32MB. */
 extern void setup_xenheap_mappings(unsigned long base_mfn, unsigned long nr_mfns);
@@ -150,11 +165,27 @@ extern void setup_frametable_mappings(paddr_t ps, paddr_t pe);
 extern void set_fixmap(unsigned map, unsigned long mfn, unsigned attributes);
 /* Remove a mapping from a fixmap entry */
 extern void clear_fixmap(unsigned map);
+/* map a physical range in virtual memory */
+void __iomem *ioremap_attr(paddr_t start, size_t len, unsigned attributes);
 
+static inline void __iomem *ioremap_nocache(paddr_t start, size_t len)
+{
+    return ioremap_attr(start, len, PAGE_HYPERVISOR_NOCACHE);
+}
+
+static inline void __iomem *ioremap_cache(paddr_t start, size_t len)
+{
+    return ioremap_attr(start, len, PAGE_HYPERVISOR);
+}
+
+static inline void __iomem *ioremap_wc(paddr_t start, size_t len)
+{
+    return ioremap_attr(start, len, PAGE_HYPERVISOR_WC);
+}
 
 #define mfn_valid(mfn)        ({                                              \
     unsigned long __m_f_n = (mfn);                                            \
-    likely(__m_f_n < max_page);                                               \
+    likely(__m_f_n >= frametable_base_mfn && __m_f_n < max_page);             \
 })
 
 #define max_pdx                 max_page
@@ -179,23 +210,36 @@ extern void clear_fixmap(unsigned map);
 #define paddr_to_pdx(pa)    pfn_to_pdx(paddr_to_pfn(pa))
 
 
-static inline paddr_t virt_to_maddr(void *va)
+static inline paddr_t __virt_to_maddr(vaddr_t va)
 {
-    uint64_t par = va_to_par((uint32_t)va);
-    return (par & PADDR_MASK & PAGE_MASK) | ((unsigned long) va & ~PAGE_MASK);
+    uint64_t par = va_to_par(va);
+    return (par & PADDR_MASK & PAGE_MASK) | (va & ~PAGE_MASK);
 }
+#define virt_to_maddr(va)   __virt_to_maddr((vaddr_t)(va))
 
+#ifdef CONFIG_ARM_32
 static inline void *maddr_to_virt(paddr_t ma)
 {
     ASSERT(is_xen_heap_mfn(ma >> PAGE_SHIFT));
     ma -= pfn_to_paddr(xenheap_mfn_start);
     return (void *)(unsigned long) ma + XENHEAP_VIRT_START;
 }
-
-static inline paddr_t gvirt_to_maddr(uint32_t va)
+#else
+static inline void *maddr_to_virt(paddr_t ma)
 {
-    uint64_t par = gva_to_par(va);
-    return (par & PADDR_MASK & PAGE_MASK) | ((unsigned long) va & ~PAGE_MASK);
+    ASSERT((ma >> PAGE_SHIFT) < (DIRECTMAP_SIZE >> PAGE_SHIFT));
+    ma -= pfn_to_paddr(xenheap_mfn_start);
+    return (void *)(unsigned long) ma + DIRECTMAP_VIRT_START;
+}
+#endif
+
+static inline int gvirt_to_maddr(vaddr_t va, paddr_t *pa)
+{
+    uint64_t par = gva_to_ma_par(va);
+    if ( par & PAR_F )
+        return -EFAULT;
+    *pa = (par & PADDR_MASK & PAGE_MASK) | ((unsigned long) va & ~PAGE_MASK);
+    return 0;
 }
 
 /* Convert between Xen-heap virtual addresses and machine addresses. */
@@ -214,17 +258,15 @@ static inline struct page_info *virt_to_page(const void *v)
     ASSERT(va >= XENHEAP_VIRT_START);
     ASSERT(va < xenheap_virt_end);
 
-    return frame_table + ((va - XENHEAP_VIRT_START) >> PAGE_SHIFT);
+    return frame_table
+        + ((va - XENHEAP_VIRT_START) >> PAGE_SHIFT)
+        + xenheap_mfn_start
+        - frametable_base_mfn;
 }
 
 static inline void *page_to_virt(const struct page_info *pg)
 {
-    ASSERT((unsigned long)pg - FRAMETABLE_VIRT_START < frametable_virt_end);
-    return (void *)(XENHEAP_VIRT_START +
-                    ((unsigned long)pg - FRAMETABLE_VIRT_START) /
-                    (sizeof(*pg) / (sizeof(*pg) & -sizeof(*pg))) *
-                    (PAGE_SIZE / (sizeof(*pg) & -sizeof(*pg))));
-
+    return mfn_to_virt(page_to_mfn(pg));
 }
 
 struct domain *page_get_owner_and_reference(struct page_info *page);
@@ -303,7 +345,7 @@ static inline void put_page_and_type(struct page_info *page)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

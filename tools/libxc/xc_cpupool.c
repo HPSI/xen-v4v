@@ -74,7 +74,7 @@ xc_cpupoolinfo_t *xc_cpupool_getinfo(xc_interface *xch,
     DECLARE_HYPERCALL_BUFFER(uint8_t, local);
 
     local_size = xc_get_cpumap_size(xch);
-    if (!local_size)
+    if (local_size <= 0)
     {
         PERROR("Could not get number of cpus");
         return NULL;
@@ -90,7 +90,7 @@ xc_cpupoolinfo_t *xc_cpupool_getinfo(xc_interface *xch,
     sysctl.u.cpupool_op.op = XEN_SYSCTL_CPUPOOL_OP_INFO;
     sysctl.u.cpupool_op.cpupool_id = poolid;
     set_xen_guest_handle(sysctl.u.cpupool_op.cpumap.bitmap, local);
-    sysctl.u.cpupool_op.cpumap.nr_cpus = local_size * 8;
+    sysctl.u.cpupool_op.cpumap.nr_bits = local_size * 8;
 
     err = do_sysctl_save(xch, &sysctl);
 
@@ -104,6 +104,7 @@ xc_cpupoolinfo_t *xc_cpupool_getinfo(xc_interface *xch,
     info->cpumap = xc_cpumap_alloc(xch);
     if (!info->cpumap) {
         free(info);
+        info = NULL;
         goto out;
     }
     info->cpupool_id = sysctl.u.cpupool_op.cpupool_id;
@@ -172,7 +173,7 @@ xc_cpumap_t xc_cpupool_freeinfo(xc_interface *xch)
     DECLARE_HYPERCALL_BUFFER(uint8_t, local);
 
     mapsize = xc_get_cpumap_size(xch);
-    if (mapsize == 0)
+    if (mapsize <= 0)
         return NULL;
 
     local = xc_hypercall_buffer_alloc(xch, local, mapsize);
@@ -184,7 +185,7 @@ xc_cpumap_t xc_cpupool_freeinfo(xc_interface *xch)
     sysctl.cmd = XEN_SYSCTL_cpupool_op;
     sysctl.u.cpupool_op.op = XEN_SYSCTL_CPUPOOL_OP_FREEINFO;
     set_xen_guest_handle(sysctl.u.cpupool_op.cpumap.bitmap, local);
-    sysctl.u.cpupool_op.cpumap.nr_cpus = mapsize * 8;
+    sysctl.u.cpupool_op.cpumap.nr_bits = mapsize * 8;
 
     err = do_sysctl_save(xch, &sysctl);
 

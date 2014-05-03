@@ -105,15 +105,13 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
         return physdev_hvm_map_pirq(d, type, index, pirq_p);
     }
 
-    ret = rcu_lock_target_domain_by_id(domid, &d);
-    if ( ret )
-        return ret;
+    d = rcu_lock_domain_by_any_id(domid);
+    if ( d == NULL )
+        return -ESRCH;
 
-    if ( !IS_PRIV_FOR(current->domain, d) )
-    {
-        ret = -EPERM;
+    ret = xsm_map_domain_pirq(XSM_TARGET, d);
+    if ( ret )
         goto free_domain;
-    }
 
     /* Verify or get irq. */
     switch ( type )
@@ -130,7 +128,7 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
         irq = domain_pirq_to_irq(current->domain, *index);
         if ( irq <= 0 )
         {
-            if ( IS_PRIV(current->domain) )
+            if ( is_hardware_domain(current->domain) )
                 irq = *index;
             else {
                 dprintk(XENLOG_G_ERR, "dom%d: map pirq with incorrect irq!\n",
@@ -142,11 +140,14 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
         break;
 
     case MAP_PIRQ_TYPE_MSI:
+        if ( !msi->table_base )
+            msi->entry_nr = 1;
         irq = *index;
         if ( irq == -1 )
+    case MAP_PIRQ_TYPE_MULTI_MSI:
             irq = create_irq(NUMA_NO_NODE);
 
-        if ( irq < 0 || irq >= nr_irqs )
+        if ( irq < nr_irqs_gsi || irq >= nr_irqs )
         {
             dprintk(XENLOG_G_ERR, "dom%d: can't create irq for msi!\n",
                     d->domain_id);
@@ -181,6 +182,30 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
                 goto done;
             }
         }
+        else if ( type == MAP_PIRQ_TYPE_MULTI_MSI )
+        {
+            if ( msi->entry_nr <= 0 || msi->entry_nr > 32 )
+                ret = -EDOM;
+            else if ( msi->entry_nr != 1 && !iommu_intremap )
+                ret = -EOPNOTSUPP;
+            else
+            {
+                while ( msi->entry_nr & (msi->entry_nr - 1) )
+                    msi->entry_nr += msi->entry_nr & -msi->entry_nr;
+                pirq = get_free_pirqs(d, msi->entry_nr);
+                if ( pirq < 0 )
+                {
+                    while ( (msi->entry_nr >>= 1) > 1 )
+                        if ( get_free_pirqs(d, msi->entry_nr) > 0 )
+                            break;
+                    dprintk(XENLOG_G_ERR, "dom%d: no block of %d free pirqs\n",
+                            d->domain_id, msi->entry_nr << 1);
+                    ret = pirq;
+                }
+            }
+            if ( ret < 0 )
+                goto done;
+        }
         else
         {
             pirq = get_free_pirq(d, type);
@@ -212,8 +237,15 @@ int physdev_map_pirq(domid_t domid, int type, int *index, int *pirq_p,
  done:
     spin_unlock(&d->event_lock);
     spin_unlock(&pcidevs_lock);
-    if ( (ret != 0) && (type == MAP_PIRQ_TYPE_MSI) && (*index == -1) )
-        destroy_irq(irq);
+    if ( ret != 0 )
+        switch ( type )
+        {
+        case MAP_PIRQ_TYPE_MSI:
+            if ( *index == -1 )
+        case MAP_PIRQ_TYPE_MULTI_MSI:
+                destroy_irq(irq);
+            break;
+        }
  free_domain:
     rcu_unlock_domain(d);
     return ret;
@@ -224,9 +256,13 @@ int physdev_unmap_pirq(domid_t domid, int pirq)
     struct domain *d;
     int ret;
 
-    ret = rcu_lock_target_domain_by_id(domid, &d);
+    d = rcu_lock_domain_by_any_id(domid);
+    if ( d == NULL )
+        return -ESRCH;
+
+    ret = xsm_unmap_domain_pirq(XSM_TARGET, d);
     if ( ret )
-        return ret;
+        goto free_domain;
 
     if ( is_hvm_domain(d) )
     {
@@ -237,14 +273,6 @@ int physdev_unmap_pirq(domid_t domid, int pirq)
         if ( domid == DOMID_SELF || ret )
             goto free_domain;
     }
-
-    ret = -EPERM;
-    if ( !IS_PRIV_FOR(current->domain, d) )
-        goto free_domain;
-
-    ret = xsm_irq_permission(d, domain_pirq_to_irq(d, pirq), 0);
-    if ( ret )
-        goto free_domain;
 
     spin_lock(&pcidevs_lock);
     spin_lock(&d->event_lock);
@@ -282,10 +310,9 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
             spin_unlock(&v->domain->event_lock);
             break;
         }
-        if ( !is_hvm_domain(v->domain) &&
-             v->domain->arch.pv_domain.auto_unmask )
+        if ( v->domain->arch.auto_unmask )
             evtchn_unmask(pirq->evtchn);
-        if ( !is_hvm_domain(v->domain) ||
+        if ( is_pv_domain(v->domain) ||
              domain_pirq_to_irq(v->domain, eoi.irq) > 0 )
             pirq_guest_eoi(pirq);
         if ( is_hvm_domain(v->domain) &&
@@ -326,7 +353,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         }
         mfn = page_to_mfn(page);
 
-        if ( cmpxchg(&v->domain->arch.pv_domain.pirq_eoi_map_mfn,
+        if ( cmpxchg(&v->domain->arch.pirq_eoi_map_mfn,
                      0, mfn) != 0 )
         {
             put_page_and_type(mfn_to_page(mfn));
@@ -334,16 +361,16 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
             break;
         }
 
-        v->domain->arch.pv_domain.pirq_eoi_map = map_domain_page_global(mfn);
-        if ( v->domain->arch.pv_domain.pirq_eoi_map == NULL )
+        v->domain->arch.pirq_eoi_map = map_domain_page_global(mfn);
+        if ( v->domain->arch.pirq_eoi_map == NULL )
         {
-            v->domain->arch.pv_domain.pirq_eoi_map_mfn = 0;
+            v->domain->arch.pirq_eoi_map_mfn = 0;
             put_page_and_type(mfn_to_page(mfn));
             ret = -ENOSPC;
             break;
         }
         if ( cmd == PHYSDEVOP_pirq_eoi_gmfn_v1 )
-            v->domain->arch.pv_domain.auto_unmask = 1;
+            v->domain->arch.auto_unmask = 1;
 
         ret = 0;
         break;
@@ -384,7 +411,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         irq_status_query.flags |= XENIRQSTAT_needs_eoi;
         if ( pirq_shared(v->domain, irq) )
             irq_status_query.flags |= XENIRQSTAT_shared;
-        ret = copy_to_guest(arg, &irq_status_query, 1) ? -EFAULT : 0;
+        ret = __copy_to_guest(arg, &irq_status_query, 1) ? -EFAULT : 0;
         break;
     }
 
@@ -396,14 +423,22 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&map, arg, 1) != 0 )
             break;
 
-        if ( map.type == MAP_PIRQ_TYPE_MSI_SEG )
+        switch ( map.type )
         {
+        case MAP_PIRQ_TYPE_MSI_SEG:
             map.type = MAP_PIRQ_TYPE_MSI;
             msi.seg = map.bus >> 16;
-        }
-        else
-        {
+            break;
+
+        case MAP_PIRQ_TYPE_MULTI_MSI:
+            if ( map.table_base )
+                return -EINVAL;
+            msi.seg = map.bus >> 16;
+            break;
+
+        default:
             msi.seg = 0;
+            break;
         }
         msi.bus = map.bus;
         msi.devfn = map.devfn;
@@ -412,7 +447,9 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         ret = physdev_map_pirq(map.domid, map.type, &map.index, &map.pirq,
                                &msi);
 
-        if ( copy_to_guest(arg, &map, 1) != 0 )
+        if ( map.type == MAP_PIRQ_TYPE_MULTI_MSI )
+            map.entry_nr = msi.entry_nr;
+        if ( __copy_to_guest(arg, &map, 1) )
             ret = -EFAULT;
         break;
     }
@@ -433,14 +470,11 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         ret = -EFAULT;
         if ( copy_from_guest(&apic, arg, 1) != 0 )
             break;
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-        ret = xsm_apic(v->domain, cmd);
+        ret = xsm_apic(XSM_PRIV, v->domain, cmd);
         if ( ret )
             break;
         ret = ioapic_guest_read(apic.apic_physbase, apic.reg, &apic.value);
-        if ( copy_to_guest(arg, &apic, 1) != 0 )
+        if ( __copy_to_guest(arg, &apic, 1) )
             ret = -EFAULT;
         break;
     }
@@ -450,10 +484,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         ret = -EFAULT;
         if ( copy_from_guest(&apic, arg, 1) != 0 )
             break;
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-        ret = xsm_apic(v->domain, cmd);
+        ret = xsm_apic(XSM_PRIV, v->domain, cmd);
         if ( ret )
             break;
         ret = ioapic_guest_write(apic.apic_physbase, apic.reg, apic.value);
@@ -467,8 +498,10 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( copy_from_guest(&irq_op, arg, 1) != 0 )
             break;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
+        /* Use the APIC check since this dummy hypercall should still only
+         * be called by the domain with access to program the ioapic */
+        ret = xsm_apic(XSM_PRIV, v->domain, cmd);
+        if ( ret )
             break;
 
         /* Vector is only used by hypervisor, and dom0 shouldn't
@@ -478,13 +511,18 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         irq_op.vector = irq_op.irq;
         ret = 0;
         
-        if ( copy_to_guest(arg, &irq_op, 1) != 0 )
+        if ( __copy_to_guest(arg, &irq_op, 1) )
             ret = -EFAULT;
         break;
     }
 
     case PHYSDEVOP_set_iopl: {
         struct physdev_set_iopl set_iopl;
+
+        ret = -ENOSYS;
+        if ( is_pvh_vcpu(current) )
+            break;
+
         ret = -EFAULT;
         if ( copy_from_guest(&set_iopl, arg, 1) != 0 )
             break;
@@ -498,6 +536,11 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 
     case PHYSDEVOP_set_iobitmap: {
         struct physdev_set_iobitmap set_iobitmap;
+
+        ret = -ENOSYS;
+        if ( is_pvh_vcpu(current) )
+            break;
+
         ret = -EFAULT;
         if ( copy_from_guest(&set_iobitmap, arg, 1) != 0 )
             break;
@@ -517,9 +560,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 
     case PHYSDEVOP_manage_pci_add: {
         struct physdev_manage_pci manage_pci;
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
         ret = -EFAULT;
         if ( copy_from_guest(&manage_pci, arg, 1) != 0 )
             break;
@@ -530,9 +570,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 
     case PHYSDEVOP_manage_pci_remove: {
         struct physdev_manage_pci manage_pci;
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
         ret = -EFAULT;
         if ( copy_from_guest(&manage_pci, arg, 1) != 0 )
             break;
@@ -544,10 +581,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
     case PHYSDEVOP_manage_pci_add_ext: {
         struct physdev_manage_pci_ext manage_pci_ext;
         struct pci_dev_info pdev_info;
-
-        ret = -EPERM;
-        if ( !IS_PRIV(current->domain) )
-            break;
 
         ret = -EFAULT;
         if ( copy_from_guest(&manage_pci_ext, arg, 1) != 0 )
@@ -571,10 +604,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         struct physdev_pci_device_add add;
         struct pci_dev_info pdev_info;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(current->domain) )
-            break;
-
         ret = -EFAULT;
         if ( copy_from_guest(&add, arg, 1) != 0 )
             break;
@@ -595,10 +624,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
     case PHYSDEVOP_pci_device_remove: {
         struct physdev_pci_device dev;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-
         ret = -EFAULT;
         if ( copy_from_guest(&dev, arg, 1) != 0 )
             break;
@@ -607,14 +632,25 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         break;
     }
 
+    case PHYSDEVOP_prepare_msix:
+    case PHYSDEVOP_release_msix: {
+        struct physdev_pci_device dev;
+
+        if ( copy_from_guest(&dev, arg, 1) )
+            ret = -EFAULT;
+        else
+            ret = xsm_resource_setup_pci(XSM_PRIV,
+                                         (dev.seg << 16) | (dev.bus << 8) |
+                                         dev.devfn) ?:
+                  pci_prepare_msix(dev.seg, dev.bus, dev.devfn,
+                                   cmd != PHYSDEVOP_prepare_msix);
+        break;
+    }
+
     case PHYSDEVOP_pci_mmcfg_reserved: {
         struct physdev_pci_mmcfg_reserved info;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(current->domain) )
-            break;
-
-        ret = xsm_resource_setup_misc();
+        ret = xsm_resource_setup_misc(XSM_PRIV);
         if ( ret )
             break;
 
@@ -631,10 +667,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         struct physdev_restore_msi restore_msi;
         struct pci_dev *pdev;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-
         ret = -EFAULT;
         if ( copy_from_guest(&restore_msi, arg, 1) != 0 )
             break;
@@ -650,10 +682,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         struct physdev_pci_device dev;
         struct pci_dev *pdev;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-
         ret = -EFAULT;
         if ( copy_from_guest(&dev, arg, 1) != 0 )
             break;
@@ -668,10 +696,6 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
     case PHYSDEVOP_setup_gsi: {
         struct physdev_setup_gsi setup_gsi;
 
-        ret = -EPERM;
-        if ( !IS_PRIV(v->domain) )
-            break;
-
         ret = -EFAULT;
         if ( copy_from_guest(&setup_gsi, arg, 1) != 0 )
             break;
@@ -680,7 +704,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( setup_gsi.gsi < 0 || setup_gsi.gsi >= nr_irqs_gsi )
             break;
 
-        ret = xsm_resource_setup_gsi(setup_gsi.gsi);
+        ret = xsm_resource_setup_gsi(XSM_PRIV, setup_gsi.gsi);
         if ( ret )
             break;
 
@@ -714,7 +738,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
         if ( ret >= 0 )
         {
             out.pirq = ret;
-            ret = copy_to_guest(arg, &out, 1) ? -EFAULT : 0;
+            ret = __copy_to_guest(arg, &out, 1) ? -EFAULT : 0;
         }
 
         break;
@@ -723,7 +747,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
     case PHYSDEVOP_dbgp_op: {
         struct physdev_dbgp_op op;
 
-        if ( !IS_PRIV(v->domain) )
+        if ( !is_hardware_domain(v->domain) )
             ret = -EPERM;
         else if ( copy_from_guest(&op, arg, 1) )
             ret = -EFAULT;
@@ -743,7 +767,7 @@ ret_t do_physdev_op(int cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

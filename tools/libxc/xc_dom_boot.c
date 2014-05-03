@@ -62,19 +62,13 @@ static int setup_hypercall_page(struct xc_dom_image *dom)
     return rc;
 }
 
-static int launch_vm(xc_interface *xch, domid_t domid, xc_hypercall_buffer_t *ctxt)
+static int launch_vm(xc_interface *xch, domid_t domid,
+                     vcpu_guest_context_any_t *ctxt)
 {
-    DECLARE_DOMCTL;
-    DECLARE_HYPERCALL_BUFFER_ARGUMENT(ctxt);
     int rc;
 
     xc_dom_printf(xch, "%s: called, ctxt=%p", __FUNCTION__, ctxt);
-    memset(&domctl, 0, sizeof(domctl));
-    domctl.cmd = XEN_DOMCTL_setvcpucontext;
-    domctl.domain = domid;
-    domctl.u.vcpucontext.vcpu = 0;
-    set_xen_guest_handle(domctl.u.vcpucontext.ctxt, ctxt);
-    rc = do_domctl(xch, &domctl);
+    rc = xc_vcpu_setcontext(xch, domid, 0, ctxt);
     if ( rc != 0 )
         xc_dom_panic(xch, XC_INTERNAL_ERROR,
                      "%s: SETVCPUCONTEXT failed (rc=%d)", __FUNCTION__, rc);
@@ -203,8 +197,8 @@ void *xc_dom_boot_domU_map(struct xc_dom_image *dom, xen_pfn_t pfn,
 
 int xc_dom_boot_image(struct xc_dom_image *dom)
 {
-    DECLARE_DOMCTL;
     DECLARE_HYPERCALL_BUFFER(vcpu_guest_context_any_t, ctxt);
+    xc_dominfo_t info;
     int rc;
 
     ctxt = xc_hypercall_buffer_alloc(dom->xch, ctxt, sizeof(*ctxt));
@@ -218,23 +212,22 @@ int xc_dom_boot_image(struct xc_dom_image *dom)
         return rc;
 
     /* collect some info */
-    domctl.cmd = XEN_DOMCTL_getdomaininfo;
-    domctl.domain = dom->guest_domid;
-    rc = do_domctl(dom->xch, &domctl);
-    if ( rc != 0 )
+    rc = xc_domain_getinfo(dom->xch, dom->guest_domid, 1, &info);
+    if ( rc < 0 )
     {
         xc_dom_panic(dom->xch, XC_INTERNAL_ERROR,
                      "%s: getdomaininfo failed (rc=%d)", __FUNCTION__, rc);
         return rc;
     }
-    if ( domctl.domain != dom->guest_domid )
+    if ( rc == 0 || info.domid != dom->guest_domid )
     {
         xc_dom_panic(dom->xch, XC_INTERNAL_ERROR,
-                     "%s: Huh? domid mismatch (%d != %d)", __FUNCTION__,
-                     domctl.domain, dom->guest_domid);
+                     "%s: Huh? No domains found (nr_domains=%d) "
+                     "or domid mismatch (%d != %d)", __FUNCTION__,
+                     rc, info.domid, dom->guest_domid);
         return -1;
     }
-    dom->shared_info_mfn = domctl.u.getdomaininfo.shared_info_frame;
+    dom->shared_info_mfn = info.shared_info_frame;
 
     /* sanity checks */
     if ( !xc_dom_compat_check(dom) )
@@ -266,11 +259,11 @@ int xc_dom_boot_image(struct xc_dom_image *dom)
         return rc;
 
     /* let the vm run */
-    memset(ctxt, 0, sizeof(ctxt));
+    memset(ctxt, 0, sizeof(*ctxt));
     if ( (rc = dom->arch_hooks->vcpu(dom, ctxt)) != 0 )
         return rc;
     xc_dom_unmap_all(dom);
-    rc = launch_vm(dom->xch, dom->guest_domid, HYPERCALL_BUFFER(ctxt));
+    rc = launch_vm(dom->xch, dom->guest_domid, ctxt);
 
     xc_hypercall_buffer_free(dom->xch, ctxt);
     return rc;
@@ -358,6 +351,10 @@ int xc_dom_gnttab_seed(xc_interface *xch, domid_t domid,
         return -1;
     }
 
+    /* Guest shouldn't really touch its grant table until it has
+     * enabled its caches. But lets be nice. */
+    xc_domain_cacheflush(xch, domid, gnttab_gmfn, 1);
+
     return 0;
 }
 
@@ -368,16 +365,26 @@ int xc_dom_gnttab_hvm_seed(xc_interface *xch, domid_t domid,
                            domid_t xenstore_domid)
 {
     int rc;
+    xen_pfn_t max_gfn;
     struct xen_add_to_physmap xatp = {
         .domid = domid,
         .space = XENMAPSPACE_grant_table,
         .idx   = 0,
-        .gpfn  = SCRATCH_PFN_GNTTAB
     };
     struct xen_remove_from_physmap xrfp = {
         .domid = domid,
-        .gpfn  = SCRATCH_PFN_GNTTAB
     };
+
+    max_gfn = xc_domain_maximum_gpfn(xch, domid);
+    if ( max_gfn <= 0 ) {
+        xc_dom_panic(xch, XC_INTERNAL_ERROR,
+                     "%s: failed to get max gfn "
+                     "[errno=%d]\n",
+                     __FUNCTION__, errno);
+        return -1;
+    }
+    xatp.gpfn = max_gfn + 1;
+    xrfp.gpfn = max_gfn + 1;
 
     rc = do_memory_op(xch, XENMEM_add_to_physmap, &xatp, sizeof(xatp));
     if ( rc != 0 )
@@ -416,25 +423,22 @@ int xc_dom_gnttab_hvm_seed(xc_interface *xch, domid_t domid,
 
 int xc_dom_gnttab_init(struct xc_dom_image *dom)
 {
-    xen_pfn_t console_gmfn;
-    xen_pfn_t xenstore_gmfn;
-    int autotranslated;
-
-    autotranslated = xc_dom_feature_translated(dom);
-    console_gmfn = autotranslated ?
-           dom->console_pfn : xc_dom_p2m_host(dom, dom->console_pfn);
-    xenstore_gmfn = autotranslated ?
-           dom->xenstore_pfn : xc_dom_p2m_host(dom, dom->xenstore_pfn);
-
-    return xc_dom_gnttab_seed(dom->xch, dom->guest_domid,
-                              console_gmfn, xenstore_gmfn,
-                              dom->console_domid, dom->xenstore_domid);
+    if ( xc_dom_feature_translated(dom) ) {
+        return xc_dom_gnttab_hvm_seed(dom->xch, dom->guest_domid,
+                                      dom->console_pfn, dom->xenstore_pfn,
+                                      dom->console_domid, dom->xenstore_domid);
+    } else {
+        return xc_dom_gnttab_seed(dom->xch, dom->guest_domid,
+                                  xc_dom_p2m_host(dom, dom->console_pfn),
+                                  xc_dom_p2m_host(dom, dom->xenstore_pfn),
+                                  dom->console_domid, dom->xenstore_domid);
+    }
 }
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

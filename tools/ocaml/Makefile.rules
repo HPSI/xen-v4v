@@ -24,7 +24,7 @@ ALL_OCAML_OBJS ?= $(OBJS)
 %.cmi: %.mli
 	$(call quiet-command, $(OCAMLC) $(OCAMLCFLAGS) -c -o $@ $<,MLI,$@)
 
-%.cmx: %.ml
+%.cmx %.o: %.ml
 	$(call quiet-command, $(OCAMLOPT) $(OCAMLOPTFLAGS) -c -o $@ $<,MLOPT,$@)
 
 %.ml: %.mll
@@ -45,7 +45,7 @@ ALL_OCAML_OBJ_SOURCES=$(addsuffix .ml, $(ALL_OCAML_OBJS))
 	$(call quiet-command, $(OCAMLDEP) $(ALL_OCAML_OBJ_SOURCES) *.mli $o,MLDEP,)
 
 clean: $(CLEAN_HOOKS)
-	$(Q)rm -f .*.d *.o *.so *.a *.cmo *.cmi *.cma *.cmx *.cmxa *.annot *.spot *.spit $(LIBS) $(PROGRAMS) $(GENERATED_FILES) .ocamldep.make
+	$(Q)rm -f .*.d *.o *.so *.a *.cmo *.cmi *.cma *.cmx *.cmxa *.annot *.spot *.spit $(LIBS) $(PROGRAMS) $(GENERATED_FILES) .ocamldep.make META
 
 quiet-command = $(if $(V),$1,@printf " %-8s %s\n" "$2" "$3" && $1)
 

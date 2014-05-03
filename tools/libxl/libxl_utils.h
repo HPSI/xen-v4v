@@ -21,6 +21,7 @@
 const char *libxl_basename(const char *name); /* returns string from strdup */
 unsigned long libxl_get_required_shadow_memory(unsigned long maxmem_kb, unsigned int smp_cpus);
 int libxl_name_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
+int libxl_domain_qualifier_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
 char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid);
 int libxl_name_to_cpupoolid(libxl_ctx *ctx, const char *name, uint32_t *poolid);
 char *libxl_cpupoolid_to_name(libxl_ctx *ctx, uint32_t poolid);
@@ -64,6 +65,11 @@ int libxl_devid_to_device_nic(libxl_ctx *ctx, uint32_t domid, int devid,
 int libxl_vdev_to_device_disk(libxl_ctx *ctx, uint32_t domid, const char *vdev,
                                libxl_device_disk *disk);
 
+int libxl_uuid_to_device_vtpm(libxl_ctx *ctx, uint32_t domid,
+                               libxl_uuid *uuid, libxl_device_vtpm *vtpm);
+int libxl_devid_to_device_vtpm(libxl_ctx *ctx, uint32_t domid,
+                               int devid, libxl_device_vtpm *vtpm);
+
 int libxl_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *bitmap, int n_bits);
     /* Allocated bimap is from malloc, libxl_bitmap_dispose() to be
      * called by the application when done. */
@@ -92,37 +98,17 @@ static inline int libxl_bitmap_cpu_valid(libxl_bitmap *bitmap, int bit)
 #define libxl_for_each_set_bit(v, m) for (v = 0; v < (m).size * 8; v++) \
                                              if (libxl_bitmap_test(&(m), v))
 
-static inline int libxl_cpu_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *cpumap,
-                                         int max_cpus)
-{
-    if (max_cpus < 0)
-        return ERROR_INVAL;
-    if (max_cpus == 0)
-        max_cpus = libxl_get_max_cpus(ctx);
-    if (max_cpus == 0)
-        return ERROR_FAIL;
-
-    return libxl_bitmap_alloc(ctx, cpumap, max_cpus);
-}
-
-static inline int libxl_node_bitmap_alloc(libxl_ctx *ctx,
-                                          libxl_bitmap *nodemap,
-                                          int max_nodes)
-{
-    if (max_nodes < 0)
-        return ERROR_INVAL;
-    if (max_nodes == 0)
-        max_nodes = libxl_get_max_nodes(ctx);
-    if (max_nodes == 0)
-        return ERROR_FAIL;
-
-    return libxl_bitmap_alloc(ctx, nodemap, max_nodes);
-}
+int libxl_cpu_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *cpumap, int max_cpus);
+int libxl_node_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *nodemap,
+                            int max_nodes);
 
 /* Populate cpumap with the cpus spanned by the nodes in nodemap */
 int libxl_nodemap_to_cpumap(libxl_ctx *ctx,
                             const libxl_bitmap *nodemap,
                             libxl_bitmap *cpumap);
+/* Populate cpumap with the cpus spanned by node */
+int libxl_node_to_cpumap(libxl_ctx *ctx, int node,
+                         libxl_bitmap *cpumap);
 /* Populate nodemap with the nodes of the cpus in cpumap */
 int libxl_cpumap_to_nodemap(libxl_ctx *ctx,
                             const libxl_bitmap *cpuemap,

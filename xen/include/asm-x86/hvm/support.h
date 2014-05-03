@@ -32,8 +32,7 @@ static inline ioreq_t *get_ioreq(struct vcpu *v)
     struct domain *d = v->domain;
     shared_iopage_t *p = d->arch.hvm_domain.ioreq.va;
     ASSERT((v == current) || spin_is_locked(&d->arch.hvm_domain.ioreq.lock));
-    ASSERT(d->arch.hvm_domain.ioreq.va != NULL);
-    return &p->vcpu_ioreq[v->vcpu_id];
+    return p ? &p->vcpu_ioreq[v->vcpu_id] : NULL;
 }
 
 #define HVM_DELIVER_NO_ERROR_CODE  -1
@@ -128,7 +127,9 @@ void hvm_triple_fault(void);
 
 void hvm_rdtsc_intercept(struct cpu_user_regs *regs);
 
-int hvm_handle_xsetbv(u64 new_bv);
+int __must_check hvm_handle_xsetbv(u32 index, u64 new_bv);
+
+void hvm_shadow_handle_cd(struct vcpu *v, unsigned long value);
 
 /* These functions all return X86EMUL return codes. */
 int hvm_set_efer(uint64_t value);

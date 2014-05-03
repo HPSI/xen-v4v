@@ -1,5 +1,6 @@
 
 	List of maintainers and how to submit changes
+	=============================================
 
 Please try to follow the guidelines below.  This will make things
 easier on the maintainers.  Not all of these guidelines matter for every
@@ -15,7 +16,11 @@ trivial patch so apply some common sense.
 	'diff -u' to make the patch easy to merge. Be prepared to get your
 	changes sent back with seemingly silly requests about formatting
 	and variable names.  These aren't as silly as they seem. One
-	job the maintainersdo is to keep things looking the same.
+	job the maintainers do is to keep things looking the same.
+
+	PLEASE see http://wiki.xen.org/wiki/Submitting_Xen_Patches for
+	hints on how to submit a patch to xen-unstable in a suitable
+	form.
 
 	PLEASE try to include any credit lines you want added with the
 	patch. It avoids people being missed off by mistake and makes
@@ -33,6 +38,23 @@ trivial patch so apply some common sense.
 	not you.
 
 5.	Happy hacking.
+
+
+	Stable Release Maintenance
+	==========================
+
+The policy for inclusion in a Xen stable release is different to that
+for inclusion in xen-unstable.
+
+Please see http://wiki.xen.org/wiki/Xen_Maintenance_Releases for more
+information.
+
+Remember to copy the appropriate stable branch maintainer who will be
+listed in this section of the MAINTAINERS file in the appropriate
+branch.
+
+	Unstable Subsystem Maintainers
+	==============================
 
 Descriptions of section entries:
 
@@ -75,27 +97,30 @@ Maintainers List (try to look for most precise areas first)
 
 		-----------------------------------
 
-ACPI & POWER MANAGEMENT
-M:	Winston Wang <winston.l.wang@intel.com>
-M:	Gang Wei <gang.wei@intel.com>
-M:	Mark Langsdorf <mark.langsdorf@amd.com>
+ACPI
 M:	Jan Beulich <jbeulich@suse.com>
 S:	Supported
 F:	xen/arch/x86/acpi/
 F:	xen/drivers/acpi/
-F:	xen/drivers/cpufreq/
+F:	xen/include/acpi/
 
 AMD IOMMU
-M:	Wei Wang <wei.wang2@amd.com>
-S:	Supported
+M:	Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+S:	Maintained
 F:	xen/drivers/passthrough/amd/
 
 AMD SVM
-M:	Andre Przywara <andre.przywara@amd.com>
-M:	Christoph Egger <christoph.egger@amd.com>
-M:	Wei Huang <wei.huang2@amd.com>
+M:	Boris Ostrovsky <boris.ostrovsky@oracle.com>
+M:	Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
 S:	Supported
 F:	xen/arch/x86/hvm/svm/
+
+ARINC653 SCHEDULER
+M:	Nathan Studer <nate.studer@dornerworks.com>
+M:	Robert VanVossen <robert.vanvossen@dornerworks.com>
+S:	Supported
+F:	xen/common/sched_arinc653.c
+F:	tools/libxc/xc_arinc653.c
 
 ARM (W/ VIRTUALISATION EXTENSIONS) ARCHITECTURE
 M:	Ian Campbell <ian.campbell@citrix.com>
@@ -105,6 +130,10 @@ S:	Supported
 L:	xen-devel@lists.xen.org
 F:	xen/arch/arm/
 F:	xen/include/asm-arm/
+F:	xen/drivers/char/dt-uart.c
+F:	xen/drivers/char/exynos4210-uart.c
+F:	xen/drivers/char/omap-uart.c
+F:	xen/drivers/char/pl011.c
 
 CPU POOLS
 M:	Juergen Gross <juergen.gross@ts.fujitsu.com>
@@ -112,7 +141,9 @@ S:	Supported
 F:	xen/common/cpupool.c
 
 DEVICE TREE
-M:	David Vrabel <david.vrabel@citrix.com>
+M:	Ian Campbell <ian.campbell@citrix.com>
+M:	Stefano Stabellini <stefano.stabellini@citrix.com>
+M:	Tim Deegan <tim@xen.org>
 S:	Supported
 F:	xen/common/libfdt/
 F:	xen/common/device_tree.c
@@ -126,6 +157,12 @@ F:     xen/arch/x86/efi/
 F:     xen/include/efi/
 F:     xen/include/asm-x86/efi*.h
 F:     xen/include/asm-x86/x86_*/efi*.h
+
+EVENT CHANNELS (FIFO-BASED ABI)
+M:	David Vrabel <david.vrabel@citrix.com>
+S:	Supported
+F:	xen/common/event_fifo.c
+F:	xen/include/xen/event_fifo.h
 
 GDBSX DEBUGGER
 M:	Mukesh Rathor <mukesh.rathor@oracle.com>
@@ -154,31 +191,55 @@ F:	xen/drivers/passthrough/vtd/
 INTEL(R) VT FOR X86 (VT-X)
 M:	Jun Nakajima <jun.nakajima@intel.com>
 M:	Eddie Dong <eddie.dong@intel.com>
+M:	Kevin Tian <kevin.tian@intel.com>
 S:	Supported
 F:	xen/arch/x86/hvm/vmx/
 F:	xen/arch/x86/mm/hap/p2m-ept.c
 F:	xen/include/asm-x86/hvm/vmx/
 
-LINUX (PV_OPS)
-M:	Jeremy Fitzhardinge <jeremy@goop.org>
+IOMMU VENDOR INDEPENDENT CODE
+M:	Xiantao Zhang <xiantao.zhang@intel.com>
+M:	Jan Beulich <jbeulich@suse.com>
 S:	Supported
-T:	git git://git.kernel.org/pub/scm/linux/kernel/git/jeremy/xen.git
+F:	xen/drivers/passthrough/
+X:	xen/drivers/passthrough/amd/
+X:	xen/drivers/passthrough/vtd/
+F:	xen/include/xen/iommu.h
 
-LINUX (XCP)
-M:	Ian Campbell <ian.campbell@citrix.com>
-S:	Supported
-T:	hg http://xenbits.xen.org/XCP/linux-2.6.*.pq.hg
+KEXEC
+M:      David Vrabel <david.vrabel@citrix.com>
+S:      Supported
+F:      xen/common/{kexec,kimage}.c
+F:      xen/include/{kexec,kimage}.h
+F:      xen/arch/x86/machine_kexec.c
+F:      xen/arch/x86/x86_64/kexec_reloc.S
 
 MACHINE CHECK (MCA) & RAS
-M:	Christoph Egger <christoph.egger@amd.com>
-M:	Yunhong Jiang <yunhong.jiang@intel.com>
+M:	Christoph Egger <chegger@amazon.de>
+M:	Liu Jinsong <jinsong.liu@alibaba-inc.com>
 S:	Supported
 F:	xen/arch/x86/cpu/mcheck/
 
 MINI-OS
 M:	Stefano Stabellini <stefano.stabellini@eu.citrix.com>
+M:	Samuel Thibault <samuel.thibault@ens-lyon.org>
 S:	Supported
 F:	extras/mini-os/
+
+OCAML TOOLS
+M:	David Scott <dave.scott@eu.citrix.com>
+S:	Supported
+F:	tools/ocaml/
+
+POWER MANAGEMENT
+M:	Jan Beulich <jbeulich@suse.com>
+M:	Liu Jinsong <jinsong.liu@alibaba-inc.com>
+S:	Supported
+F:	xen/arch/x86/acpi/
+X:	xen/arch/x86/acpi/boot.c
+X:	xen/arch/x86/acpi/lib.c
+F:	xen/drivers/cpufreq/
+F:	xen/include/acpi/cpufreq/
 
 QEMU-DM
 M:	Ian Jackson <ian.jackson@eu.citrix.com>
@@ -194,8 +255,6 @@ REMUS
 M:	Shriram Rajagopalan <rshriram@cs.ubc.ca>
 S:	Maintained
 F:	tools/remus/
-F:	tools/python/xen/remus/
-F:	tools/python/xen/lowlevel/checkpoint/
 F:	tools/blktap2/drivers/block-remus.c
 F:	tools/blktap2/drivers/hashtable*
 
@@ -211,6 +270,7 @@ T:	git git://xenbits.xen.org/seabios.git
 
 STUB DOMAINS
 M:	Stefano Stabellini <stefano.stabellini@eu.citrix.com>
+M:	Samuel Thibault <samuel.thibault@ens-lyon.org>
 S:	Supported
 F:	stubdom/
 
@@ -222,7 +282,7 @@ S:	Supported
 F:	tools/
 
 TRANSCENDENT MEMORY (TMEM)
-M:	Dan Magenheimer <dan.magenheimer@oracle.com>
+M:	Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
 W:	http://oss.oracle.com/projects/tmem
 S:	Supported
 F:	xen/common/tmem*
@@ -243,16 +303,10 @@ T:	hg http://xenbits.xen.org/linux-2.6.18-xen.hg
 F:	drivers/xen/usb*/
 
 VTPM
-M:	Matthew Fioravante <matthew.fioravante@jhuapl.edu>
+M:	Daniel De Graaf <dgdegra@tycho.nsa.gov>
 S:	Supported
-F:	extras/minios-os/tpmfront.c
-F:	extras/minios-os/tpmback.c
-F:	extras/minios-os/tpm-tis.c
-F:	extras/minios-os/include/tpmfront.h
-F:	extras/minios-os/include/tpmback.h
-F:	extras/minios-os/include/tpm-tis.h
-F:	tools/vtpm/
-F:	tools/vtpm_manager/
+F:	extras/mini-os/tpm*
+F:	extras/mini-os/include/tpm*
 F:	stubdom/vtpm/
 F:	stubdom/vtpmmgr/
 F:	docs/misc/vtpm.txt
@@ -270,14 +324,34 @@ M:	Tim Deegan <tim@xen.org>
 S:	Supported
 F:	xen/arch/x86/mm/
 
+X86 MEMORY SHARING AND PAGING
+M:	Andres Lagar-Cavilla <andres@lagarcavilla.org>
+M:	Tim Deegan <tim@xen.org>
+S:	Supported
+F:	xen/arch/x86/mm/mem_sharing.c
+F:	xen/arch/x86/mm/mem_paging.c
+F:	tools/memshr
+
 XENTRACE
 M:	George Dunlap <george.dunlap@eu.citrix.com>
 S:	Supported
 F:	tools/xentrace/
 F:	xen/common/trace.c
 
+XSM/FLASK
+M:  Daniel De Graaf <dgdegra@tycho.nsa.gov>
+S:  Supported
+F:  tools/flask/
+F:  xen/include/xsm/
+F:  xen/xsm/
+F:  docs/misc/xsm-flask.txt
+
 THE REST
+M:	Ian Campbell <ian.campbell@citrix.com>
+M:	Ian Jackson <ian.jackson@eu.citrix.com>
+M:	Jan Beulich <jbeulich@suse.com>
 M:	Keir Fraser <keir@xen.org>
+M:	Tim Deegan <tim@xen.org>
 L:	xen-devel@lists.xen.org
 S:	Supported
 F:	*

@@ -333,7 +333,7 @@ int kdd_get_regs(kdd_guest *g, int cpuid, kdd_regs *r, int w64)
     if (!cpu) 
         return -1;
 
-    memset(r, 0, sizeof(r));
+    memset(r, 0, sizeof(*r));
     
     if (w64)
         kdd_get_regs_x86_64(cpu, &r->r64);
@@ -619,7 +619,6 @@ void kdd_guest_teardown(kdd_guest *g)
 {
     flush_maps(g);
     xc_interface_close(g->xc_handle);
-    free(g->id);
     free(g->hvm_buf);
     free(g);
 }

@@ -27,11 +27,15 @@
 #                    boots / shuts down.
 ### END INIT INFO
 
-CMD=xm
+. /etc/xen/scripts/hotplugpath.sh
+
+CMD=${SBINDIR}/xm
+HEADCOMP="LinuxGuestRecord"
 $CMD list &> /dev/null
 if test $? -ne 0
 then
-	CMD=xl
+	CMD=${SBINDIR}/xl
+	HEADCOMP="Xen saved domain"
 fi
 
 $CMD list &> /dev/null
@@ -182,7 +186,7 @@ contains_something()
 rdname()
 {
     NM=$($CMD create --quiet --dryrun --defconfig "$1" |
-         sed -n 's/^.*(name \(.*\))$/\1/p')
+         sed -n 's/^.*(name \(.*\))$/\1/p;s/^.*"name": "\(.*\)",$/\1/p')
 }
 
 rdnames()
@@ -202,7 +206,7 @@ rdnames()
     done
 }
 
-LIST_GREP='((domain\|(domid\|(name\|^{$\|"name":\|"domid":'
+LIST_GREP='(domain\|(domid\|(name\|^    {$\|"name":\|"domid":'
 parseln()
 {
     if [[ "$1" =~ '(domain' ]] || [[ "$1" = "{" ]]; then
@@ -233,7 +237,7 @@ is_running()
 		RC=0
 		;;
 	esac
-    done < <($CMD list -l | grep $LIST_GREP)
+    done < <($CMD list -l | grep "$LIST_GREP")
     return $RC
 }
 
@@ -255,7 +259,7 @@ start()
         for dom in $XENDOMAINS_SAVE/*; do
             if [ -f $dom ] ; then
                 HEADER=`head -c 16 $dom | head -n 1 2> /dev/null`
-                if [ $HEADER = "LinuxGuestRecord" ]; then
+                if [ "$HEADER" = "$HEADCOMP" ]; then
                     echo -n " ${dom##*/}"
                     XMR=`$CMD restore $dom 2>&1 1>/dev/null`
                     #$CMD restore $dom
@@ -315,7 +319,7 @@ all_zombies()
 	if test "$state" != "-b---d" -a "$state" != "-----d"; then
 	    return 1;
 	fi
-    done < <($CMD list -l | grep $LIST_GREP)
+    done < <($CMD list -l | grep "$LIST_GREP")
     return 0
 }
 
@@ -446,7 +450,7 @@ stop()
 	    fi
 	    kill $WDOG_PID >/dev/null 2>&1
 	fi
-    done < <($CMD list -l | grep $LIST_GREP)
+    done < <($CMD list -l | grep "$LIST_GREP")
 
     # NB. this shuts down ALL Xen domains (politely), not just the ones in
     # AUTODIR/*
@@ -483,7 +487,7 @@ check_domain_up()
 		return 0
 		;;
 	esac
-    done < <($CMD list -l | grep $LIST_GREP)
+    done < <($CMD list -l | grep "$LIST_GREP")
     return 1
 }
 

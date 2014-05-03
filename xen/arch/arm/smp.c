@@ -3,35 +3,29 @@
 #include <asm/smp.h>
 #include <asm/cpregs.h>
 #include <asm/page.h>
+#include <asm/gic.h>
+#include <asm/flushtlb.h>
 
 void flush_tlb_mask(const cpumask_t *mask)
 {
-    /* XXX IPI other processors */
-    flush_xen_data_tlb();
+    /* No need to IPI other processors on ARM, the processor takes care of it. */
+    flush_tlb_all();
 }
 
-void smp_call_function(
-    void (*func) (void *info),
-    void *info,
-    int wait)
-{
-    /* TODO: No SMP just now, does not include self so nothing to do.
-       cpumask_t allbutself = cpu_online_map;
-       cpu_clear(smp_processor_id(), allbutself);
-       on_selected_cpus(&allbutself, func, info, wait);
-    */
-}
 void smp_send_event_check_mask(const cpumask_t *mask)
 {
-    /* TODO: No SMP just now, does not include self so nothing to do.
-       send_IPI_mask(mask, EVENT_CHECK_VECTOR);
-    */
+    send_SGI_mask(mask, GIC_SGI_EVENT_CHECK);
+}
+
+void smp_send_call_function_mask(const cpumask_t *mask)
+{
+    send_SGI_mask(mask, GIC_SGI_CALL_FUNCTION);
 }
 
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

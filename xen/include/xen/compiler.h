@@ -7,12 +7,22 @@
 
 #define barrier()     __asm__ __volatile__("": : :"memory")
 
-#define likely(x)     __builtin_expect((x),1)
-#define unlikely(x)   __builtin_expect((x),0)
+#define likely(x)     __builtin_expect(!!(x),1)
+#define unlikely(x)   __builtin_expect(!!(x),0)
 
 #define inline        __inline__
 #define always_inline __inline__ __attribute__ ((always_inline))
 #define noinline      __attribute__((noinline))
+
+#define noreturn      __attribute__((noreturn))
+
+#define __packed      __attribute__((packed))
+
+#if (!defined(__clang__) && (__GNUC__ == 4) && (__GNUC_MINOR__ < 5))
+#define unreachable() do {} while (1)
+#else
+#define unreachable() __builtin_unreachable()
+#endif
 
 #ifdef __clang__
 /* Clang can replace some vars with new automatic ones that go in .data;
@@ -53,6 +63,10 @@
 #define __must_check __attribute__((warn_unused_result))
 
 #define offsetof(a,b) __builtin_offsetof(a,b)
+
+#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 201112L
+#define alignof __alignof__
+#endif
 
 /* &a[0] degrades to a pointer: a different type from an array */
 #define __must_be_array(a) \

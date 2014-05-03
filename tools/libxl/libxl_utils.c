@@ -57,7 +57,7 @@ char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid)
 
 char *libxl__domid_to_name(libxl__gc *gc, uint32_t domid)
 {
-    char *s = libxl_domid_to_name(libxl__gc_owner(gc), domid);
+    char *s = libxl_domid_to_name(CTX, domid);
     libxl__ptr_add(gc, s);
     return s;
 }
@@ -90,6 +90,25 @@ int libxl_name_to_domid(libxl_ctx *ctx, const char *name,
     return ret;
 }
 
+int libxl_domain_qualifier_to_domid(libxl_ctx *ctx, const char *name,
+                                    uint32_t *domid)
+{
+    int i, rv;
+    for (i=0; name[i]; i++) {
+        if (!CTYPE(isdigit, name[i])) {
+            goto nondigit_found;
+        }
+    }
+    *domid = strtoul(name, NULL, 10);
+    return 0;
+
+ nondigit_found:
+    /* this could also check for uuids */
+    rv = libxl_name_to_domid(ctx, name, domid);
+    return rv;
+}
+
+
 char *libxl_cpupoolid_to_name(libxl_ctx *ctx, uint32_t poolid)
 {
     unsigned int len;
@@ -116,7 +135,7 @@ int libxl_cpupoolid_is_valid(libxl_ctx *ctx, uint32_t poolid)
 
 char *libxl__cpupoolid_to_name(libxl__gc *gc, uint32_t poolid)
 {
-    char *s = libxl_cpupoolid_to_name(libxl__gc_owner(gc), poolid);
+    char *s = libxl_cpupoolid_to_name(CTX, poolid);
     libxl__ptr_add(gc, s);
     return s;
 }
@@ -154,8 +173,8 @@ int libxl_get_stubdom_id(libxl_ctx *ctx, int guest_domid)
     int ret;
 
     stubdom_id_s = libxl__xs_read(gc, XBT_NULL,
-                                 libxl__sprintf(gc, "%s/image/device-model-domid",
-                                               libxl__xs_get_dompath(gc, guest_domid)));
+                                  GCSPRINTF("%s/image/device-model-domid",
+                                  libxl__xs_get_dompath(gc, guest_domid)));
     if (stubdom_id_s)
         ret = atoi(stubdom_id_s);
     else
@@ -171,7 +190,8 @@ int libxl_is_stubdom(libxl_ctx *ctx, uint32_t domid, uint32_t *target_domid)
     uint32_t value;
     int ret = 0;
 
-    target = libxl__xs_read(gc, XBT_NULL, libxl__sprintf(gc, "%s/target", libxl__xs_get_dompath(gc, domid)));
+    target = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("%s/target",
+                            libxl__xs_get_dompath(gc, domid)));
     if (!target)
         goto out;
     value = strtol(target, &endptr, 10);
@@ -187,15 +207,14 @@ out:
 
 static int logrename(libxl__gc *gc, const char *old, const char *new)
 {
-    libxl_ctx *ctx = libxl__gc_owner(gc);
     int r;
 
     r = rename(old, new);
     if (r) {
         if (errno == ENOENT) return 0; /* ok */
 
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "failed to rotate logfile - could not"
-                     " rename %s to %s", old, new);
+        LOGE(ERROR, "failed to rotate logfile - "
+                    "could not rename %s to %s", old, new);
         return ERROR_FAIL;
     }
     return 0;
@@ -208,29 +227,29 @@ int libxl_create_logfile(libxl_ctx *ctx, const char *name, char **full_name)
     char *logfile, *logfile_new;
     int i, rc;
 
-    logfile = libxl__sprintf(gc, "/var/log/xen/%s.log", name);
+    logfile = GCSPRINTF("/var/log/xen/%s.log", name);
     if (stat(logfile, &stat_buf) == 0) {
         /* file exists, rotate */
-        logfile = libxl__sprintf(gc, "/var/log/xen/%s.log.10", name);
+        logfile = GCSPRINTF("/var/log/xen/%s.log.10", name);
         unlink(logfile);
         for (i = 9; i > 0; i--) {
-            logfile = libxl__sprintf(gc, "/var/log/xen/%s.log.%d", name, i);
-            logfile_new = libxl__sprintf(gc, "/var/log/xen/%s.log.%d", name, i + 1);
+            logfile = GCSPRINTF("/var/log/xen/%s.log.%d", name, i);
+            logfile_new = GCSPRINTF("/var/log/xen/%s.log.%d", name, i + 1);
             rc = logrename(gc, logfile, logfile_new);
             if (rc)
                 goto out;
         }
-        logfile = libxl__sprintf(gc, "/var/log/xen/%s.log", name);
-        logfile_new = libxl__sprintf(gc, "/var/log/xen/%s.log.1", name);
+        logfile = GCSPRINTF("/var/log/xen/%s.log", name);
+        logfile_new = GCSPRINTF("/var/log/xen/%s.log.1", name);
 
         rc = logrename(gc, logfile, logfile_new);
         if (rc)
             goto out;
     } else {
         if (errno != ENOENT)
-            LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_WARNING, "problem checking existence of"
-                         " logfile %s, which might have needed to be rotated",
-                         name);
+            LOGE(WARN, "problem checking existence of logfile %s, "
+                       "which might have needed to be rotated",
+                 name);
     }
     *full_name = strdup(logfile);
     rc = 0;
@@ -271,6 +290,7 @@ out:
 
 int libxl_read_file_contents(libxl_ctx *ctx, const char *filename,
                              void **data_r, int *datalen_r) {
+    GC_INIT(ctx);
     FILE *f = 0;
     uint8_t *data = 0;
     int datalen = 0;
@@ -281,23 +301,23 @@ int libxl_read_file_contents(libxl_ctx *ctx, const char *filename,
     f = fopen(filename, "r");
     if (!f) {
         if (errno == ENOENT) return ENOENT;
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "failed to open %s", filename);
+        LOGE(ERROR, "failed to open %s", filename);
         goto xe;
     }
 
     if (fstat(fileno(f), &stab)) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "failed to fstat %s", filename);
+        LOGE(ERROR, "failed to fstat %s", filename);
         goto xe;
     }
 
     if (!S_ISREG(stab.st_mode)) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "%s is not a plain file", filename);
+        LOGE(ERROR, "%s is not a plain file", filename);
         errno = ENOTTY;
         goto xe;
     }
 
     if (stab.st_size > INT_MAX) {
-        LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "file %s is far too large", filename);
+        LOG(ERROR, "file %s is far too large", filename);
         errno = EFBIG;
         goto xe;
     }
@@ -311,10 +331,10 @@ int libxl_read_file_contents(libxl_ctx *ctx, const char *filename,
         rs = fread(data, 1, datalen, f);
         if (rs != datalen) {
             if (ferror(f))
-                LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "failed to read %s", filename);
+                LOGE(ERROR, "failed to read %s", filename);
             else if (feof(f))
-                LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "%s changed size while we"
-                       " were reading it", filename);
+                LOG(ERROR, "%s changed size while we were reading it",
+		    filename);
             else
                 abort();
             goto xe;
@@ -323,20 +343,22 @@ int libxl_read_file_contents(libxl_ctx *ctx, const char *filename,
 
     if (fclose(f)) {
         f = 0;
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "failed to close %s", filename);
+        LOGE(ERROR, "failed to close %s", filename);
         goto xe;
     }
 
     if (data_r) *data_r = data;
     if (datalen_r) *datalen_r = datalen;
 
+    GC_FREE;
     return 0;
 
  xe:
+    GC_FREE;
     e = errno;
     assert(e != ENOENT);
     if (f) fclose(f);
-    if (data) free(data);
+    free(data);
     return e;
 }
 
@@ -456,11 +478,41 @@ int libxl__remove_directory(libxl__gc *gc, const char *dirpath)
 
 int libxl_pipe(libxl_ctx *ctx, int pipes[2])
 {
+    GC_INIT(ctx);
+    int ret = 0;
     if (pipe(pipes) < 0) {
-        LIBXL__LOG(ctx, LIBXL__LOG_ERROR, "Failed to create a pipe");
-        return -1;
+        LOG(ERROR, "Failed to create a pipe");
+        ret = -1;
     }
-    return 0;
+    GC_FREE;
+    return ret;
+}
+
+int libxl_uuid_to_device_vtpm(libxl_ctx *ctx, uint32_t domid,
+                            libxl_uuid* uuid, libxl_device_vtpm *vtpm)
+{
+    libxl_device_vtpm *vtpms;
+    int nb, i;
+    int rc;
+
+    vtpms = libxl_device_vtpm_list(ctx, domid, &nb);
+    if (!vtpms)
+        return ERROR_FAIL;
+
+    memset(vtpm, 0, sizeof (libxl_device_vtpm));
+    rc = 1;
+    for (i = 0; i < nb; ++i) {
+        if(!libxl_uuid_compare(uuid, &vtpms[i].uuid)) {
+            vtpm->backend_domid = vtpms[i].backend_domid;
+            vtpm->devid = vtpms[i].devid;
+            libxl_uuid_copy(&vtpm->uuid, &vtpms[i].uuid);
+            rc = 0;
+            break;
+        }
+    }
+
+    libxl_device_vtpm_list_free(vtpms, nb);
+    return rc;
 }
 
 int libxl_mac_to_device_nic(libxl_ctx *ctx, uint32_t domid,
@@ -599,12 +651,64 @@ char *libxl_bitmap_to_hex_string(libxl_ctx *ctx, const libxl_bitmap *bitmap)
     return q;
 }
 
+int libxl_cpu_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *cpumap, int max_cpus)
+{
+    GC_INIT(ctx);
+    int rc = 0;
+
+    if (max_cpus < 0) {
+        rc = ERROR_INVAL;
+        LOG(ERROR, "invalid number of cpus provided");
+        goto out;
+    }
+    if (max_cpus == 0)
+        max_cpus = libxl_get_max_cpus(ctx);
+    if (max_cpus < 0) {
+        LOG(ERROR, "failed to retrieve the maximum number of cpus");
+        rc = max_cpus;
+        goto out;
+    }
+    /* This can't fail: no need to check and log */
+    libxl_bitmap_alloc(ctx, cpumap, max_cpus);
+
+ out:
+    GC_FREE;
+    return rc;
+}
+
+int libxl_node_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *nodemap,
+                            int max_nodes)
+{
+    GC_INIT(ctx);
+    int rc = 0;
+
+    if (max_nodes < 0) {
+        rc = ERROR_INVAL;
+        LOG(ERROR, "invalid number of nodes provided");
+        goto out;
+    }
+
+    if (max_nodes == 0)
+        max_nodes = libxl_get_max_nodes(ctx);
+    if (max_nodes < 0) {
+        LOG(ERROR, "failed to retrieve the maximum number of nodes");
+        rc = max_nodes;
+        goto out;
+    }
+    /* This can't fail: no need to check and log */
+    libxl_bitmap_alloc(ctx, nodemap, max_nodes);
+
+ out:
+    GC_FREE;
+    return rc;
+}
+
 int libxl_nodemap_to_cpumap(libxl_ctx *ctx,
                             const libxl_bitmap *nodemap,
                             libxl_bitmap *cpumap)
 {
     libxl_cputopology *tinfo = NULL;
-    int nr_cpus, i, rc = 0;
+    int nr_cpus = 0, i, rc = 0;
 
     tinfo = libxl_get_cpu_topology(ctx, &nr_cpus);
     if (tinfo == NULL) {
@@ -622,12 +726,34 @@ int libxl_nodemap_to_cpumap(libxl_ctx *ctx,
     return rc;
 }
 
+int libxl_node_to_cpumap(libxl_ctx *ctx, int node,
+                         libxl_bitmap *cpumap)
+{
+    libxl_bitmap nodemap;
+    int rc = 0;
+
+    libxl_bitmap_init(&nodemap);
+
+    rc = libxl_node_bitmap_alloc(ctx, &nodemap, 0);
+    if (rc)
+        goto out;
+
+    libxl_bitmap_set_none(&nodemap);
+    libxl_bitmap_set(&nodemap, node);
+
+    rc = libxl_nodemap_to_cpumap(ctx, &nodemap, cpumap);
+
+ out:
+    libxl_bitmap_dispose(&nodemap);
+    return rc;
+}
+
 int libxl_cpumap_to_nodemap(libxl_ctx *ctx,
                             const libxl_bitmap *cpumap,
                             libxl_bitmap *nodemap)
 {
     libxl_cputopology *tinfo = NULL;
-    int nr_cpus, i, rc = 0;
+    int nr_cpus = 0, i, rc = 0;
 
     tinfo = libxl_get_cpu_topology(ctx, &nr_cpus);
     if (tinfo == NULL) {
@@ -636,8 +762,11 @@ int libxl_cpumap_to_nodemap(libxl_ctx *ctx,
     }
 
     libxl_bitmap_set_none(nodemap);
-    libxl_for_each_set_bit(i, *cpumap)
+    libxl_for_each_set_bit(i, *cpumap) {
+        if (i >= nr_cpus)
+            break;
         libxl_bitmap_set(nodemap, tinfo[i].node);
+    }
  out:
     libxl_cputopology_list_free(tinfo, nr_cpus);
     return rc;
@@ -645,12 +774,23 @@ int libxl_cpumap_to_nodemap(libxl_ctx *ctx,
 
 int libxl_get_max_cpus(libxl_ctx *ctx)
 {
-    return xc_get_max_cpus(ctx->xch);
+    int max_cpus = xc_get_max_cpus(ctx->xch);
+
+    return max_cpus < 0 ? ERROR_FAIL : max_cpus;
+}
+
+int libxl_get_online_cpus(libxl_ctx *ctx)
+{
+    int online_cpus = xc_get_online_cpus(ctx->xch);
+
+    return online_cpus < 0 ? ERROR_FAIL : online_cpus;
 }
 
 int libxl_get_max_nodes(libxl_ctx *ctx)
 {
-    return xc_get_max_nodes(ctx->xch);
+    int max_nodes = xc_get_max_nodes(ctx->xch);
+
+    return max_nodes < 0 ? ERROR_FAIL : max_nodes;
 }
 
 int libxl__enum_from_string(const libxl_enum_string_table *t,
@@ -817,6 +957,22 @@ void libxl_cpupoolinfo_list_free(libxl_cpupoolinfo *list, int nr)
     for (i = 0; i < nr; i++)
         libxl_cpupoolinfo_dispose(&list[i]);
     free(list);
+}
+
+void libxl_vtpminfo_list_free(libxl_vtpminfo* list, int nr)
+{
+   int i;
+   for (i = 0; i < nr; i++)
+      libxl_vtpminfo_dispose(&list[i]);
+   free(list);
+}
+
+void libxl_device_vtpm_list_free(libxl_device_vtpm* list, int nr)
+{
+   int i;
+   for (i = 0; i < nr; i++)
+      libxl_device_vtpm_dispose(&list[i]);
+   free(list);
 }
 
 int libxl_domid_valid_guest(uint32_t domid)

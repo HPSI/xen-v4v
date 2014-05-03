@@ -175,7 +175,7 @@ void svm_intr_assist(void)
                 /* Guest already enabled an interrupt window. */
                 return;
             default:
-                panic("%s: nestedsvm_vcpu_interrupt can't handle value %#x\n",
+                panic("%s: nestedsvm_vcpu_interrupt can't handle value %#x",
                     __func__, rc);
             }
         }
@@ -223,7 +223,7 @@ void svm_intr_assist(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -6,6 +6,7 @@ unions  = [ "vcpu_cr_regs",
 structs = [ "start_info",
             "trap_info",
             "cpu_user_regs",
+            "vcpu_guest_core_regs",
             "vcpu_guest_context",
             "arch_vcpu_info",
             "vcpu_time_info",
@@ -14,8 +15,11 @@ structs = [ "start_info",
             "shared_info" ];
 
 defines = [ "__arm__",
+            "__aarch64__",
             "__i386__",
             "__x86_64__",
+
+            "XEN_HAVE_PV_GUEST_ENTRY",
 
             # arm
             # None
@@ -54,3 +58,8 @@ defines = [ "__arm__",
             "XEN_LEGACY_MAX_VCPUS",
             "MAX_GUEST_CMDLINE" ];
 
+# Architectures which must be compatible, i.e. identical
+compat_arches = {
+    'arm32': 'arm64',
+    'arm64': 'arm32',
+}

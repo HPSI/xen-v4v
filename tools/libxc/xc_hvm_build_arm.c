@@ -22,7 +22,7 @@
 #include <xenguest.h>
 
 int xc_hvm_build(xc_interface *xch, uint32_t domid,
-                 const struct xc_hvm_build_args *hvm_args)
+                 struct xc_hvm_build_args *hvm_args)
 {
     errno = ENOSYS;
     return -1;
@@ -41,7 +41,7 @@ int xc_hvm_build_target_mem(xc_interface *xch,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

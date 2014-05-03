@@ -34,6 +34,9 @@ void arch_hvm_save(struct domain *d, struct hvm_save_header *hdr)
 
     /* Save guest's preferred TSC. */
     hdr->gtsc_khz = d->arch.tsc_khz;
+
+    /* Time when saving started */
+    rdtscll(d->arch.hvm_domain.sync_tsc);
 }
 
 int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
@@ -67,6 +70,9 @@ int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
     if ( d->arch.vtsc )
         hvm_set_rdtsc_exiting(d, 1);
 
+    /* Time when restore started  */
+    rdtscll(d->arch.hvm_domain.sync_tsc);
+
     /* VGA state is not saved/restored, so we nobble the cache. */
     d->arch.hvm_domain.stdvga.cache = 0;
 
@@ -76,7 +82,7 @@ int arch_hvm_load(struct domain *d, struct hvm_save_header *hdr)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

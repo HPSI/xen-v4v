@@ -83,7 +83,8 @@ __attribute__((unused))
     XSD_ERROR(EROFS),
     XSD_ERROR(EBUSY),
     XSD_ERROR(EAGAIN),
-    XSD_ERROR(EISCONN)
+    XSD_ERROR(EISCONN),
+    XSD_ERROR(E2BIG)
 };
 #endif
 
@@ -103,7 +104,10 @@ enum xs_watch_type
     XS_WATCH_TOKEN
 };
 
-/* Inter-domain shared memory communications. */
+/*
+ * `incontents 150 xenstore_struct XenStore wire protocol.
+ *
+ * Inter-domain shared memory communications. */
 #define XENSTORE_RING_SIZE 1024
 typedef uint32_t XENSTORE_RING_IDX;
 #define MASK_XENSTORE_IDX(idx) ((idx) & (XENSTORE_RING_SIZE-1))
@@ -126,7 +130,7 @@ struct xenstore_domain_interface {
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

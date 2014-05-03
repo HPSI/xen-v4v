@@ -136,13 +136,16 @@ class EnumerationValue(object):
 
         self.valuename = str.upper(name)
         self.rawname = str.upper(enum.rawname) + "_" + self.valuename
-        self.name = str.upper(enum.namespace) + self.rawname
+        self.name = str.upper(enum.value_namespace) + self.rawname
         self.value = value
 
 class Enumeration(Type):
     def __init__(self, typename, values, **kwargs):
         kwargs.setdefault('dispose_fn', None)
         Type.__init__(self, typename, **kwargs)
+
+        self.value_namespace = kwargs.setdefault('value_namespace',
+            self.namespace)
 
         self.values = []
         for v in values:
@@ -215,6 +218,9 @@ class Struct(Aggregate):
     def __init__(self, name, fields, **kwargs):
         kwargs.setdefault('passby', PASS_BY_REFERENCE)
         Aggregate.__init__(self, "struct", name, fields, **kwargs)
+
+    def has_fields(self):
+        return len(self.fields) != 0
 
 class Union(Aggregate):
     def __init__(self, name, fields, **kwargs):

@@ -5,7 +5,9 @@
 
 enum virtual_vga { VGA_none, VGA_std, VGA_cirrus, VGA_pt };
 extern enum virtual_vga virtual_vga;
+
 extern unsigned long igd_opregion_pgbase;
+#define IGD_OPREGION_PAGES 3
 
 struct bios_config {
     const char *name;
@@ -53,7 +55,6 @@ extern struct bios_config ovmf_config;
 /* MMIO hole: Hardcoded defaults, which can be dynamically expanded. */
 #define PCI_MEM_START       0xf0000000
 #define PCI_MEM_END         0xfc000000
-#define PCI_MIN_BIG_BAR_SIZE          0x20000000
 
 extern unsigned long pci_mem_start, pci_mem_end;
 
@@ -86,7 +87,7 @@ extern unsigned long scratch_start;
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

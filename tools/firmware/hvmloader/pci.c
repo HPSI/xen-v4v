@@ -27,6 +27,8 @@
 
 #include <xen/memory.h>
 #include <xen/hvm/ioreq.h>
+#include <xen/hvm/hvm_xs_strings.h>
+#include <stdbool.h>
 
 unsigned long pci_mem_start = PCI_MEM_START;
 unsigned long pci_mem_end = PCI_MEM_END;
@@ -42,7 +44,6 @@ void pci_setup(void)
     uint32_t vga_devfn = 256;
     uint16_t class, vendor_id, device_id;
     unsigned int bar, pin, link, isa_irq;
-    int64_t mmio_left;
 
     /* Resources assignable to PCI devices via BARs. */
     struct resource {
@@ -57,6 +58,32 @@ void pci_setup(void)
         uint64_t bar_sz;
     } *bars = (struct bars *)scratch_start;
     unsigned int i, nr_bars = 0;
+
+    const char *s;
+    /*
+     * Do we allow hvmloader to relocate guest memory in order to
+     * increase the size of the lowmem MMIO hole?  Defaulting to 1
+     * here will mean that non-libxl toolstacks (including xend and
+     * home-grown ones) means that those using qemu-xen will still
+     * experience the memory relocation bug described below; but it
+     * also means that those using qemu-traditional will *not*
+     * experience any change; and it also means that there is a
+     * work-around for those using qemu-xen, namely switching to
+     * qemu-traditional.
+     *
+     * If we defaulted to 0, and failing to resize the hole caused any
+     * problems with qemu-traditional, then there is no work-around.
+     *
+     * Since xend can only use qemu-traditional, I think this is the
+     * option that will have the least impact.
+     */
+    bool allow_memory_relocate = 1;
+
+    s = xenstore_read(HVM_XS_ALLOW_MEMORY_RELOCATE, NULL);
+    if ( s )
+        allow_memory_relocate = strtoll(s, NULL, 0);
+    printf("Relocating guest memory for lowmem MMIO space %s\n",
+           allow_memory_relocate?"enabled":"disabled");
 
     /* Program PCI-ISA bridge with appropriate link routes. */
     isa_irq = 0;
@@ -104,7 +131,7 @@ void pci_setup(void)
                 virtual_vga = VGA_pt;
                 if ( vendor_id == 0x8086 )
                 {
-                    igd_opregion_pgbase = mem_hole_alloc(2);
+                    igd_opregion_pgbase = mem_hole_alloc(IGD_OPREGION_PAGES);
                     /*
                      * Write the the OpRegion offset to give the opregion
                      * address to the device model. The device model will trap 
@@ -209,12 +236,33 @@ void pci_setup(void)
         pci_writew(devfn, PCI_COMMAND, cmd);
     }
 
-    while ( (mmio_total > (pci_mem_end - pci_mem_start)) &&
-            ((pci_mem_start << 1) != 0) )
+    /*
+     * At the moment qemu-xen can't deal with relocated memory regions.
+     * It's too close to the release to make a proper fix; for now,
+     * only allow the MMIO hole to grow large enough to move guest memory
+     * if we're running qemu-traditional.  Items that don't fit will be
+     * relocated into the 64-bit address space.
+     *
+     * This loop now does the following:
+     * - If allow_memory_relocate, increase the MMIO hole until it's
+     *   big enough, or until it's 2GiB
+     * - If !allow_memory_relocate, increase the MMIO hole until it's
+     *   big enough, or until it's 2GiB, or until it overlaps guest
+     *   memory
+     */
+    while ( (mmio_total > (pci_mem_end - pci_mem_start)) 
+            && ((pci_mem_start << 1) != 0)
+            && (allow_memory_relocate
+                || (((pci_mem_start << 1) >> PAGE_SHIFT)
+                    >= hvm_info->low_mem_pgend)) )
         pci_mem_start <<= 1;
 
-    if ( (pci_mem_start << 1) != 0 )
+    if ( mmio_total > (pci_mem_end - pci_mem_start) )
+    {
+        printf("Low MMIO hole not large enough for all devices,"
+               " relocating some BARs to 64-bit\n");
         bar64_relocate = 1;
+    }
 
     /* Relocate RAM that overlaps PCI space (in 64k-page chunks). */
     while ( (pci_mem_start >> PAGE_SHIFT) < hvm_info->low_mem_pgend )
@@ -227,6 +275,11 @@ void pci_setup(void)
         if ( hvm_info->high_mem_pgend == 0 )
             hvm_info->high_mem_pgend = 1ull << (32 - PAGE_SHIFT);
         hvm_info->low_mem_pgend -= nr_pages;
+        printf("Relocating 0x%x pages from "PRIllx" to "PRIllx\
+               " for lowmem MMIO hole\n",
+               nr_pages,
+               PRIllx_arg(((uint64_t)hvm_info->low_mem_pgend)<<PAGE_SHIFT),
+               PRIllx_arg(((uint64_t)hvm_info->high_mem_pgend)<<PAGE_SHIFT));
         xatp.domid = DOMID_SELF;
         xatp.space = XENMAPSPACE_gmfn_range;
         xatp.idx   = hvm_info->low_mem_pgend;
@@ -237,14 +290,23 @@ void pci_setup(void)
         hvm_info->high_mem_pgend += nr_pages;
     }
 
-    high_mem_resource.base = ((uint64_t)hvm_info->high_mem_pgend) << PAGE_SHIFT; 
+    high_mem_resource.base = ((uint64_t)hvm_info->high_mem_pgend) << PAGE_SHIFT;
+    if ( high_mem_resource.base < 1ull << 32 )
+    {
+        if ( hvm_info->high_mem_pgend != 0 )
+            printf("WARNING: hvm_info->high_mem_pgend %x"
+                   " does not point into high memory!",
+                   hvm_info->high_mem_pgend);
+        high_mem_resource.base = 1ull << 32;
+    }
+    printf("%sRAM in high memory; setting high_mem resource base to "PRIllx"\n",
+           hvm_info->high_mem_pgend?"":"No ",
+           PRIllx_arg(high_mem_resource.base));
     high_mem_resource.max = 1ull << cpu_phys_addr();
     mem_resource.base = pci_mem_start;
     mem_resource.max = pci_mem_end;
     io_resource.base = 0xc000;
     io_resource.max = 0x10000;
-
-    mmio_left = pci_mem_end - pci_mem_start;
 
     /* Assign iomem and ioport resources in descending order of size. */
     for ( i = 0; i < nr_bars; i++ )
@@ -253,15 +315,33 @@ void pci_setup(void)
         bar_reg = bars[i].bar_reg;
         bar_sz  = bars[i].bar_sz;
 
-        using_64bar = bars[i].is_64bar && bar64_relocate && (mmio_left < bar_sz);
+        /*
+         * Relocate to high memory if the total amount of MMIO needed
+         * is more than the low MMIO available.  Because devices are
+         * processed in order of bar_sz, this will preferentially
+         * relocate larger devices to high memory first.
+         *
+         * NB: The code here is rather fragile, as the check here to see
+         * whether bar_sz will fit in the low MMIO region doesn't match the
+         * real check made below, which involves aligning the base offset of the
+         * bar with the size of the bar itself.  As it happens, this will always
+         * be satisfied because:
+         * - The first one will succeed because the MMIO hole can only start at
+         *   0x{f,e,c,8}00000000.  If it fits, it will be aligned properly.
+         * - All subsequent ones will be aligned because the list is ordered
+         *   large to small, and bar_sz is always a power of 2. (At least
+         *   the code here assumes it to be.)
+         * Should either of those two conditions change, this code will break.
+         */
+        using_64bar = bars[i].is_64bar && bar64_relocate
+            && (mmio_total > (mem_resource.max - mem_resource.base));
         bar_data = pci_readl(devfn, bar_reg);
 
         if ( (bar_data & PCI_BASE_ADDRESS_SPACE) ==
              PCI_BASE_ADDRESS_SPACE_MEMORY )
         {
-            /* Mapping high memory if PCI deivce is 64 bits bar and the bar size
-               is larger than 512M */
-            if (using_64bar && (bar_sz > PCI_MIN_BIG_BAR_SIZE)) {
+            /* Mapping high memory if PCI device is 64 bits bar */
+            if ( using_64bar ) {
                 if ( high_mem_resource.base & (bar_sz - 1) )
                     high_mem_resource.base = high_mem_resource.base - 
                         (high_mem_resource.base & (bar_sz - 1)) + bar_sz;
@@ -275,7 +355,7 @@ void pci_setup(void)
                 resource = &mem_resource;
                 bar_data &= ~PCI_BASE_ADDRESS_MEM_MASK;
             }
-            mmio_left -= bar_sz;
+            mmio_total -= bar_sz;
         }
         else
         {
@@ -290,8 +370,9 @@ void pci_setup(void)
 
         if ( (base < resource->base) || (base > resource->max) )
         {
-            printf("pci dev %02x:%x bar %02x size %llx: no space for "
-                   "resource!\n", devfn>>3, devfn&7, bar_reg, bar_sz);
+            printf("pci dev %02x:%x bar %02x size "PRIllx": no space for "
+                   "resource!\n", devfn>>3, devfn&7, bar_reg,
+                   PRIllx_arg(bar_sz));
             continue;
         }
 
@@ -300,8 +381,10 @@ void pci_setup(void)
         pci_writel(devfn, bar_reg, bar_data);
         if (using_64bar)
             pci_writel(devfn, bar_reg + 4, bar_data_upper);
-        printf("pci dev %02x:%x bar %02x size %llx: %08x\n",
-               devfn>>3, devfn&7, bar_reg, bar_sz, bar_data);
+        printf("pci dev %02x:%x bar %02x size "PRIllx": %x%08x\n",
+               devfn>>3, devfn&7, bar_reg,
+               PRIllx_arg(bar_sz),
+               bar_data_upper, bar_data);
 			
 
         /* Now enable the memory or I/O mapping. */
@@ -331,7 +414,7 @@ void pci_setup(void)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

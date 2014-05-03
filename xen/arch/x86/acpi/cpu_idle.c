@@ -62,13 +62,17 @@
 
 #define GET_HW_RES_IN_NS(msr, val) \
     do { rdmsrl(msr, val); val = tsc_ticks2ns(val); } while( 0 )
-#define GET_PC2_RES(val)  GET_HW_RES_IN_NS(0x60D, val) /* SNB only */
+#define GET_PC2_RES(val)  GET_HW_RES_IN_NS(0x60D, val) /* SNB onwards */
 #define GET_PC3_RES(val)  GET_HW_RES_IN_NS(0x3F8, val)
 #define GET_PC6_RES(val)  GET_HW_RES_IN_NS(0x3F9, val)
 #define GET_PC7_RES(val)  GET_HW_RES_IN_NS(0x3FA, val)
+#define GET_PC8_RES(val)  GET_HW_RES_IN_NS(0x630, val) /* some Haswells only */
+#define GET_PC9_RES(val)  GET_HW_RES_IN_NS(0x631, val) /* some Haswells only */
+#define GET_PC10_RES(val) GET_HW_RES_IN_NS(0x632, val) /* some Haswells only */
+#define GET_CC1_RES(val)  GET_HW_RES_IN_NS(0x660, val) /* Silvermont only */
 #define GET_CC3_RES(val)  GET_HW_RES_IN_NS(0x3FC, val)
 #define GET_CC6_RES(val)  GET_HW_RES_IN_NS(0x3FD, val)
-#define GET_CC7_RES(val)  GET_HW_RES_IN_NS(0x3FE, val) /* SNB only */
+#define GET_CC7_RES(val)  GET_HW_RES_IN_NS(0x3FE, val) /* SNB onwards */
 
 static void lapic_timer_nop(void) { }
 void (*__read_mostly lapic_timer_off)(void);
@@ -111,8 +115,13 @@ struct hw_residencies
 {
     uint64_t pc2;
     uint64_t pc3;
+    uint64_t pc4;
     uint64_t pc6;
     uint64_t pc7;
+    uint64_t pc8;
+    uint64_t pc9;
+    uint64_t pc10;
+    uint64_t cc1;
     uint64_t cc3;
     uint64_t cc6;
     uint64_t cc7;
@@ -128,6 +137,12 @@ static void do_get_hw_residencies(void *arg)
 
     switch ( c->x86_model )
     {
+    /* 4th generation Intel Core (Haswell) */
+    case 0x45:
+        GET_PC8_RES(hw_res->pc8);
+        GET_PC9_RES(hw_res->pc9);
+        GET_PC10_RES(hw_res->pc10);
+        /* fall through */
     /* Sandy bridge */
     case 0x2A:
     case 0x2D:
@@ -135,8 +150,12 @@ static void do_get_hw_residencies(void *arg)
     case 0x3A:
     case 0x3E:
     /* Haswell */
-    case 0x3c:
-    case 0x45:
+    case 0x3C:
+    case 0x3F:
+    case 0x46:
+    /* future */
+    case 0x3D:
+    case 0x4E:
         GET_PC2_RES(hw_res->pc2);
         GET_CC7_RES(hw_res->cc7);
         /* fall through */
@@ -153,6 +172,22 @@ static void do_get_hw_residencies(void *arg)
         GET_PC6_RES(hw_res->pc6);
         GET_PC7_RES(hw_res->pc7);
         GET_CC3_RES(hw_res->cc3);
+        GET_CC6_RES(hw_res->cc6);
+        break;
+    /* various Atoms */
+    case 0x27:
+        GET_PC3_RES(hw_res->pc2); /* abusing GET_PC3_RES */
+        GET_PC6_RES(hw_res->pc4); /* abusing GET_PC6_RES */
+        GET_PC7_RES(hw_res->pc6); /* abusing GET_PC7_RES */
+        break;
+    /* Silvermont */
+    case 0x37:
+    case 0x4A:
+    case 0x4D:
+    case 0x5A:
+    case 0x5D:
+        GET_PC7_RES(hw_res->pc6); /* abusing GET_PC7_RES */
+        GET_CC1_RES(hw_res->cc1);
         GET_CC6_RES(hw_res->cc6);
         break;
     }
@@ -174,10 +209,16 @@ static void print_hw_residencies(uint32_t cpu)
 
     get_hw_residencies(cpu, &hw_res);
 
-    printk("PC2[%"PRId64"] PC3[%"PRId64"] PC6[%"PRId64"] PC7[%"PRId64"]\n",
-           hw_res.pc2, hw_res.pc3, hw_res.pc6, hw_res.pc7);
-    printk("CC3[%"PRId64"] CC6[%"PRId64"] CC7[%"PRId64"]\n",
-           hw_res.cc3, hw_res.cc6,hw_res.cc7);
+    printk("PC2[%"PRIu64"] PC%d[%"PRIu64"] PC6[%"PRIu64"] PC7[%"PRIu64"]\n",
+           hw_res.pc2,
+           hw_res.pc4 ? 4 : 3, hw_res.pc4 ?: hw_res.pc3,
+           hw_res.pc6, hw_res.pc7);
+    if ( hw_res.pc8 | hw_res.pc9 | hw_res.pc10 )
+        printk("PC8[%"PRIu64"] PC9[%"PRIu64"] PC10[%"PRIu64"]\n",
+               hw_res.pc8, hw_res.pc9, hw_res.pc10);
+    printk("CC%d[%"PRIu64"] CC6[%"PRIu64"] CC7[%"PRIu64"]\n",
+           hw_res.cc1 ? 1 : 3, hw_res.cc1 ?: hw_res.cc3,
+           hw_res.cc6, hw_res.cc7);
 }
 
 static char* acpi_cstate_method_name[] =
@@ -293,6 +334,9 @@ void mwait_idle_with_hints(unsigned int eax, unsigned int ecx)
 {
     unsigned int cpu = smp_processor_id();
     s_time_t expires = per_cpu(timer_deadline, cpu);
+
+    if ( boot_cpu_has(X86_FEATURE_CLFLUSH_MONITOR) )
+        clflush((void *)&mwait_wakeup(cpu));
 
     __monitor((void *)&mwait_wakeup(cpu), 0, 0);
     smp_mb();
@@ -437,8 +481,8 @@ static void acpi_processor_idle(void)
          (next_state = cpuidle_current_governor->select(power)) > 0 )
     {
         cx = &power->states[next_state];
-        if ( power->flags.bm_check && acpi_idle_bm_check()
-             && cx->type == ACPI_STATE_C3 )
+        if ( cx->type == ACPI_STATE_C3 && power->flags.bm_check &&
+             acpi_idle_bm_check() )
             cx = power->safe_state;
         if ( cx->idx > max_cstate )
             cx = &power->states[max_cstate];
@@ -561,8 +605,8 @@ static void acpi_processor_idle(void)
         {
             /* Enable bus master arbitration */
             spin_lock(&c3_cpu_status.lock);
-            acpi_set_register(ACPI_BITREG_ARB_DISABLE, 0);
-            c3_cpu_status.count--;
+            if ( c3_cpu_status.count-- == num_online_cpus() )
+                acpi_set_register(ACPI_BITREG_ARB_DISABLE, 0);
             spin_unlock(&c3_cpu_status.lock);
         }
 
@@ -819,12 +863,10 @@ static int check_cx(struct acpi_processor_power *power, xen_processor_cx_t *cx)
             return -EINVAL;
 
         /* All the logic here assumes flags.bm_check is same across all CPUs */
-        if ( bm_check_flag == -1 )
+        if ( bm_check_flag < 0 )
         {
             /* Determine whether bm_check is needed based on CPU  */
             acpi_processor_power_init_bm_check(&(power->flags));
-            bm_check_flag = power->flags.bm_check;
-            bm_control_flag = power->flags.bm_control;
         }
         else
         {
@@ -851,14 +893,13 @@ static int check_cx(struct acpi_processor_power *power, xen_processor_cx_t *cx)
                 }
             }
             /*
-             * On older chipsets, BM_RLD needs to be set
-             * in order for Bus Master activity to wake the
-             * system from C3.  Newer chipsets handle DMA
-             * during C3 automatically and BM_RLD is a NOP.
-             * In either case, the proper way to
-             * handle BM_RLD is to set it and leave it set.
+             * On older chipsets, BM_RLD needs to be set in order for Bus
+             * Master activity to wake the system from C3, hence
+             * acpi_set_register() is always being called once below.  Newer
+             * chipsets handle DMA during C3 automatically and BM_RLD is a
+             * NOP.  In either case, the proper way to handle BM_RLD is to
+             * set it and leave it set.
              */
-            acpi_set_register(ACPI_BITREG_BUS_MASTER_RLD, 1);
         }
         else
         {
@@ -873,7 +914,13 @@ static int check_cx(struct acpi_processor_power *power, xen_processor_cx_t *cx)
                           " for C3 to be enabled on SMP systems\n"));
                 return -EINVAL;
             }
-            acpi_set_register(ACPI_BITREG_BUS_MASTER_RLD, 0);
+        }
+
+        if ( bm_check_flag < 0 )
+        {
+            bm_check_flag = power->flags.bm_check;
+            bm_control_flag = power->flags.bm_control;
+            acpi_set_register(ACPI_BITREG_BUS_MASTER_RLD, bm_check_flag);
         }
 
         break;
@@ -907,7 +954,7 @@ static void set_cx(
                    acpi_power->cpu, xen_cx->type);
             return;
         }
-        cx = &acpi_power->states[acpi_power->count++];
+        cx = &acpi_power->states[acpi_power->count];
         cx->type = xen_cx->type;
         break;
     }
@@ -925,19 +972,21 @@ static void set_cx(
             cx->entry_method = ACPI_CSTATE_EM_HALT;
         break;
     case ACPI_ADR_SPACE_SYSTEM_IO:
-        if ( ioports_deny_access(dom0, cx->address, cx->address) )
+        if ( ioports_deny_access(hardware_domain, cx->address, cx->address) )
             printk(XENLOG_WARNING "Could not deny access to port %04x\n",
                    cx->address);
         cx->entry_method = ACPI_CSTATE_EM_SYSIO;
         break;
     default:
         cx->entry_method = ACPI_CSTATE_EM_NONE;
+        break;
     }
 
-    cx->latency  = xen_cx->latency;
-    cx->power    = xen_cx->power;
-    
+    cx->latency = xen_cx->latency;
     cx->target_residency = cx->latency * latency_factor;
+
+    smp_wmb();
+    acpi_power->count++;
     if ( cx->type == ACPI_STATE_C1 || cx->type == ACPI_STATE_C2 )
         acpi_power->safe_state = cx;
 }
@@ -1032,7 +1081,10 @@ long set_cx_pminfo(uint32_t cpu, struct xen_processor_power *power)
     cpu_id = get_cpu_id(cpu);
     if ( cpu_id == -1 )
     {
-        printk(XENLOG_ERR "no cpu_id for acpi_id %d\n", cpu);
+        static bool_t warn_once = 1;
+        if ( warn_once || opt_cpu_info )
+            printk(XENLOG_WARNING "No CPU ID for APIC ID %#x\n", cpu);
+        warn_once = 0;
         return -EINVAL;
     }
 
@@ -1084,19 +1136,21 @@ int pmstat_get_cx_stat(uint32_t cpuid, struct pm_cx_stat *stat)
     struct acpi_processor_power *power = processor_powers[cpuid];
     uint64_t idle_usage = 0, idle_res = 0;
     uint64_t usage[ACPI_PROCESSOR_MAX_POWER], res[ACPI_PROCESSOR_MAX_POWER];
-    int i;
-    struct hw_residencies hw_res;
+    unsigned int i, nr, nr_pc = 0, nr_cc = 0;
 
     if ( power == NULL )
     {
         stat->last = 0;
         stat->nr = 0;
         stat->idle_time = 0;
+        stat->nr_pc = 0;
+        stat->nr_cc = 0;
         return 0;
     }
 
     stat->last = power->last_state ? power->last_state->idx : 0;
     stat->idle_time = get_cpu_idle_time(cpuid);
+    nr = min(stat->nr, power->count);
 
     /* mimic the stat when detail info hasn't been registered by dom0 */
     if ( pm_idle_save == NULL )
@@ -1105,14 +1159,14 @@ int pmstat_get_cx_stat(uint32_t cpuid, struct pm_cx_stat *stat)
 
         usage[1] = idle_usage = 1;
         res[1] = idle_res = stat->idle_time;
-
-        memset(&hw_res, 0, sizeof(hw_res));
     }
     else
     {
+        struct hw_residencies hw_res;
+
         stat->nr = power->count;
 
-        for ( i = 1; i < power->count; i++ )
+        for ( i = 1; i < nr; i++ )
         {
             spin_lock_irq(&power->stat_lock);
             usage[i] = power->states[i].usage;
@@ -1124,22 +1178,42 @@ int pmstat_get_cx_stat(uint32_t cpuid, struct pm_cx_stat *stat)
         }
 
         get_hw_residencies(cpuid, &hw_res);
+
+#define PUT_xC(what, n) do { \
+        if ( stat->nr_##what >= n && \
+             copy_to_guest_offset(stat->what, n - 1, &hw_res.what##n, 1) ) \
+            return -EFAULT; \
+        if ( hw_res.what##n ) \
+            nr_##what = n; \
+    } while ( 0 )
+#define PUT_PC(n) PUT_xC(pc, n)
+        PUT_PC(2);
+        PUT_PC(3);
+        PUT_PC(4);
+        PUT_PC(6);
+        PUT_PC(7);
+        PUT_PC(8);
+        PUT_PC(9);
+        PUT_PC(10);
+#undef PUT_PC
+#define PUT_CC(n) PUT_xC(cc, n)
+        PUT_CC(1);
+        PUT_CC(3);
+        PUT_CC(6);
+        PUT_CC(7);
+#undef PUT_CC
+#undef PUT_xC
     }
 
     usage[0] = idle_usage;
     res[0] = NOW() - idle_res;
 
-    if ( copy_to_guest(stat->triggers, usage, stat->nr) ||
-         copy_to_guest(stat->residencies, res, stat->nr) )
+    if ( copy_to_guest(stat->triggers, usage, nr) ||
+         copy_to_guest(stat->residencies, res, nr) )
         return -EFAULT;
 
-    stat->pc2 = hw_res.pc2;
-    stat->pc3 = hw_res.pc3;
-    stat->pc6 = hw_res.pc6;
-    stat->pc7 = hw_res.pc7;
-    stat->cc3 = hw_res.cc3;
-    stat->cc6 = hw_res.cc6;
-    stat->cc7 = hw_res.cc7;
+    stat->nr_pc = nr_pc;
+    stat->nr_cc = nr_cc;
 
     return 0;
 }

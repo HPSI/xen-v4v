@@ -84,38 +84,12 @@ unsigned long csum_page (void * page);
 #define L3_PAGETABLE_ENTRIES_X86_64  512
 #define L4_PAGETABLE_ENTRIES_X86_64  512
 
-#if defined(__i386__)
-#define L1_PAGETABLE_SHIFT     L1_PAGETABLE_SHIFT_I386
-#define L2_PAGETABLE_SHIFT     L2_PAGETABLE_SHIFT_I386
-#define L1_PAGETABLE_ENTRIES   L1_PAGETABLE_ENTRIES_I386
-#define L2_PAGETABLE_ENTRIES   L2_PAGETABLE_ENTRIES_I386
-#elif defined(__x86_64__)
-#define L1_PAGETABLE_SHIFT     L1_PAGETABLE_SHIFT_X86_64
-#define L2_PAGETABLE_SHIFT     L2_PAGETABLE_SHIFT_X86_64
-#define L3_PAGETABLE_SHIFT     L3_PAGETABLE_SHIFT_X86_64
-#define L4_PAGETABLE_SHIFT     L4_PAGETABLE_SHIFT_X86_64
-#define L1_PAGETABLE_ENTRIES   L1_PAGETABLE_ENTRIES_X86_64
-#define L2_PAGETABLE_ENTRIES   L2_PAGETABLE_ENTRIES_X86_64
-#define L3_PAGETABLE_ENTRIES   L3_PAGETABLE_ENTRIES_X86_64
-#define L4_PAGETABLE_ENTRIES   L4_PAGETABLE_ENTRIES_X86_64
-#endif
-
 typedef uint32_t l1_pgentry_32_t;
 typedef uint32_t l2_pgentry_32_t;
 typedef uint64_t l1_pgentry_64_t;
 typedef uint64_t l2_pgentry_64_t;
 typedef uint64_t l3_pgentry_64_t;
 typedef uint64_t l4_pgentry_64_t;
-
-#if defined(__i386__)
-typedef l1_pgentry_32_t l1_pgentry_t;
-typedef l2_pgentry_32_t l2_pgentry_t;
-#elif defined(__x86_64__)
-typedef l1_pgentry_64_t l1_pgentry_t;
-typedef l2_pgentry_64_t l2_pgentry_t;
-typedef l3_pgentry_64_t l3_pgentry_t;
-typedef l4_pgentry_64_t l4_pgentry_t;
-#endif
 
 #define l1_table_offset_i386(_a) \
   (((_a) >> L1_PAGETABLE_SHIFT_I386) & (L1_PAGETABLE_ENTRIES_I386 - 1))
@@ -138,16 +112,6 @@ typedef l4_pgentry_64_t l4_pgentry_t;
 #define l4_table_offset_x86_64(_a) \
   (((_a) >> L4_PAGETABLE_SHIFT_X86_64) & (L4_PAGETABLE_ENTRIES_X86_64 - 1))
 
-#if defined(__i386__)
-#define l1_table_offset(_a) l1_table_offset_i386(_a)
-#define l2_table_offset(_a) l2_table_offset_i386(_a)
-#elif defined(__x86_64__)
-#define l1_table_offset(_a) l1_table_offset_x86_64(_a)
-#define l2_table_offset(_a) l2_table_offset_x86_64(_a)
-#define l3_table_offset(_a) l3_table_offset_x86_64(_a)
-#define l4_table_offset(_a) l4_table_offset_x86_64(_a)
-#endif
-
 #define PAGE_SHIFT_ARM          12
 #define PAGE_SIZE_ARM           (1UL << PAGE_SHIFT_ARM)
 #define PAGE_MASK_ARM           (~(PAGE_SIZE_ARM-1))
@@ -155,10 +119,6 @@ typedef l4_pgentry_64_t l4_pgentry_t;
 #define PAGE_SHIFT_X86          12
 #define PAGE_SIZE_X86           (1UL << PAGE_SHIFT_X86)
 #define PAGE_MASK_X86           (~(PAGE_SIZE_X86-1))
-
-#define PAGE_SHIFT_IA64         14
-#define PAGE_SIZE_IA64          (1UL << PAGE_SHIFT_IA64)
-#define PAGE_MASK_IA64          (~(PAGE_SIZE_IA64-1))
 
 #define ROUNDUP(_x,_w) (((unsigned long)(_x)+(1UL<<(_w))-1) & ~((1UL<<(_w))-1))
 #define NRPAGES(x) (ROUNDUP(x, PAGE_SHIFT) >> PAGE_SHIFT)
@@ -171,6 +131,15 @@ struct domain_info_context {
     unsigned int guest_width;
     unsigned long p2m_size;
 };
+
+static inline xen_pfn_t pfn_to_mfn(xen_pfn_t pfn, xen_pfn_t *p2m, int gwidth)
+{
+  return ((xen_pfn_t) ((gwidth==8)?
+                       (((uint64_t *)p2m)[(pfn)]):
+                       ((((uint32_t *)p2m)[(pfn)]) == 0xffffffffU ?
+                            (-1UL) :
+                            (((uint32_t *)p2m)[(pfn)]))));
+}
 
 /* Number of xen_pfn_t in a page */
 #define FPP             (PAGE_SIZE/(dinfo->guest_width))

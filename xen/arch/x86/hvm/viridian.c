@@ -17,13 +17,16 @@
 #include <public/hvm/hvm_op.h>
 
 /* Viridian MSR numbers. */
-#define VIRIDIAN_MSR_GUEST_OS_ID 0x40000000
-#define VIRIDIAN_MSR_HYPERCALL   0x40000001
-#define VIRIDIAN_MSR_VP_INDEX    0x40000002
-#define VIRIDIAN_MSR_EOI         0x40000070
-#define VIRIDIAN_MSR_ICR         0x40000071
-#define VIRIDIAN_MSR_TPR         0x40000072
-#define VIRIDIAN_MSR_APIC_ASSIST 0x40000073
+#define VIRIDIAN_MSR_GUEST_OS_ID                0x40000000
+#define VIRIDIAN_MSR_HYPERCALL                  0x40000001
+#define VIRIDIAN_MSR_VP_INDEX                   0x40000002
+#define VIRIDIAN_MSR_TIME_REF_COUNT             0x40000020
+#define VIRIDIAN_MSR_TSC_FREQUENCY              0x40000022
+#define VIRIDIAN_MSR_APIC_FREQUENCY             0x40000023
+#define VIRIDIAN_MSR_EOI                        0x40000070
+#define VIRIDIAN_MSR_ICR                        0x40000071
+#define VIRIDIAN_MSR_TPR                        0x40000072
+#define VIRIDIAN_MSR_APIC_ASSIST                0x40000073
 
 /* Viridian Hypercall Status Codes. */
 #define HV_STATUS_SUCCESS                       0x0000
@@ -33,13 +36,20 @@
 #define HvNotifyLongSpinWait    8
 
 /* Viridian CPUID 4000003, Viridian MSR availability. */
+#define CPUID3A_MSR_REF_COUNT   (1 << 1)
 #define CPUID3A_MSR_APIC_ACCESS (1 << 4)
 #define CPUID3A_MSR_HYPERCALL   (1 << 5)
 #define CPUID3A_MSR_VP_INDEX    (1 << 6)
+#define CPUID3A_MSR_FREQ        (1 << 11)
 
 /* Viridian CPUID 4000004, Implementation Recommendations. */
 #define CPUID4A_MSR_BASED_APIC  (1 << 3)
 #define CPUID4A_RELAX_TIMER_INT (1 << 5)
+
+/* Viridian CPUID 4000006, Implementation HW features detected and in use. */
+#define CPUID6A_APIC_OVERLAY    (1 << 0)
+#define CPUID6A_MSR_BITMAPS     (1 << 1)
+#define CPUID6A_NESTED_PAGING   (1 << 3)
 
 int cpuid_viridian_leaves(unsigned int leaf, unsigned int *eax,
                           unsigned int *ebx, unsigned int *ecx,
@@ -80,23 +90,34 @@ int cpuid_viridian_leaves(unsigned int leaf, unsigned int *eax,
         /* Which hypervisor MSRs are available to the guest */
         *eax = (CPUID3A_MSR_APIC_ACCESS |
                 CPUID3A_MSR_HYPERCALL   |
-                CPUID3A_MSR_VP_INDEX);
+                CPUID3A_MSR_VP_INDEX    |
+                CPUID3A_MSR_FREQ);
         break;
     case 4:
         /* Recommended hypercall usage. */
         if ( (d->arch.hvm_domain.viridian.guest_os_id.raw == 0) ||
              (d->arch.hvm_domain.viridian.guest_os_id.fields.os < 4) )
             break;
-        *eax = (CPUID4A_MSR_BASED_APIC |
-                CPUID4A_RELAX_TIMER_INT);
+        *eax = CPUID4A_RELAX_TIMER_INT;
+        if ( !cpu_has_vmx_apic_reg_virt )
+            *eax |= CPUID4A_MSR_BASED_APIC;
         *ebx = 2047; /* long spin count */
+        break;
+    case 6:
+        /* Detected and in use hardware features. */
+        if ( cpu_has_vmx_virtualize_apic_accesses )
+            *eax |= CPUID6A_APIC_OVERLAY;
+        if ( cpu_has_vmx_msr_bitmap || (read_efer() & EFER_SVME) )
+            *eax |= CPUID6A_MSR_BITMAPS;
+        if ( hap_enabled(d) )
+            *eax |= CPUID6A_NESTED_PAGING;
         break;
     }
 
     return 1;
 }
 
-void dump_guest_os_id(struct domain *d)
+static void dump_guest_os_id(const struct domain *d)
 {
     gdprintk(XENLOG_INFO, "GUEST_OS_ID:\n");
     gdprintk(XENLOG_INFO, "\tvendor: %x\n",
@@ -113,7 +134,7 @@ void dump_guest_os_id(struct domain *d)
             d->arch.hvm_domain.viridian.guest_os_id.fields.build_number);
 }
 
-void dump_hypercall(struct domain *d)
+static void dump_hypercall(const struct domain *d)
 {
     gdprintk(XENLOG_INFO, "HYPERCALL:\n");
     gdprintk(XENLOG_INFO, "\tenabled: %x\n",
@@ -122,7 +143,7 @@ void dump_hypercall(struct domain *d)
             (unsigned long)d->arch.hvm_domain.viridian.hypercall_gpa.fields.pfn);
 }
 
-void dump_apic_assist(struct vcpu *v)
+static void dump_apic_assist(const struct vcpu *v)
 {
     gdprintk(XENLOG_INFO, "APIC_ASSIST[%d]:\n", v->vcpu_id);
     gdprintk(XENLOG_INFO, "\tenabled: %x\n",
@@ -142,7 +163,7 @@ static void enable_hypercall_page(struct domain *d)
         if ( page )
             put_page(page);
         gdprintk(XENLOG_WARNING, "Bad GMFN %lx (MFN %lx)\n", gmfn,
-                 page_to_mfn(page));
+                 page ? page_to_mfn(page) : INVALID_MFN);
         return;
     }
 
@@ -165,7 +186,7 @@ static void enable_hypercall_page(struct domain *d)
     put_page_and_type(page);
 }
 
-void initialize_apic_assist(struct vcpu *v)
+static void initialize_apic_assist(struct vcpu *v)
 {
     struct domain *d = v->domain;
     unsigned long gmfn = v->arch.hvm_vcpu.viridian.apic_assist.fields.pfn;
@@ -187,7 +208,7 @@ void initialize_apic_assist(struct vcpu *v)
         if ( page )
             put_page(page);
         gdprintk(XENLOG_WARNING, "Bad GMFN %lx (MFN %lx)\n", gmfn,
-                 page_to_mfn(page));
+                 page ? page_to_mfn(page) : INVALID_MFN);
         return;
     }
 
@@ -240,8 +261,8 @@ int wrmsr_viridian_regs(uint32_t idx, uint64_t val)
         eax &= ~(1 << 12);
         edx &= 0xff000000;
         vlapic_set_reg(vlapic, APIC_ICR2, edx);
-        if ( vlapic_ipi(vlapic, eax, edx) == X86EMUL_OKAY )
-            vlapic_set_reg(vlapic, APIC_ICR, eax);
+        vlapic_ipi(vlapic, eax, edx);
+        vlapic_set_reg(vlapic, APIC_ICR, eax);
         break;
     }
 
@@ -288,6 +309,16 @@ int rdmsr_viridian_regs(uint32_t idx, uint64_t *val)
     case VIRIDIAN_MSR_VP_INDEX:
         perfc_incr(mshv_rdmsr_vp_index);
         *val = v->vcpu_id;
+        break;
+
+    case VIRIDIAN_MSR_TSC_FREQUENCY:
+        perfc_incr(mshv_rdmsr_tsc_frequency);
+        *val = (uint64_t)d->arch.tsc_khz * 1000ull;
+        break;
+
+    case VIRIDIAN_MSR_APIC_FREQUENCY:
+        perfc_incr(mshv_rdmsr_apic_frequency);
+        *val = 1000000000ull / APIC_BUS_CYCLE_NS;
         break;
 
     case VIRIDIAN_MSR_ICR:

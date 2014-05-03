@@ -173,7 +173,9 @@ int compat_grant_table_op(unsigned int cmd,
                         for ( i = 0; i < (_s_)->nr_frames; ++i ) \
                         { \
                             unsigned int frame = (_s_)->frame_list.p[i]; \
-                            (void)__copy_to_compat_offset((_d_)->frame_list, i, &frame, 1); \
+                            if ( __copy_to_compat_offset((_d_)->frame_list, \
+                                                         i, &frame, 1) ) \
+                                (_s_)->status = GNTST_bad_virt_addr; \
                         } \
                     } \
                 } while (0)
@@ -310,7 +312,9 @@ int compat_grant_table_op(unsigned int cmd,
                         for ( i = 0; i < (_s_)->nr_frames; ++i ) \
                         { \
                             uint64_t frame = (_s_)->frame_list.p[i]; \
-                            (void)__copy_to_compat_offset((_d_)->frame_list, i, &frame, 1); \
+                            if ( __copy_to_compat_offset((_d_)->frame_list, \
+                                                         i, &frame, 1) ) \
+                                (_s_)->status = GNTST_bad_virt_addr; \
                         } \
                     } \
                 } while (0)
@@ -318,6 +322,8 @@ int compat_grant_table_op(unsigned int cmd,
 #undef XLAT_gnttab_get_status_frames_HNDL_frame_list
                 if ( unlikely(__copy_to_guest(cmp_uop, &cmp.get_status, 1)) )
                     rc = -EFAULT;
+                else
+                    i = 1;
             }
             break;
         }
@@ -342,7 +348,7 @@ int compat_grant_table_op(unsigned int cmd,
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -20,11 +20,12 @@ void compat_show_guest_stack(struct vcpu *v, struct cpu_user_regs *regs,
     if ( v != current )
     {
         struct vcpu *vcpu;
+        unsigned long mfn;
 
         ASSERT(guest_kernel_mode(v, regs));
-        addr = read_cr3() >> PAGE_SHIFT;
+        mfn = read_cr3() >> PAGE_SHIFT;
         for_each_vcpu( v->domain, vcpu )
-            if ( pagetable_get_pfn(vcpu->arch.guest_table) == addr )
+            if ( pagetable_get_pfn(vcpu->arch.guest_table) == mfn )
                 break;
         if ( !vcpu )
         {
@@ -54,6 +55,11 @@ void compat_show_guest_stack(struct vcpu *v, struct cpu_user_regs *regs,
             printk("\n ");
         printk(" %08x", addr);
         stack++;
+    }
+    if ( mask == PAGE_SIZE )
+    {
+        BUILD_BUG_ON(PAGE_SIZE == STACK_SIZE);
+        unmap_domain_page(stack);
     }
     if ( i == 0 )
         printk("Stack empty.");
@@ -323,13 +329,6 @@ int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps)
 
     for ( ; ; )
     {
-        if ( hypercall_preempt_check() )
-        {
-            rc = hypercall_create_continuation(
-                __HYPERVISOR_set_trap_table, "h", traps);
-            break;
-        }
-
         if ( copy_from_guest(&cur, traps, 1) )
         {
             rc = -EFAULT;
@@ -347,6 +346,13 @@ int compat_set_trap_table(XEN_GUEST_HANDLE(trap_info_compat_t) traps)
             init_int80_direct_trap(current);
 
         guest_handle_add_offset(traps, 1);
+
+        if ( hypercall_preempt_check() )
+        {
+            rc = hypercall_create_continuation(
+                __HYPERVISOR_set_trap_table, "h", traps);
+            break;
+        }
     }
 
     return rc;
@@ -361,6 +367,9 @@ static void hypercall_page_initialise_ring1_kernel(void *hypercall_page)
 
     for ( i = 0; i < (PAGE_SIZE / 32); i++ )
     {
+        if ( i == __HYPERVISOR_iret )
+            continue;
+
         p = (char *)(hypercall_page + (i * 32));
         *(u8  *)(p+ 0) = 0xb8;    /* mov  $<i>,%eax */
         *(u32 *)(p+ 1) = i;
@@ -383,7 +392,7 @@ static void hypercall_page_initialise_ring1_kernel(void *hypercall_page)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

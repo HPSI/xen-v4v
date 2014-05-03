@@ -26,26 +26,52 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <inttypes.h>
+#include <regex.h>
 
 #include "libxl.h"
 #include "libxl_utils.h"
 #include "libxlutil.h"
 #include "xl.h"
 
-#define XEND_LOCK { "/var/lock/subsys/xend", "/var/lock/xend" }
-
 xentoollog_logger_stdiostream *logger;
 int dryrun_only;
 int force_execution;
-int autoballoon = 1;
+int autoballoon = -1;
 char *blkdev_start;
 int run_hotplug_scripts = 1;
 char *lockfile;
 char *default_vifscript = NULL;
 char *default_bridge = NULL;
+char *default_gatewaydev = NULL;
+char *default_vifbackend = NULL;
 enum output_format default_output_format = OUTPUT_FORMAT_JSON;
+int claim_mode = 1;
+bool progress_use_cr = 0;
 
-static xentoollog_level minmsglevel = XTL_PROGRESS;
+xentoollog_level minmsglevel = minmsglevel_default;
+
+/* Get autoballoon option based on presence of dom0_mem Xen command
+   line option. */
+static int auto_autoballoon(void)
+{
+    const libxl_version_info *info;
+    regex_t regex;
+    int ret;
+
+    info = libxl_get_version_info(ctx);
+    if (!info)
+        return 1; /* default to on */
+
+    ret = regcomp(&regex,
+                  "(^| )dom0_mem=((|min:|max:)[0-9]+[bBkKmMgG]?,?)+($| )",
+                  REG_NOSUB | REG_EXTENDED);
+    if (ret)
+        return 1;
+
+    ret = regexec(&regex, info->commandline, 0, NULL, 0);
+    regfree(&regex);
+    return ret == REG_NOMATCH;
+}
 
 static void parse_global_config(const char *configfile,
                               const char *configfile_data,
@@ -68,8 +94,18 @@ static void parse_global_config(const char *configfile,
         exit(1);
     }
 
-    if (!xlu_cfg_get_long (config, "autoballoon", &l, 0))
-        autoballoon = l;
+    if (!xlu_cfg_get_string(config, "autoballoon", &buf, 0)) {
+        if (!strcmp(buf, "on") || !strcmp(buf, "1"))
+            autoballoon = 1;
+        else if (!strcmp(buf, "off") || !strcmp(buf, "0"))
+            autoballoon = 0;
+        else if (!strcmp(buf, "auto"))
+            autoballoon = -1;
+        else
+            fprintf(stderr, "invalid autoballoon option");
+    }
+    if (autoballoon == -1)
+        autoballoon = auto_autoballoon();
 
     if (!xlu_cfg_get_long (config, "run_hotplug_scripts", &l, 0))
         run_hotplug_scripts = l;
@@ -80,16 +116,50 @@ static void parse_global_config(const char *configfile,
         lockfile = strdup(XL_LOCK_FILE);
     }
 
-    if (!lockfile < 0) {
-        fprintf(stderr, "failed to allocate lockdir \n");
+    if (!lockfile) {
+        fprintf(stderr, "failed to allocate lockdir\n");
         exit(1);
     }
 
-    if (!xlu_cfg_get_string (config, "vifscript", &buf, 0))
-        default_vifscript = strdup(buf);
+    /*
+     * For global options that are related to a specific type of device
+     * we use the following nomenclature:
+     *
+     * <device type>.default.<option name>
+     *
+     * This allows us to keep the default options classified for the
+     * different device kinds.
+     */
 
-    if (!xlu_cfg_get_string (config, "defaultbridge", &buf, 0))
-	default_bridge = strdup(buf);
+    if (!xlu_cfg_get_string (config, "vifscript", &buf, 0)) {
+        fprintf(stderr, "the global config option vifscript is deprecated, "
+                        "please switch to vif.default.script\n");
+        free(default_vifscript);
+        default_vifscript = strdup(buf);
+    }
+
+    if (!xlu_cfg_get_string (config, "vif.default.script", &buf, 0)) {
+        free(default_vifscript);
+        default_vifscript = strdup(buf);
+    }
+
+    if (!xlu_cfg_get_string (config, "defaultbridge", &buf, 0)) {
+        fprintf(stderr, "the global config option defaultbridge is deprecated, "
+                        "please switch to vif.default.bridge\n");
+        free(default_bridge);
+        default_bridge = strdup(buf);
+    }
+
+    if (!xlu_cfg_get_string (config, "vif.default.bridge", &buf, 0)) {
+        free(default_bridge);
+        default_bridge = strdup(buf);
+    }
+
+    if (!xlu_cfg_get_string (config, "vif.default.gatewaydev", &buf, 0))
+        default_gatewaydev = strdup(buf);
+
+    if (!xlu_cfg_get_string (config, "vif.default.backend", &buf, 0))
+        default_vifbackend = strdup(buf);
 
     if (!xlu_cfg_get_string (config, "output_format", &buf, 0)) {
         if (!strcmp(buf, "json"))
@@ -102,6 +172,10 @@ static void parse_global_config(const char *configfile,
     }
     if (!xlu_cfg_get_string (config, "blkdev_start", &buf, 0))
         blkdev_start = strdup(buf);
+
+    if (!xlu_cfg_get_long (config, "claim_mode", &l, 0))
+        claim_mode = l;
+
     xlu_cfg_destroy(config);
 }
 
@@ -113,12 +187,13 @@ void postfork(void)
     xl_ctx_alloc();
 }
 
-pid_t xl_fork(xlchildnum child) {
+pid_t xl_fork(xlchildnum child, const char *description) {
     xlchild *ch = &children[child];
     int i;
 
     assert(!ch->pid);
     ch->reaped = 0;
+    ch->description = description;
 
     ch->pid = fork();
     if (ch->pid == -1) {
@@ -160,6 +235,13 @@ int xl_child_pid(xlchildnum child)
 {
     xlchild *ch = &children[child];
     return ch->pid;
+}
+
+void xl_report_child_exitstatus(xentoollog_level level,
+                                xlchildnum child, pid_t pid, int status)
+{
+    libxl_report_child_exitstatus(ctx, level, children[child].description,
+                                  pid, status);
 }
 
 static int xl_reaped_callback(pid_t got, int status, void *user)
@@ -215,9 +297,8 @@ int main(int argc, char **argv)
     int ret;
     void *config_data = 0;
     int config_len = 0;
-    const char *locks[] = XEND_LOCK;
 
-    while ((opt = getopt(argc, argv, "+vfN")) >= 0) {
+    while ((opt = getopt(argc, argv, "+vftN")) >= 0) {
         switch (opt) {
         case 'v':
             if (minmsglevel > 0) minmsglevel--;
@@ -227,6 +308,9 @@ int main(int argc, char **argv)
             break;
         case 'f':
             force_execution = 1;
+            break;
+        case 't':
+            progress_use_cr = 1;
             break;
         default:
             fprintf(stderr, "unknown global option\n");
@@ -242,7 +326,8 @@ int main(int argc, char **argv)
     }
     opterr = 0;
 
-    logger = xtl_createlogger_stdiostream(stderr, minmsglevel,  0);
+    logger = xtl_createlogger_stdiostream(stderr, minmsglevel,
+        (progress_use_cr ? XTL_STDIOSTREAM_PROGRESS_USE_CR : 0));
     if (!logger) exit(1);
 
     atexit(xl_ctx_free);
@@ -268,19 +353,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "command does not implement -N (dryrun) option\n");
             ret = 1;
             goto xit;
-        }
-        if (cspec->modifies && !dryrun_only) {
-            for (int i = 0; i < sizeof(locks)/sizeof(locks[0]); i++) {
-                if (!access(locks[i], F_OK) && !force_execution) {
-                    fprintf(stderr,
-"xend is running, which may cause unpredictable results when using\n"
-"this xl command.  Please shut down xend before continuing.\n\n"
-"(This check can be overridden with the -f option.)\n"
-                            );
-                    ret = 1;
-                    goto xit;
-                }
-            }
         }
         ret = cspec->cmd_impl(argc, argv);
     } else if (!strcmp(cmd, "help")) {

@@ -25,7 +25,7 @@
 #include <xen/errno.h>
 #include <xen/sched.h>
 
-#include "gic.h"
+#include <asm/gic.h>
 
 static void enable_none(struct irq_desc *irq) { }
 static unsigned int startup_none(struct irq_desc *irq) { return 0; }
@@ -93,9 +93,9 @@ void __cpuinit init_secondary_IRQ(void)
     BUG_ON(init_local_irq_data() < 0);
 }
 
-int __init request_irq(unsigned int irq,
+int __init request_dt_irq(const struct dt_irq *irq,
         void (*handler)(int, void *, struct cpu_user_regs *),
-        unsigned long irqflags, const char * devname, void *dev_id)
+        const char *devname, void *dev_id)
 {
     struct irqaction *action;
     int retval;
@@ -106,7 +106,7 @@ int __init request_irq(unsigned int irq,
      * which interrupt is which (messes up the interrupt freeing
      * logic etc).
      */
-    if (irq >= nr_irqs)
+    if (irq->irq >= nr_irqs)
         return -EINVAL;
     if (!handler)
         return -EINVAL;
@@ -120,7 +120,7 @@ int __init request_irq(unsigned int irq,
     action->dev_id = dev_id;
     action->free_on_release = 1;
 
-    retval = setup_irq(irq, action);
+    retval = setup_dt_irq(irq, action);
     if (retval)
         xfree(action);
 
@@ -156,6 +156,7 @@ void do_IRQ(struct cpu_user_regs *regs, unsigned int irq, int is_fiq)
         desc->handler->end(desc);
 
         desc->status |= IRQ_INPROGRESS;
+        desc->arch.eoi_cpu = smp_processor_id();
 
         /* XXX: inject irq into all guest vcpus */
         vgic_vcpu_inject_irq(d->vcpu[0], irq, 0);
@@ -192,9 +193,38 @@ out_no_end:
 }
 
 /*
+ * pirq event channels. We don't use these on ARM, instead we use the
+ * features of the GIC to inject virtualised normal interrupts.
+ */
+struct pirq *alloc_pirq_struct(struct domain *d)
+{
+    return NULL;
+}
+
+/*
+ * These are all unreachable given an alloc_pirq_struct
+ * which returns NULL, all callers try to lookup struct pirq first
+ * which will fail.
+ */
+int pirq_guest_bind(struct vcpu *v, struct pirq *pirq, int will_share)
+{
+    BUG();
+}
+
+void pirq_guest_unbind(struct domain *d, struct pirq *pirq)
+{
+    BUG();
+}
+
+void pirq_set_affinity(struct domain *d, int pirq, const cpumask_t *mask)
+{
+    BUG();
+}
+
+/*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

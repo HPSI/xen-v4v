@@ -28,7 +28,9 @@
 #include <blkfront.h>
 #include <netfront.h>
 #include <fbfront.h>
+#include <tpmfront.h>
 #include <shared.h>
+#include <byteswap.h>
 
 #include "mini-os.h"
 
@@ -53,6 +55,30 @@ static unsigned long allocated;
 
 int pin_table(xc_interface *xc_handle, unsigned int type, unsigned long mfn,
               domid_t dom);
+
+#define TPM_TAG_RQU_COMMAND 0xC1
+#define TPM_ORD_Extend 20
+
+struct pcr_extend_cmd {
+	uint16_t tag;
+	uint32_t size;
+	uint32_t ord;
+
+	uint32_t pcr;
+	unsigned char hash[20];
+} __attribute__((packed));
+
+struct pcr_extend_rsp {
+	uint16_t tag;
+	uint32_t size;
+	uint32_t status;
+
+	unsigned char hash[20];
+} __attribute__((packed));
+
+/* Not imported from polarssl's header since the prototype unhelpfully defines
+ * the input as unsigned char, which causes pointer type mismatches */
+void sha1(const void *input, size_t ilen, unsigned char output[20]);
 
 /* We need mfn to appear as target_pfn, so exchange with the MFN there */
 static void do_exchange(struct xc_dom_image *dom, xen_pfn_t target_pfn, xen_pfn_t source_mfn)
@@ -117,6 +143,72 @@ int kexec_allocate(struct xc_dom_image *dom, xen_vaddr_t up_to)
     return 0;
 }
 
+/* Filled from mini-os command line or left as NULL */
+char *vtpm_label;
+
+static void tpm_hash2pcr(struct xc_dom_image *dom, char *cmdline)
+{
+	struct tpmfront_dev* tpm = init_tpmfront(NULL);
+	struct pcr_extend_rsp *resp;
+	size_t resplen = 0;
+	struct pcr_extend_cmd cmd;
+	int rv;
+
+	/*
+	 * If vtpm_label was specified on the command line, require a vTPM to be
+	 * attached and for the domain providing the vTPM to have the given
+	 * label.
+	 */
+	if (vtpm_label) {
+		char ctx[128];
+		if (!tpm) {
+			printf("No TPM found and vtpm_label specified, aborting!\n");
+			do_exit();
+		}
+		rv = evtchn_get_peercontext(tpm->evtchn, ctx, sizeof(ctx) - 1);
+		if (rv < 0) {
+			printf("Could not verify vtpm_label: %d\n", rv);
+			do_exit();
+		}
+		ctx[127] = 0;
+		rv = strcmp(ctx, vtpm_label);
+		if (rv && vtpm_label[0] == '*') {
+			int match_len = strlen(vtpm_label) - 1;
+			int offset = strlen(ctx) - match_len;
+			if (offset > 0)
+				rv = strcmp(ctx + offset, vtpm_label + 1);
+		}
+
+		if (rv) {
+			printf("Mismatched vtpm_label: '%s' != '%s'\n", ctx, vtpm_label);
+			do_exit();
+		}
+	} else if (!tpm) {
+		return;
+	}
+
+	cmd.tag = bswap_16(TPM_TAG_RQU_COMMAND);
+	cmd.size = bswap_32(sizeof(cmd));
+	cmd.ord = bswap_32(TPM_ORD_Extend);
+	cmd.pcr = bswap_32(4); // PCR #4 for kernel
+	sha1(dom->kernel_blob, dom->kernel_size, cmd.hash);
+
+	rv = tpmfront_cmd(tpm, (void*)&cmd, sizeof(cmd), (void*)&resp, &resplen);
+	ASSERT(rv == 0 && resp->status == 0);
+
+	cmd.pcr = bswap_32(5); // PCR #5 for cmdline
+	sha1(cmdline, strlen(cmdline), cmd.hash);
+	rv = tpmfront_cmd(tpm, (void*)&cmd, sizeof(cmd), (void*)&resp, &resplen);
+	ASSERT(rv == 0 && resp->status == 0);
+
+	cmd.pcr = bswap_32(5); // PCR #5 for initrd
+	sha1(dom->ramdisk_blob, dom->ramdisk_size, cmd.hash);
+	rv = tpmfront_cmd(tpm, (void*)&cmd, sizeof(cmd), (void*)&resp, &resplen);
+	ASSERT(rv == 0 && resp->status == 0);
+
+	shutdown_tpmfront(tpm);
+}
+
 void kexec(void *kernel, long kernel_size, void *module, long module_size, char *cmdline, unsigned long flags)
 {
     struct xc_dom_image *dom;
@@ -137,6 +229,10 @@ void kexec(void *kernel, long kernel_size, void *module, long module_size, char 
     dom = xc_dom_allocate(xc_handle, cmdline, features);
     dom->allocate = kexec_allocate;
 
+    /* We are using guest owned memory, therefore no limits. */
+    xc_dom_kernel_max_size(dom, 0);
+    xc_dom_ramdisk_max_size(dom, 0);
+
     dom->kernel_blob = kernel;
     dom->kernel_size = kernel_size;
 
@@ -146,6 +242,8 @@ void kexec(void *kernel, long kernel_size, void *module, long module_size, char 
     dom->flags = flags;
     dom->console_evtchn = start_info.console.domU.evtchn;
     dom->xenstore_evtchn = start_info.store_evtchn;
+
+    tpm_hash2pcr(dom, cmdline);
 
     if ( (rc = xc_dom_boot_xen_init(dom, xc_handle, domid)) != 0 ) {
         grub_printf("xc_dom_boot_xen_init returned %d\n", rc);

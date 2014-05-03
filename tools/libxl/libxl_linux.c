@@ -84,11 +84,16 @@ static char **get_hotplug_env(libxl__gc *gc,
                               char *script, libxl__device *dev)
 {
     const char *type = libxl__device_kind_to_string(dev->backend_kind);
+    char *be_path = libxl__device_backend_path(gc, dev);
     char **env;
+    char *gatewaydev;
     int nr = 0;
     libxl_nic_type nictype;
 
-    const int arraysize = 13;
+    gatewaydev = libxl__xs_read(gc, XBT_NULL, GCSPRINTF("%s/%s", be_path,
+                                                        "gatewaydev"));
+
+    const int arraysize = 15;
     GCNEW_ARRAY(env, arraysize);
     env[nr++] = "script";
     env[nr++] = script;
@@ -98,6 +103,8 @@ static char **get_hotplug_env(libxl__gc *gc,
     env[nr++] = GCSPRINTF("backend/%s/%u/%d", type, dev->domid, dev->devid);
     env[nr++] = "XENBUS_BASE_PATH";
     env[nr++] = "backend";
+    env[nr++] = "netdev";
+    env[nr++] = gatewaydev ? : "";
     if (dev->backend_kind == LIBXL__DEVICE_KIND_VIF) {
         if (libxl__nic_type(gc, dev, &nictype)) {
             LOG(ERROR, "unable to get nictype");
@@ -163,7 +170,7 @@ static int libxl__hotplug_nic(libxl__gc *gc, libxl__device *dev,
     }
 
     *env = get_hotplug_env(gc, script, dev);
-    if (!env) {
+    if (!*env) {
         rc = ERROR_FAIL;
         goto out;
     }
@@ -173,11 +180,12 @@ static int libxl__hotplug_nic(libxl__gc *gc, libxl__device *dev,
     (*args)[nr++] = script;
 
     if (nictype == LIBXL_NIC_TYPE_VIF_IOEMU && num_exec) {
-        (*args)[nr++] = action == DEVICE_CONNECT ? "add" : "remove";
+        (*args)[nr++] = (char *) libxl__device_action_to_string(action);
         (*args)[nr++] = "type_if=tap";
         (*args)[nr++] = NULL;
     } else {
-        (*args)[nr++] = action == DEVICE_CONNECT ? "online" : "offline";
+        (*args)[nr++] = action == LIBXL__DEVICE_ACTION_ADD ? "online" :
+                                                             "offline";
         (*args)[nr++] = "type_if=vif";
         (*args)[nr++] = NULL;
     }
@@ -213,7 +221,7 @@ static int libxl__hotplug_disk(libxl__gc *gc, libxl__device *dev,
     const int arraysize = 3;
     GCNEW_ARRAY(*args, arraysize);
     (*args)[nr++] = script;
-    (*args)[nr++] = action == DEVICE_CONNECT ? "add" : "remove";
+    (*args)[nr++] = (char *) libxl__device_action_to_string(action);
     (*args)[nr++] = NULL;
     assert(nr == arraysize);
 
@@ -265,4 +273,9 @@ int libxl__get_hotplug_script_info(libxl__gc *gc, libxl__device *dev,
 
 out:
     return rc;
+}
+
+libxl_device_model_version libxl__default_device_model(libxl__gc *gc)
+{
+    return LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN;
 }

@@ -6,8 +6,8 @@
  * Copyright 2002 Andi Kleen <ak@suse.de>
  */
 
-#include <xen/config.h>
 #include <xen/lib.h>
+#include <xen/sched.h>
 #include <asm/uaccess.h>
 
 unsigned long __copy_to_user_ll(void __user *to, const void *from, unsigned n)
@@ -175,7 +175,7 @@ copy_from_user(void *to, const void __user *from, unsigned n)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

@@ -2,7 +2,7 @@ XEN_ROOT=$(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
 MAJOR = 3.0
-MINOR = 2
+MINOR = 3
 
 CFLAGS += -Werror
 CFLAGS += -I.
@@ -29,9 +29,12 @@ endif
 
 ALL_TARGETS = libxenstore.so libxenstore.a clients xs_tdb_dump xenstored
 
+ifeq ($(CONFIG_Linux),y)
+ALL_TARGETS += init-xenstore-domain
+endif
+
 ifdef CONFIG_STUBDOM
 CFLAGS += -DNO_SOCKETS=1
-ALL_TARGETS += init-xenstore-domain
 endif
 
 .PHONY: all
@@ -110,7 +113,6 @@ install: all
 	$(INSTALL_DIR) $(DESTDIR)$(SBINDIR)
 	$(INSTALL_DIR) $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL_DIR) $(DESTDIR)$(INCLUDEDIR)/xenstore-compat
-	$(INSTALL_DIR) $(DESTDIR)/var/run/xenstored
 	$(INSTALL_DIR) $(DESTDIR)/var/lib/xenstored
 	$(INSTALL_PROG) xenstored $(DESTDIR)$(SBINDIR)
 	$(INSTALL_PROG) xenstore-control $(DESTDIR)$(BINDIR)

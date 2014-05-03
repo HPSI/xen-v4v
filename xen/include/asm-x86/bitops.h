@@ -327,10 +327,7 @@ static inline unsigned int __scanbit(unsigned long val, unsigned long max)
  * Returns the bit-number of the first set bit, not the number of the byte
  * containing a bit.
  */
-#define find_first_bit(addr,size)                               \
-((__builtin_constant_p(size) && (size) <= BITS_PER_LONG ?       \
-  (__scanbit(*(const unsigned long *)addr, size)) :             \
-  __find_first_bit(addr,size)))
+#define find_first_bit(addr, size) find_next_bit(addr, size, 0)
 
 /**
  * find_next_bit - find the first set bit in a memory region
@@ -338,10 +335,21 @@ static inline unsigned int __scanbit(unsigned long val, unsigned long max)
  * @offset: The bitnumber to start searching at
  * @size: The maximum size to search
  */
-#define find_next_bit(addr,size,off)                                     \
-((__builtin_constant_p(size) && (size) <= BITS_PER_LONG ?                \
-  ((off) + (__scanbit((*(const unsigned long *)addr) >> (off), size))) : \
-  __find_next_bit(addr,size,off)))
+#define find_next_bit(addr, size, off) ({                                   \
+    unsigned int r__;                                                       \
+    const unsigned long *a__ = (addr);                                      \
+    unsigned int s__ = (size);                                              \
+    unsigned int o__ = (off);                                               \
+    if ( __builtin_constant_p(size) && !s__ )                               \
+        r__ = s__;                                                          \
+    else if ( __builtin_constant_p(size) && s__ <= BITS_PER_LONG )          \
+        r__ = o__ + __scanbit(*(const unsigned long *)(a__) >> o__, s__);   \
+    else if ( __builtin_constant_p(off) && !o__ )                           \
+        r__ = __find_first_bit(a__, s__);                                   \
+    else                                                                    \
+        r__ = __find_next_bit(a__, s__, o__);                               \
+    r__;                                                                    \
+})
 
 /**
  * find_first_zero_bit - find the first zero bit in a memory region
@@ -351,10 +359,7 @@ static inline unsigned int __scanbit(unsigned long val, unsigned long max)
  * Returns the bit-number of the first zero bit, not the number of the byte
  * containing a bit.
  */
-#define find_first_zero_bit(addr,size)                          \
-((__builtin_constant_p(size) && (size) <= BITS_PER_LONG ?       \
-  (__scanbit(~*(const unsigned long *)addr, size)) :            \
-  __find_first_zero_bit(addr,size)))
+#define find_first_zero_bit(addr, size) find_next_zero_bit(addr, size, 0)
 
 /**
  * find_next_zero_bit - find the first zero bit in a memory region
@@ -362,11 +367,21 @@ static inline unsigned int __scanbit(unsigned long val, unsigned long max)
  * @offset: The bitnumber to start searching at
  * @size: The maximum size to search
  */
-#define find_next_zero_bit(addr,size,off)                                   \
-((__builtin_constant_p(size) && (size) <= BITS_PER_LONG ?                   \
-  ((off)+(__scanbit(~(((*(const unsigned long *)addr)) >> (off)), size))) : \
-  __find_next_zero_bit(addr,size,off)))
-
+#define find_next_zero_bit(addr, size, off) ({                              \
+    unsigned int r__;                                                       \
+    const unsigned long *a__ = (addr);                                      \
+    unsigned int s__ = (size);                                              \
+    unsigned int o__ = (off);                                               \
+    if ( __builtin_constant_p(size) && !s__ )                               \
+        r__ = s__;                                                          \
+    else if ( __builtin_constant_p(size) && s__ <= BITS_PER_LONG )          \
+        r__ = o__ + __scanbit(~*(const unsigned long *)(a__) >> o__, s__);  \
+    else if ( __builtin_constant_p(off) && !o__ )                           \
+        r__ = __find_first_zero_bit(a__, s__);                              \
+    else                                                                    \
+        r__ = __find_next_zero_bit(a__, s__, o__);                          \
+    r__;                                                                    \
+})
 
 /**
  * find_first_set_bit - find the first set bit in @word

@@ -71,6 +71,12 @@ char *xc_read_image(xc_interface *xch,
             image = NULL;
             goto out;
         case 0: /* EOF */
+            if ( *size == 0 )
+            {
+                PERROR("Could not read kernel image");
+                free(image);
+                image = NULL;
+            }
             goto out;
         default:
             *size += bytes;
@@ -80,13 +86,7 @@ char *xc_read_image(xc_interface *xch,
 #undef CHUNK
 
  out:
-    if ( *size == 0 )
-    {
-        PERROR("Could not read kernel image");
-        free(image);
-        image = NULL;
-    }
-    else if ( image )
+    if ( image )
     {
         /* Shrink allocation to fit image. */
         tmp = realloc(image, *size);
@@ -192,7 +192,7 @@ unsigned long csum_page(void *page)
 __attribute__((weak)) 
     int xc_hvm_build(xc_interface *xch,
                      uint32_t domid,
-                     const struct xc_hvm_build_args *hvm_args)
+                     struct xc_hvm_build_args *hvm_args)
 {
     errno = ENOSYS;
     return -1;
@@ -201,7 +201,7 @@ __attribute__((weak))
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

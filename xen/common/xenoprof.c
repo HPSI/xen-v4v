@@ -193,6 +193,13 @@ static int alloc_xenoprof_struct(
     unsigned max_max_samples;
     int i;
 
+    nvcpu = 0;
+    for_each_vcpu ( d, v )
+        nvcpu++;
+
+    if ( !nvcpu )
+        return -EINVAL;
+
     d->xenoprof = xzalloc(struct xenoprof);
     if ( d->xenoprof == NULL )
     {
@@ -209,14 +216,10 @@ static int alloc_xenoprof_struct(
         return -ENOMEM;
     }
 
-    nvcpu = 0;
-    for_each_vcpu ( d, v )
-        nvcpu++;
-
     bufsize = sizeof(struct xenoprof_buf);
     i = sizeof(struct event_log);
 #ifdef CONFIG_COMPAT
-    d->xenoprof->is_compat = is_pv_32on64_domain(is_passive ? dom0 : d);
+    d->xenoprof->is_compat = is_pv_32on64_domain(is_passive ? hardware_domain : d);
     if ( XENOPROF_COMPAT(d->xenoprof) )
     {
         bufsize = sizeof(struct compat_oprof_buf);
@@ -449,7 +452,7 @@ static int add_passive_list(XEN_GUEST_HANDLE_PARAM(void) arg)
             current->domain, __pa(d->xenoprof->rawbuf),
             passive.buf_gmaddr, d->xenoprof->npages);
 
-    if ( copy_to_guest(arg, &passive, 1) )
+    if ( __copy_to_guest(arg, &passive, 1) )
     {
         put_domain(d);
         return -EFAULT;
@@ -598,13 +601,19 @@ static int xenoprof_op_init(XEN_GUEST_HANDLE_PARAM(void) arg)
                                    xenoprof_init.cpu_type)) )
         return ret;
 
+    /* Only the hardware domain may become the primary profiler here because
+     * there is currently no cleanup of xenoprof_primary_profiler or associated
+     * profiling state when the primary profiling domain is shut down or
+     * crashes.  Once a better cleanup method is present, it will be possible to
+     * allow another domain to be the primary profiler.
+     */
     xenoprof_init.is_primary = 
         ((xenoprof_primary_profiler == d) ||
-         ((xenoprof_primary_profiler == NULL) && (d->domain_id == 0)));
+         ((xenoprof_primary_profiler == NULL) && is_hardware_domain(d)));
     if ( xenoprof_init.is_primary )
         xenoprof_primary_profiler = current->domain;
 
-    return (copy_to_guest(arg, &xenoprof_init, 1) ? -EFAULT : 0);
+    return __copy_to_guest(arg, &xenoprof_init, 1) ? -EFAULT : 0;
 }
 
 #define ret_t long
@@ -651,10 +660,7 @@ static int xenoprof_op_get_buffer(XEN_GUEST_HANDLE_PARAM(void) arg)
             d, __pa(d->xenoprof->rawbuf), xenoprof_get_buffer.buf_gmaddr,
             d->xenoprof->npages);
 
-    if ( copy_to_guest(arg, &xenoprof_get_buffer, 1) )
-        return -EFAULT;
-
-    return 0;
+    return __copy_to_guest(arg, &xenoprof_get_buffer, 1) ? -EFAULT : 0;
 }
 
 #define NONPRIV_OP(op) ( (op == XENOPROF_init)          \
@@ -680,7 +686,7 @@ ret_t do_xenoprof_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg)
         return -EPERM;
     }
 
-    ret = xsm_profile(current->domain, op);
+    ret = xsm_profile(XSM_HOOK, current->domain, op);
     if ( ret )
         return ret;
 
@@ -913,7 +919,7 @@ ret_t do_xenoprof_op(int op, XEN_GUEST_HANDLE_PARAM(void) arg)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

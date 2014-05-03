@@ -91,7 +91,7 @@ static void __init set_num_var_ranges(void)
 	unsigned long config = 0;
 
 	if (use_intel()) {
-		rdmsrl(MTRRcap_MSR, config);
+		rdmsrl(MSR_MTRRcap, config);
 	} else if (is_cpu(AMD))
 		config = 2;
 	else if (is_cpu(CYRIX) || is_cpu(CENTAUR))
@@ -340,7 +340,7 @@ int mtrr_add_page(unsigned long base, unsigned long size,
 		return -EINVAL;
 	}
 
-	if (base & size_or_mask || size & size_or_mask) {
+	if ((base | (base + size - 1)) >> (paddr_bits - PAGE_SHIFT)) {
 		printk(KERN_WARNING "mtrr: base or size exceeds the MTRR width\n");
 		return -EINVAL;
 	}

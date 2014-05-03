@@ -25,7 +25,7 @@
 static const struct mmio_handler *const mmio_handlers[] =
 {
     &vgic_distr_mmio_handler,
-    &uart0_mmio_handler,
+    &vuart_mmio_handler,
 };
 #define MMIO_HANDLER_NR ARRAY_SIZE(mmio_handlers)
 
@@ -45,7 +45,7 @@ int handle_mmio(mmio_info_t *info)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

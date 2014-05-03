@@ -132,7 +132,7 @@ domain 0 command line
 Permit Xen to use superpages when performing memory management.
 
 ### apic
-> `= summit | bigsmp | default`
+> `= bigsmp | default`
 
 Override Xen's logic for choosing the APIC driver.  By default, if
 there are more than 8 CPUs, Xen will switch to `bigsmp` over
@@ -154,6 +154,15 @@ to boot on systems with the following errata:
 > `= verbose | debug`
 
 Increase the verbosity of the APIC code from the default value.
+
+### arat
+> `= <boolean>`
+
+> Default: `true`
+
+Permit Xen to use "Always Running APIC Timer" support on compatible hardware
+in combination with cpuidle.  This option is only expected to be useful for
+developers wishing Xen to fall back to older timing methods on newer hardware.
 
 ### ats
 > `= <boolean>`
@@ -194,7 +203,7 @@ and reboots.
 If set, override Xen's calculation of the level 2 cache line size.
 
 ### clocksource
-> `= pit | hpet | cyclone | acpi`
+> `= pit | hpet | acpi`
 
 If set, override Xen's default choice for the platform timer.
 
@@ -266,11 +275,22 @@ cleared.  This allows a single port to be shared by two subsystems
 makes sense on its own.
 
 ### console\_timestamps
-> `= <boolean>`
+> `= none | date | datems | boot`
 
-> Default: `false`
+> Default: `none`
 
-Flag to indicate whether include a timestamp with each console line.
+Specify which timestamp format Xen should use for each console line.
+
+* `none`: No timestamps
+* `date`: Date and time information
+    * `[YYYY-MM-DD HH:MM:SS]`
+* `datems`: Date and time, with milliseconds
+    * `[YYYY-MM-DD HH:MM:SS.mmm]`
+* `boot`: Seconds and microseconds since boot
+    * `[SSSSSS.uuuuuu]`
+
+For compatibility with the older boolean parameter, specifying
+`console_timestamps` alone will enable the `date` option.
 
 ### console\_to\_ring
 > `= <boolean>`
@@ -281,7 +301,7 @@ Flag to indicate whether all guest console output should be copied
 into the console ring buffer.
 
 ### conswitch
-> `= <switch char>[,x]`
+> `= <switch char>[x]`
 
 > Default `conswitch=a`
 
@@ -292,7 +312,8 @@ times.
 The optional trailing `x` indicates that Xen should not automatically
 switch the console input to dom0 during boot.  Any other value,
 including omission, causes Xen to automatically switch to the dom0
-console during dom0 boot.
+console during dom0 boot.  Use `conswitch=ax` to keep the default switch
+character, but for xen to keep the console.
 
 ### cpu\_type
 > `= arch_perfmon`
@@ -310,23 +331,41 @@ Indicate where the responsibility for driving power states lies.
 ### cpuid\_mask\_cpu (AMD only)
 > `= fam_0f_rev_c | fam_0f_rev_d | fam_0f_rev_e | fam_0f_rev_f | fam_0f_rev_g | fam_10_rev_b | fam_10_rev_c | fam_11_rev_b`
 
-If the other **cpuid\_mask\_{,ext\_}e{c,d}x** options are fully set
-(unspecified on the command line), specify a pre-canned cpuid mask to
-mask the current processor down to appear as the specified processor.
-It is important to ensure that all hosts in a pool appear the same to
-guests to allow successful live migration.
+If the other **cpuid\_mask\_{,ext\_,thermal\_,l7s0\_}e{a,b,c,d}x**
+options are fully set (unspecified on the command line), specify a
+pre-canned cpuid mask to mask the current processor down to appear as
+the specified processor. It is important to ensure that all hosts in a
+pool appear the same to guests to allow successful live migration.
 
-### cpuid\_mask\_ ecx,edx,ext\_ecx,ext\_edx,xsave_eax
+### cpuid\_mask\_{{,ext\_}ecx,edx}
 > `= <integer>`
 
 > Default: `~0` (all bits set)
 
-These five command line parameters are used to specify cpuid masks to
+These four command line parameters are used to specify cpuid masks to
 help with cpuid levelling across a pool of hosts.  Setting a bit in
 the mask indicates that the feature should be enabled, while clearing
 a bit in the mask indicates that the feature should be disabled.  It
 is important to ensure that all hosts in a pool appear the same to
 guests to allow successful live migration.
+
+### cpuid\_mask\_xsave\_eax (Intel only)
+> `= <integer>`
+
+> Default: `~0` (all bits set)
+
+This command line parameter is also used to specify a cpuid mask to
+help with cpuid levelling across a pool of hosts.  See the description
+of the other respective options above.
+
+### cpuid\_mask\_{l7s0\_{eax,ebx},thermal\_ecx} (AMD only)
+> `= <integer>`
+
+> Default: `~0` (all bits set)
+
+These three command line parameters are also used to specify cpuid
+masks to help with cpuid levelling across a pool of hosts.  See the
+description of the other respective options above.
 
 ### cpuidle
 > `= <boolean>`
@@ -440,6 +479,11 @@ reservation is unlimited.
 For example, to set dom0's initial memory allocation to 512MB but
 allow it to balloon up as far as 1GB use `dom0_mem=512M,max:1G`
 
+If you use this option then it is highly recommended that you disable
+any dom0 autoballooning feature present in your toolstack. See the
+_xl.conf(5)_ man page or [Xen Best
+Practices](http://wiki.xen.org/wiki/Xen_Best_Practices#Xen_dom0_dedicated_memory_and_preventing_dom0_memory_ballooning).
+
 ### dom0\_shadow
 > `= <boolean>`
 
@@ -480,9 +524,15 @@ disable it (edid=no). This option should not normally be required
 except for debugging purposes.
 
 ### extra\_guest\_irqs
-> `= <number>`
+> `= [<domU number>][,<dom0 number>]`
 
-Increase the number of PIRQs available for the guest. The default is 32. 
+> Default: `32,256`
+
+Change the number of PIRQs available for guests.  The optional first number is
+common for all domUs, while the optional second number (preceded by a comma)
+is for dom0.  Changing the setting for domU has no impact on dom0 and vice
+versa.  For example to change dom0 without changing domU, use
+`extra_guest_irqs=,512`
 
 ### flask\_enabled
 > `= <integer>`
@@ -494,6 +544,22 @@ Increase the number of PIRQs available for the guest. The default is 32.
 > `= <height>` where height is `8x8 | 8x14 | 8x16 '`
 
 Specify the font size when using the VESA console driver.
+
+### force-ept (Intel)
+> `= <boolean>`
+
+> Default: `false`
+
+Allow EPT to be enabled when VMX feature VM\_ENTRY\_LOAD\_GUEST\_PAT is not
+present.
+
+*Warning:*
+Due to CVE-2013-2212, VMX feature VM\_ENTRY\_LOAD\_GUEST\_PAT is by default
+required as a prerequisite for using EPT.  If you are not using PCI Passthrough,
+or trust the guest administrator who would be using passthrough, then the
+requirement can be relaxed.  This option is particularly useful for nested
+virtualization, to allow the L1 hypervisor to use EPT even if the L0 hypervisor
+does not provide VM\_ENTRY\_LOAD\_GUEST\_PAT.
 
 ### gdb
 > `= <baud>[/<clock_hz>][,DPS[,<io-base>[,<irq>[,<port-bdf>[,<bridge-bdf>]]]] | pci | amt ] `
@@ -516,6 +582,14 @@ more importance will be printed.
 The optional `<rate-limited level>` option instructs which severities
 should be rate limited.
 
+### hap
+> `= <boolean>`
+
+> Default: `true`
+
+Flag to globally enable or disable support for Hardware Assisted
+Paging (HAP)
+
 ### hap\_1gb
 > `= <boolean>`
 
@@ -529,8 +603,18 @@ Paging (HAP).
 
 > Default: `true`
 
-Flag to enable 1 GB host page table support for Hardware Assisted
+Flag to enable 2 MB host page table support for Hardware Assisted
 Paging (HAP).
+
+### hardware\_dom
+> `= <domid>`
+
+> Default: `0`
+
+Enable late hardware domain creation using the specified domain ID.  This is
+intended to be used when domain 0 is a stub domain which builds a disaggregated
+system including a hardware domain with the specified domain ID.  This option is
+supported only when compiled with XSM\_ENABLE=y on x86.
 
 ### hpetbroadcast
 > `= <boolean>`
@@ -540,6 +624,12 @@ Paging (HAP).
 
 ### hvm\_port80
 > `= <boolean>`
+
+### highmem-start
+> `= <size>`
+
+Specify the memory boundary past which memory will be treated as highmem (x86
+debug hypervisor only).
 
 ### idle\_latency\_factor
 > `= <integer>`
@@ -553,6 +643,20 @@ Paging (HAP).
 > `= <integer>`
 
 ### irq\_vector\_map
+### ivrs_hpet[`<hpet>`]
+> `=[<seg>:]<bus>:<device>.<func>`
+
+Force the use of `[<seg>:]<bus>:<device>.<func>` as device ID of HPET
+`<hpet>` instead of the one specified by the IVHD sub-tables of the IVRS
+ACPI table.
+
+### ivrs_ioapic[`<ioapic>`]
+> `=[<seg>:]<bus>:<device>.<func>`
+
+Force the use of `[<seg>:]<bus>:<device>.<func>` as device ID of IO-APIC
+`<ioapic>` instead of the one specified by the IVHD sub-tables of the IVRS
+ACPI table.
+
 ### lapic
 
 Force the use of use of the local APIC on a uniprocessor system, even
@@ -619,6 +723,20 @@ limit is ignored by Xen.
 > Default: `1`
 
 Specify if the MMConfig space should be enabled.
+
+### msi
+> `= <boolean>`
+
+> Default: `true`
+
+Force Xen to (not) use PCI-MSI, even if ACPI FADT says otherwise.
+
+### mtrr.show
+> `= <boolean>`
+
+> Default: `false`
+
+Print boot time MTRR state (x86 only).
 
 ### mwait-idle
 > `= <boolean>`
@@ -698,6 +816,24 @@ Defaults to booting secondary processors.
 
 Default: `on`
 
+### pci
+> `= {no-}serr | {no-}perr`
+
+Disable signaling of SERR (system errors) and/or PERR (parity errors)
+on all PCI devices.
+
+Default: Signaling left as set by firmware.
+
+### pci-phantom
+> `=[<seg>:]<bus>:<device>,<stride>`
+
+Mark a group of PCI devices as using phantom functions without actually
+advertising so, so the IOMMU can create translation contexts for them.
+
+All numbers specified must be hexadecimal ones.
+
+This option can be specified more than once (up to 8 times at present).
+
 ### ple\_gap
 > `= <integer>`
 
@@ -705,7 +841,7 @@ Default: `on`
 > `= <integer>`
 
 ### reboot
-> `= b[ios] | t[riple] | k[bd] | n[o] [, [w]arm | [c]old]`
+> `= t[riple] | k[bd] | n[o] [, [w]arm | [c]old]`
 
 Default: `0`
 
@@ -714,9 +850,6 @@ Specify the host reboot method.
 `warm` instructs Xen to not set the cold reboot flag.
 
 `cold` instructs Xen to set the cold reboot flag.
-
-`bios` instructs Xen to reboot the host by jumping to BIOS. This is
-only available on 32-bit x86 platforms.
 
 `triple` instructs Xen to reboot the host by causing a triple fault.
 
@@ -843,10 +976,12 @@ pages) must also be specified via the tbuf\_size parameter.
 > `= unstable | skewed`
 
 ### ucode
-> `= <integer>`
+> `= [<integer> | scan]`
 
-Specify the CPU microcode update blob module index. When positive, this
-specifies the n-th module (in the GrUB entry, zero based) to be used
+Specify how and where to find CPU microcode update blob.
+
+'integer' specifies the CPU microcode update blob module index. When positive,
+this specifies the n-th module (in the GrUB entry, zero based) to be used
 for updating CPU micrcode. When negative, counting starts at the end of
 the modules in the GrUB entry (so with the blob commonly being last,
 one could specify `ucode=-1`). Note that the value of zero is not valid
@@ -855,6 +990,12 @@ image). Note further that use of this option has an unspecified effect
 when used with xen.efi (there the concept of modules doesn't exist, and
 the blob gets specified via the `ucode=<filename>` config file/section
 entry; see [EFI configuration file description](efi.html)).
+
+'scan' instructs the hypervisor to scan the multiboot images for an cpio
+image that contains microcode. Depending on the platform the blob with the
+microcode in the cpio name space must be:
+  - on Intel: kernel/x86/microcode/GenuineIntel.bin
+  - on AMD  : kernel/x86/microcode/AuthenticAMD.bin
 
 ### unrestricted\_guest
 > `= <boolean>`

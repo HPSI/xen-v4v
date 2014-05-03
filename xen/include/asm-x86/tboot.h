@@ -39,10 +39,6 @@
 
 #include <xen/acpi.h>
 
-#ifndef __packed
-#define __packed   __attribute__ ((packed))
-#endif
-
 typedef struct __packed {
   uint32_t    data1;
   uint16_t    data2;
@@ -137,7 +133,7 @@ int tboot_wake_ap(int apicid, unsigned long sipi_vec);
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * tab-width: 4
  * indent-tabs-mode: nil

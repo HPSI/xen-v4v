@@ -3,29 +3,16 @@
 #include <xen/cpu.h>
 #include <xen/delay.h>
 #include <xen/lib.h>
-#include <xen/mm.h>
 #include <xen/smp.h>
+#include <asm/platform.h>
 
 static void raw_machine_reset(void)
 {
-    /* XXX get this from device tree */
-#ifdef SP810_ADDRESS
-    /* Use the SP810 system controller to force a reset */
-    volatile uint32_t *sp810;
-    set_fixmap(FIXMAP_MISC, SP810_ADDRESS >> PAGE_SHIFT, DEV_SHARED);
-    sp810 = ((uint32_t *)
-             (FIXMAP_ADDR(FIXMAP_MISC) + (SP810_ADDRESS & ~PAGE_MASK)));
-    sp810[0] = 0x3; /* switch to slow mode */
-    dsb(); isb();
-    sp810[1] = 0x1; /* writing any value to SCSYSSTAT reg will reset system */
-    dsb(); isb();
-    clear_fixmap(FIXMAP_MISC);
-#endif
+    platform_reset();
 }
 
-static void halt_this_cpu(void *arg)
+static void noreturn halt_this_cpu(void *arg)
 {
-    __cpu_disable();
     stop_cpu();
 }
 
@@ -62,7 +49,7 @@ void machine_restart(unsigned int delay_millisecs)
 /*
  * Local variables:
  * mode: C
- * c-set-style: "BSD"
+ * c-file-style: "BSD"
  * c-basic-offset: 4
  * indent-tabs-mode: nil
  * End:

@@ -119,11 +119,12 @@ void send_timeoffset_req(unsigned long timeoff);
 void send_invalidate_req(void);
 int handle_mmio(void);
 int handle_mmio_with_translation(unsigned long gva, unsigned long gpfn);
-int handle_pio(uint16_t port, int size, int dir);
+int handle_pio(uint16_t port, unsigned int size, int dir);
 void hvm_interrupt_post(struct vcpu *v, int vector, int type);
-void hvm_io_assist(void);
+void hvm_io_assist(ioreq_t *p);
 void hvm_dpci_eoi(struct domain *d, unsigned int guest_irq,
                   union vioapic_redir_entry *ent);
+void msix_write_completion(struct vcpu *);
 
 struct hvm_hw_stdvga {
     uint8_t sr_index;

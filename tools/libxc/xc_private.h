@@ -34,22 +34,11 @@
 
 #include <xen/sys/privcmd.h>
 
-/* valgrind cannot see when a hypercall has filled in some values.  For this
-   reason, we must zero the privcmd_hypercall_t or domctl/sysctl instance
-   before a call, if using valgrind.  */
-#ifdef VALGRIND
-#define DECLARE_HYPERCALL privcmd_hypercall_t hypercall = { 0 }
-#define DECLARE_DOMCTL struct xen_domctl domctl = { 0 }
-#define DECLARE_SYSCTL struct xen_sysctl sysctl = { 0 }
-#define DECLARE_PHYSDEV_OP struct physdev_op physdev_op = { 0 }
-#define DECLARE_FLASK_OP struct xen_flask_op op = { 0 }
-#else
 #define DECLARE_HYPERCALL privcmd_hypercall_t hypercall
 #define DECLARE_DOMCTL struct xen_domctl domctl
 #define DECLARE_SYSCTL struct xen_sysctl sysctl
 #define DECLARE_PHYSDEV_OP struct physdev_op physdev_op
 #define DECLARE_FLASK_OP struct xen_flask_op op
-#endif
 
 #undef PAGE_SHIFT
 #undef PAGE_SIZE
@@ -119,13 +108,28 @@ void xc_report_progress_step(xc_interface *xch,
 
 /* anamorphic macros:  struct xc_interface *xch  must be in scope */
 
-#define IPRINTF(_f, _a...) xc_report(xch, xch->error_handler, XTL_INFO,0, _f , ## _a)
-#define DPRINTF(_f, _a...) xc_report(xch, xch->error_handler, XTL_DETAIL,0, _f , ## _a)
-#define DBGPRINTF(_f, _a...) xc_report(xch, xch->error_handler, XTL_DEBUG,0, _f , ## _a)
+#define IPRINTF(_f, _a...)  do { int IPRINTF_errno = errno; \
+        xc_report(xch, xch->error_handler, XTL_INFO,0, _f , ## _a); \
+        errno = IPRINTF_errno; \
+        } while (0)
+#define DPRINTF(_f, _a...) do { int DPRINTF_errno = errno; \
+        xc_report(xch, xch->error_handler, XTL_DETAIL,0, _f , ## _a); \
+        errno = DPRINTF_errno; \
+        } while (0)
+#define DBGPRINTF(_f, _a...)  do { int DBGPRINTF_errno = errno; \
+        xc_report(xch, xch->error_handler, XTL_DEBUG,0, _f , ## _a); \
+        errno = DBGPRINTF_errno; \
+        } while (0)
 
-#define ERROR(_m, _a...)  xc_report_error(xch,XC_INTERNAL_ERROR,_m , ## _a )
-#define PERROR(_m, _a...) xc_report_error(xch,XC_INTERNAL_ERROR,_m \
-                  " (%d = %s)", ## _a , errno, xc_strerror(xch, errno))
+#define ERROR(_m, _a...)  do { int ERROR_errno = errno; \
+        xc_report_error(xch,XC_INTERNAL_ERROR,_m , ## _a ); \
+        errno = ERROR_errno; \
+        } while (0)
+#define PERROR(_m, _a...) do { int PERROR_errno = errno; \
+        xc_report_error(xch,XC_INTERNAL_ERROR,_m " (%d = %s)", \
+        ## _a , errno, xc_strerror(xch, errno)); \
+        errno = PERROR_errno; \
+        } while (0)
 
 /*
  * HYPERCALL ARGUMENT BUFFERS
@@ -304,14 +308,17 @@ void bitmap_byte_to_64(uint64_t *lp, const uint8_t *bp, int nbits);
 /* Optionally flush file to disk and discard page cache */
 void discard_file_cache(xc_interface *xch, int fd, int flush);
 
+int xc_domain_cacheflush(xc_interface *xch, uint32_t domid,
+			 xen_pfn_t start_pfn, xen_pfn_t nr_pfns);
+
 #define MAX_MMU_UPDATES 1024
 struct xc_mmu {
     mmu_update_t updates[MAX_MMU_UPDATES];
     int          idx;
-    domid_t      subject;
+    unsigned int subject;
 };
 /* Structure returned by xc_alloc_mmu_updates must be free()'ed by caller. */
-struct xc_mmu *xc_alloc_mmu_updates(xc_interface *xch, domid_t dom);
+struct xc_mmu *xc_alloc_mmu_updates(xc_interface *xch, unsigned int subject);
 int xc_add_mmu_update(xc_interface *xch, struct xc_mmu *mmu,
                    unsigned long long ptr, unsigned long long val);
 int xc_flush_mmu_updates(xc_interface *xch, struct xc_mmu *mmu);

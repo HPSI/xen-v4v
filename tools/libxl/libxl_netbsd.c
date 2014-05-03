@@ -50,7 +50,7 @@ static int libxl__hotplug(libxl__gc *gc, libxl__device *dev, char ***args,
     GCNEW_ARRAY(*args, arraysize);
     (*args)[nr++] = script;
     (*args)[nr++] = be_path;
-    (*args)[nr++] = GCSPRINTF("%d", action == DEVICE_CONNECT ?
+    (*args)[nr++] = GCSPRINTF("%d", action == LIBXL__DEVICE_ACTION_ADD ?
                                     XenbusStateInitWait : XenbusStateClosed);
     (*args)[nr++] = NULL;
     assert(nr == arraysize);
@@ -76,10 +76,6 @@ int libxl__get_hotplug_script_info(libxl__gc *gc, libxl__device *dev,
     switch (dev->backend_kind) {
     case LIBXL__DEVICE_KIND_VBD:
     case LIBXL__DEVICE_KIND_VIF:
-        if (num_exec != 0) {
-            rc = 0;
-            goto out;
-        }
         rc = libxl__hotplug(gc, dev, args, action);
         if (!rc) rc = 1;
         break;
@@ -93,4 +89,9 @@ int libxl__get_hotplug_script_info(libxl__gc *gc, libxl__device *dev,
 
 out:
     return rc;
+}
+
+libxl_device_model_version libxl__default_device_model(libxl__gc *gc)
+{
+    return LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL;
 }
