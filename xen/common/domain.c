@@ -513,6 +513,7 @@ struct domain *get_domain_by_id(domid_t dom)
 
     rcu_read_unlock(&domlist_read_lock);
 
+    //printk(KERN_INFO "%s: %#lx @ %#lx\n", __func__, (unsigned long)dom, (unsigned long)d);
     return d;
 }
 

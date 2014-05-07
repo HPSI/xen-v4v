@@ -449,7 +449,9 @@ v4v_ringbuf_get_rx_ptr(struct domain *d, struct v4v_ring_info *ring_info,
     write_atomic(rx_ptr, ringp->rx_ptr);
     mb();
 
-    unmap_domain_page((void*)mfn_x(ring_info->mfns[0]));
+    //v4v_dprintk("v4v_ringbuf_payload_space: mapped %p to %p\n",
+    //            (void *)mfn_x(ring_info->mfns[0]), ringp);
+    unmap_domain_page(ringp);
     return 0;
 }
 
@@ -902,14 +904,14 @@ v4v_find_ring_mfns(struct domain *d, struct v4v_ring_info *ring_info,
 
     if ( (npage << PAGE_SHIFT) < ring_info->len )
     {
-        //v4v_dprintk("EINVAL\n");
+        v4v_dprintk("EINVAL\n");
         return -EINVAL;
     }
 
     mfns = xmalloc_array(mfn_t, npage);
     if ( !mfns )
     {
-        //v4v_dprintk("ENOMEM\n");
+        v4v_dprintk("ENOMEM\n");
         return -ENOMEM;
     }
 
@@ -928,7 +930,7 @@ v4v_find_ring_mfns(struct domain *d, struct v4v_ring_info *ring_info,
         if ( copy_from_guest_offset(&pfn, pfn_hnd, i, 1) )
         {
             ret = -EFAULT;
-            //v4v_dprintk("EFAULT\n");
+            v4v_dprintk("EFAULT\n");
             break;
         }
 
@@ -1080,22 +1082,22 @@ v4v_ring_remove(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd)
     {
         if ( !d->v4v )
         {
-            //v4v_dprintk("EINVAL\n");
+            v4v_dprintk("EINVAL\n");
             ret = -EINVAL;
             break;
         }
 
         if ( copy_from_guest(&ring, ring_hnd, 1) )
         {
-            //v4v_dprintk("EFAULT\n");
+            v4v_dprintk("EFAULT\n");
             ret = -EFAULT;
             break;
         }
 
         if ( ring.magic != V4V_RING_MAGIC )
         {
-            //v4v_dprintk("ring.magic(%"PRIx64") != V4V_RING_MAGIC(%"PRIx64"), EINVAL\n",
-            //        ring.magic, V4V_RING_MAGIC);
+            v4v_dprintk("ring.magic(%"PRIx64") != V4V_RING_MAGIC(%"PRIx64"), EINVAL\n",
+                    ring.magic, V4V_RING_MAGIC);
             ret = -EINVAL;
             break;
         }
@@ -1112,7 +1114,7 @@ v4v_ring_remove(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd)
 
         if ( !ring_info )
         {
-            //v4v_dprintk("ENOENT\n");
+            v4v_dprintk("ENOENT\n");
             ret = -ENOENT;
             break;
         }
@@ -1145,22 +1147,22 @@ v4v_ring_add(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd,
     {
         if ( !d->v4v )
         {
-            //v4v_dprintk(" !d->v4v, EINVAL\n");
+            v4v_dprintk(" !d->v4v, EINVAL\n");
             ret = -EINVAL;
             break;
         }
 
         if ( copy_from_guest(&ring, ring_hnd, 1) )
         {
-            //v4v_dprintk(" copy_from_guest failed, EFAULT\n");
+            v4v_dprintk(" copy_from_guest failed, EFAULT\n");
             ret = -EFAULT;
             break;
         }
 
         if ( ring.magic != V4V_RING_MAGIC )
         {
-            //v4v_dprintk("ring.magic(%lx) != V4V_RING_MAGIC(%lx), EINVAL\n",
-            //            ring.magic, V4V_RING_MAGIC);
+            v4v_dprintk("ring.magic(%lx) != V4V_RING_MAGIC(%lx), EINVAL\n",
+                        ring.magic, V4V_RING_MAGIC);
             ret = -EINVAL;
             break;
         }
@@ -1169,7 +1171,7 @@ v4v_ring_add(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd,
                     (sizeof (struct v4v_ring_message_header) + V4V_ROUNDUP(1) +
                      V4V_ROUNDUP(1))) || (V4V_ROUNDUP(ring.len) != ring.len) )
         {
-            //v4v_dprintk("EINVAL\n");
+            v4v_dprintk("EINVAL\n");
             ret = -EINVAL;
             break;
         }
@@ -1177,7 +1179,7 @@ v4v_ring_add(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd,
         ring.id.addr.domain = d->domain_id;
         if ( copy_field_to_guest(ring_hnd, &ring, id) )
         {
-            //v4v_dprintk("EFAULT\n");
+            v4v_dprintk("EFAULT\n");
             ret = -EFAULT;
             break;
         }
@@ -1290,7 +1292,7 @@ v4v_notify(struct domain *d,
     if ( !d->v4v )
     {
         read_unlock(&v4v_lock);
-        //v4v_dprintk("!d->v4v, ENODEV\n");
+        v4v_dprintk("!d->v4v, ENODEV\n");
         return -ENODEV;
     }
 
@@ -1319,28 +1321,29 @@ v4v_notify(struct domain *d,
             /* Quick sanity check on ring_data_hnd */
             if ( copy_field_from_guest(&ring_data, ring_data_hnd, magic) )
             {
-                //v4v_dprintk("copy_field_from_guest failed\n");
+                v4v_dprintk("copy_field_from_guest failed\n");
                 ret = -EFAULT;
                 break;
             }
 
             if ( ring_data.magic != V4V_RING_DATA_MAGIC )
             {
-                //v4v_dprintk("ring.magic(%lx) != V4V_RING_MAGIC(%lx), EINVAL\n",
-                //        ring_data.magic, V4V_RING_MAGIC);
+                v4v_dprintk("ring.magic(%lx) != V4V_RING_MAGIC(%lx), EINVAL\n",
+                        ring_data.magic, V4V_RING_MAGIC);
                 ret = -EINVAL;
                 break;
             }
 
             if ( copy_from_guest(&ring_data, ring_data_hnd, 1) )
             {
-                //v4v_dprintk("copy_from_guest failed\n");
+                v4v_dprintk("copy_from_guest failed\n");
                 ret = -EFAULT;
                 break;
             }
 
             {
                 XEN_GUEST_HANDLE(v4v_ring_data_ent_t) ring_data_ent_hnd;
+                //v4v_dprintk("notifying: %p\n",(void*) &ring_data.data[0]); 
                 ring_data_ent_hnd =
                     guest_handle_for_field(ring_data_hnd, v4v_ring_data_ent_t, data[0]);
                 ret = v4v_fill_ring_datas(d, ring_data.nent, ring_data_ent_hnd);
@@ -1614,7 +1617,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
 
     if ( !dst_addr )
     {
-        //v4v_dprintk("!dst_addr, EINVAL\n");
+        v4v_dprintk("!dst_addr, EINVAL\n");
         return -EINVAL;
     }
 
@@ -1622,7 +1625,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     if ( !src_d->v4v )
     {
         read_unlock(&v4v_lock);
-        //v4v_dprintk("!src_d->v4v, EINVAL\n");
+        v4v_dprintk("!src_d->v4v, EINVAL\n");
         return -EINVAL;
     }
 
@@ -1630,11 +1633,12 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     src_id.addr.domain = src_d->domain_id;
     src_id.partner = dst_addr->domain;
 
+    //v4v_dprintk("port:%#lx, domain:%#lx, partner:%#lx\n", (unsigned long)src_id.addr.port, (unsigned long)src_id.addr.domain, (unsigned long)src_id.partner);
     dst_d = get_domain_by_id(dst_addr->domain);
     if ( !dst_d )
     {
         read_unlock(&v4v_lock);
-        //v4v_dprintk("!dst_d, ECONNREFUSED\n");
+        v4v_dprintk("!dst_d, ECONNREFUSED\n");
         return -ECONNREFUSED;
     }
 
@@ -1652,7 +1656,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     {
         if ( !dst_d->v4v )
         {
-            //v4v_dprintk("dst_d->v4v, ECONNREFUSED\n");
+            v4v_dprintk("dst_d->v4v, ECONNREFUSED\n");
             ret = -ECONNREFUSED;
             break;
         }
@@ -1664,7 +1668,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
         if ( !ring_info )
         {
             ret = -ECONNREFUSED;
-            //v4v_dprintk(" !ring_info, ECONNREFUSED\n");
+            v4v_dprintk(" !ring_info, ECONNREFUSED\n");
         }
         else
         {
@@ -1677,16 +1681,17 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
             }
 
             spin_lock(&ring_info->lock);
+    	    //v4v_dprintk("dst_d:%#lx, ring_info:%#lx,  niov:%#lx, len:%#lx\n", (unsigned long) dst_d, (unsigned long) ring_info, (unsigned long) niov, (unsigned long) len);
             ret =
                 v4v_ringbuf_insertv(dst_d, ring_info, &src_id, proto, iovs,
                         niov, len);
             if ( ret == -EAGAIN )
             {
-                //v4v_dprintk("v4v_ringbuf_insertv failed, EAGAIN\n");
+                v4v_dprintk("v4v_ringbuf_insertv failed, EAGAIN\n");
                 /* Schedule a wake up on the event channel when space is there */
                 if ( v4v_pending_requeue(ring_info, src_d->domain_id, len) )
                 {
-                    //v4v_dprintk("v4v_pending_requeue failed, ENOMEM\n");
+                    v4v_dprintk("v4v_pending_requeue failed, ENOMEM\n");
                     ret = -ENOMEM;
                 }
             }

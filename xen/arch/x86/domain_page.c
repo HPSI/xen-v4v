@@ -157,6 +157,7 @@ void *map_domain_page(unsigned long mfn)
     spin_unlock(&dcache->lock);
 
     l1e_write(&MAPCACHE_L1ENT(idx), l1e_from_pfn(mfn, __PAGE_HYPERVISOR));
+    //printk(KERN_INFO "va: %#lx, START: %#lx, END:%#lx\n", MAPCACHE_VIRT_START + pfn_to_paddr(idx), MAPCACHE_VIRT_START, MAPCACHE_VIRT_END);
 
  out:
     local_irq_restore(flags);
@@ -175,6 +176,7 @@ void unmap_domain_page(const void *ptr)
         return;
 
     ASSERT(va >= MAPCACHE_VIRT_START && va < MAPCACHE_VIRT_END);
+    //printk(KERN_INFO "va: %#lx, START: %#lx, END:%#lx\n", va, MAPCACHE_VIRT_START, MAPCACHE_VIRT_END);
 
     v = mapcache_current_vcpu();
     ASSERT(v && is_pv_vcpu(v));
