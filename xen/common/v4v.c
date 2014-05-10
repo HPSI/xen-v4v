@@ -113,7 +113,7 @@ v4v_hash_fn(v4v_ring_id_t *id)
     ret = (uint16_t)(id->addr.port >> 16);
     ret ^= (uint16_t)id->addr.port;
     ret ^= id->addr.domain;
-    ret ^= id->partner;
+    //ret ^= id->partner;
 
     ret &= (V4V_HTABLE_SIZE - 1);
 
@@ -172,7 +172,7 @@ static DEFINE_RWLOCK(v4vtables_rules_lock);
 
 
 
-#define V4V_DEBUG
+//#define V4V_DEBUG
 /*
  * Debugs
  */
@@ -281,9 +281,9 @@ v4v_ring_map_page(struct v4v_ring_info *ring_info, int i)
         return ring_info->mfn_mapping[i];
     ring_info->mfn_mapping[i] = map_domain_page(mfn_x(ring_info->mfns[i]));
 
-    //v4v_dprintk("mapping page %p to %p\n",
-    //            (void *)mfn_x(ring_info->mfns[i]),
-    //            ring_info->mfn_mapping[i]);
+    v4v_dprintk("mapping page %p to %p\n",
+                (void *)mfn_x(ring_info->mfns[i]),
+                ring_info->mfn_mapping[i]);
     return ring_info->mfn_mapping[i];
 }
 
@@ -307,11 +307,14 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
         if ( !src )
             return -EFAULT;
 
-        //v4v_dprintk("memcpy(%p,%p+%d,%d)\n",
-        //            dst, src, offset,
-        //            (int)(PAGE_SIZE - offset));
+        v4v_dprintk("memcpy(%p,%p+%d,%d)\n",
+                    dst, src, offset,
+                    (int)(PAGE_SIZE - offset));
         memcpy(dst, src + offset, PAGE_SIZE - offset);
-
+        /*jo mod*/
+        unmap_domain_page(ring_info->mfn_mapping[page]);
+        ring_info->mfn_mapping[page] = NULL;
+        /*jo mod end*/
         page++;
         len -= PAGE_SIZE - offset;
         dst += PAGE_SIZE - offset;
@@ -322,8 +325,12 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
     if ( !src )
         return -EFAULT;
 
-    //v4v_dprintk("memcpy(%p,%p+%d,%d)\n", dst, src, offset, len);
+    v4v_dprintk("memcpy(%p,%p+%d,%d)\n", dst, src, offset, len);
     memcpy(dst, src + offset, len);
+    /*jo mod*/
+    unmap_domain_page(ring_info->mfn_mapping[page]);
+    ring_info->mfn_mapping[page] = NULL;
+    /*jo mod end*/
 
     return 0;
 }
@@ -387,26 +394,29 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
     int page = offset >> PAGE_SHIFT;
     uint8_t *dst;
     
-    //v4v_dprintk("%s: page = %d, offset = %d, page_shift = %d\n", __func__, page, (int) offset, PAGE_SHIFT);
+    v4v_dprintk("%s: page = %d, offset = %d, page_shift = %d\n", __func__, page, (int) offset, PAGE_SHIFT);
     ASSERT(spin_is_locked(&ring_info->lock));
 
     page = page % (int)ring_info->npage;
     offset &= PAGE_SIZE - 1;
-    //v4v_dprintk("%s: offset = %d, after &=PAGE_SIZE-1\n", __func__,(int) offset);
+    v4v_dprintk("%s: offset = %d, after &=PAGE_SIZE-1\n", __func__,(int) offset);
     while ( (offset + len) > PAGE_SIZE )
     {
         dst = v4v_ring_map_page(ring_info, page);
         if ( !dst ) {
-	   // v4v_dprintk("%s: PROBLHMA !dist, page=%d, %d, %d\n",__func__, page, PAGE_SHIFT, (int)offset);
+	    v4v_dprintk("%s: PROBLHMA !dist, page=%d, %d, %d\n",__func__, page, PAGE_SHIFT, (int)offset);
             return -EFAULT;
 	}
 
         if ( v4v_copy_from_guest_maybe(dst + offset, src, src_hnd,
                                        PAGE_SIZE - offset) ) {
-	    //v4v_dprintk("%s: PROBLHMA copy_from_guest_maybe\n",__func__);
+	    v4v_dprintk("%s: PROBLHMA copy_from_guest_maybe\n",__func__);
             return -EFAULT;
 	}
-
+	/*jo mod*/
+        unmap_domain_page(ring_info->mfn_mapping[page]);
+	ring_info->mfn_mapping[page] = NULL;
+        /*jo mod end*/
         page++;
         len -= PAGE_SIZE - offset;
         if ( src )
@@ -426,7 +436,10 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
 	//v4v_dprintk("%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
         return -EFAULT;
     }
-
+    /*jo mod*/
+    unmap_domain_page(ring_info->mfn_mapping[page]);
+    ring_info->mfn_mapping[page] = NULL;
+    /*jo mod end*/
     return 0;
 }
 
@@ -542,8 +555,8 @@ v4v_ringbuf_insertv(struct domain *d,
         ring.tx_ptr = ring_info->tx_ptr;
         ring.len = ring_info->len;
 
-        //v4v_dprintk("ring.tx_ptr=%d ring.rx_ptr=%d ring.len=%d ring_info->tx_ptr=%d\n",
-        //            (int)ring.tx_ptr, (int)ring.rx_ptr, (int)ring.len, (int)ring_info->tx_ptr);
+        v4v_dprintk("ring.tx_ptr=%d ring.rx_ptr=%d ring.len=%d ring_info->tx_ptr=%d\n",
+                    (int)ring.tx_ptr, (int)ring.rx_ptr, (int)ring.len, (int)ring_info->tx_ptr);
 
         if ( ring.rx_ptr == ring.tx_ptr ) {
             sp = ring_info->len;
@@ -849,6 +862,7 @@ v4v_fill_ring_data(struct domain *src_d,
                 v4v_pending_requeue(ring_info, src_d->domain_id,
                         ent.space_required);
                 ent.flags |= V4V_RING_DATA_F_PENDING;
+	        v4v_dprintk("space_available= %#x, req: %#x\n", space_avail, ent.space_required);
             }
 
             spin_unlock(&ring_info->lock);
@@ -951,8 +965,8 @@ v4v_find_ring_mfns(struct domain *d, struct v4v_ring_info *ring_info,
             break;
         }
         mfns[i] = _mfn(mfn);
-        //v4v_dprintk("v4v_find_ring_mfns: %d: %lx -> %lx\n",
-        //            i, (unsigned long)pfn, (unsigned long)mfn_x(mfns[i]));
+        v4v_dprintk("v4v_find_ring_mfns: %d: %lx -> %lx\n",
+                    i, (unsigned long)pfn, (unsigned long)mfn_x(mfns[i]));
         mfn_mapping[i] = NULL;
         put_gfn(d, pfn);
     }
@@ -987,10 +1001,10 @@ v4v_ring_find_info(struct domain *d, v4v_ring_id_t *id)
 
     hash = v4v_hash_fn(id);
 
-    //v4v_dprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
-    //            d->v4v, (int)hash, d->v4v->ring_hash[hash].first, id);
-    //v4v_dprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
-    //            id->addr.port, id->addr.domain, id->partner);
+    v4v_dprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
+                d->v4v, (int)hash, d->v4v->ring_hash[hash].first, id);
+    v4v_dprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
+                id->addr.port, id->addr.domain, id->partner);
 
     hlist_for_each_entry(ring_info, node, &d->v4v->ring_hash[hash], node)
     {
@@ -998,8 +1012,8 @@ v4v_ring_find_info(struct domain *d, v4v_ring_id_t *id)
 
         //v4v_dprintk("ring_find_info: ring_info=%p, port=%u, domain=%d\n", cmpid, cmpid->addr.port, cmpid->addr.domain);
         if ( cmpid->addr.port == id->addr.port &&
-             cmpid->addr.domain == id->addr.domain &&
-             cmpid->partner == id->partner)
+             cmpid->addr.domain == id->addr.domain) //&&
+             //cmpid->partner == id->partner)
         {
             //v4v_dprintk("ring_find_info: ring_info=%p\n", ring_info);
             return ring_info;
@@ -1022,7 +1036,7 @@ v4v_ring_find_info_by_addr(struct domain *d, struct v4v_addr *a, domid_t p)
 
     id.addr.port = a->port;
     id.addr.domain = d->domain_id;
-    id.partner = p;
+    //id.partner = p;
 
     ret = v4v_ring_find_info(d, &id);
     if ( ret )
