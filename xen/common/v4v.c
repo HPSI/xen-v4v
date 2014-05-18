@@ -173,19 +173,29 @@ static DEFINE_RWLOCK(v4vtables_rules_lock);
 
 
 //#define V4V_DEBUG
+//#define V4V_EXTRA_DEBUG
 /*
  * Debugs
  */
+#ifdef V4V_EXTRA_DEBUG
+#define v4v_ddprintk(format, args...) v4v_dprintk(format, ## args)
+#else
+#define v4v_ddprintk(format, ... ) (void)0
+#endif
+
 
 #ifdef V4V_DEBUG
 #define v4v_dprintk(format, args...)            				\
     do {                                        				\
-        printk("%s:%d,DOM:%d " format,                 				\
-               __FILE__, __LINE__, current->domain->domain_id, ## args );   	\
+        printk("%s:%d,DOM:%d:%s " format,                 				\
+               __FILE__, __LINE__, current->domain->domain_id, __func__, ## args );   	\
     } while ( 1 == 0 )
 #else
 #define v4v_dprintk(format, ... ) (void)0
 #endif
+
+#define v4v_dprintk_in() v4v_ddprintk("enter\n")
+#define v4v_dprintk_out() v4v_ddprintk("exit\n")
 
 #ifdef V4V_DEBUG
 static void __attribute__((unused))
@@ -229,20 +239,24 @@ static void
 v4v_signal_domain(struct domain *d)
 {
     int ret = 234;
+    v4v_dprintk_in();
     //v4v_dprintk("send guest VIRQ_V4V domid:%d\n", d->domain_id);
 
     ret = evtchn_send(d, d->v4v->evtchn_port);
     //v4v_dprintk("ret = %d\n", ret);
+    v4v_dprintk_out();
 }
 
 static void
 v4v_signal_domid(domid_t id)
 {
     struct domain *d = get_domain_by_id(id);
+    v4v_dprintk_in();
     if ( !d )
         return;
     v4v_signal_domain(d);
     put_domain(d);
+    v4v_dprintk_out();
 }
 
 
@@ -255,6 +269,7 @@ v4v_ring_unmap(struct v4v_ring_info *ring_info)
 {
     int i;
 
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&ring_info->lock));
 
     for ( i = 0; i < ring_info->npage; ++i )
@@ -268,22 +283,28 @@ v4v_ring_unmap(struct v4v_ring_info *ring_info)
         unmap_domain_page(ring_info->mfn_mapping[i]);
         ring_info->mfn_mapping[i] = NULL;
     }
+
+    v4v_dprintk_out();
 }
 
 static uint8_t *
 v4v_ring_map_page(struct v4v_ring_info *ring_info, int i)
 {
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&ring_info->lock));
 
-    if ( i >= ring_info->npage )
+    if ( i >= ring_info->npage )  {
+	printk("%s: %d\n", __func__, i);
         return NULL;
+	}
     if ( ring_info->mfn_mapping[i] )
         return ring_info->mfn_mapping[i];
     ring_info->mfn_mapping[i] = map_domain_page(mfn_x(ring_info->mfns[i]));
 
-    v4v_dprintk("mapping page %p to %p\n",
+    v4v_ddprintk("mapping page %p to %p\n",
                 (void *)mfn_x(ring_info->mfns[i]),
                 ring_info->mfn_mapping[i]);
+    v4v_dprintk_out();
     return ring_info->mfn_mapping[i];
 }
 
@@ -296,10 +317,13 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
     uint8_t *src;
     uint8_t *dst = _dst;
 
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&ring_info->lock));
-    page = page % (int)ring_info->npage;
     offset &= PAGE_SIZE - 1;
 
+    v4v_dprintk("offset = %d, after &=PAGE_SIZE-1\n", (int) offset);
+    v4v_dprintk("page:%d, offset =%#x, len=%#x, dst=%p\n", page, offset, len, dst);
+    v4v_dprintk("offset+len: %#x\n", offset + len);
     while ( (offset + len) > PAGE_SIZE )
     {
         src = v4v_ring_map_page(ring_info, page);
@@ -316,58 +340,76 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
         ring_info->mfn_mapping[page] = NULL;
         /*jo mod end*/
         page++;
+        page = page % (int)ring_info->npage;
         len -= PAGE_SIZE - offset;
         dst += PAGE_SIZE - offset;
+        v4v_dprintk("page:%d, offset =%#x, len=%#x, dst=%p\n", page, offset, len, dst);
         offset = 0;
+        v4v_dprintk("just before loop check: offset+len: %#x\n", offset + len);
     }
 
     src = v4v_ring_map_page(ring_info, page);
     if ( !src )
         return -EFAULT;
 
-    v4v_dprintk("memcpy(%p,%p+%d,%d)\n", dst, src, offset, len);
+    v4v_dprintk("memcpy(%p,%p+%#x,%#x)\n", dst, src, offset, len);
     memcpy(dst, src + offset, len);
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
     ring_info->mfn_mapping[page] = NULL;
     /*jo mod end*/
 
+    v4v_dprintk_out();
     return 0;
 }
 
 /*jo magic*/
+#if 1
 static int
 v4v_update_rx_ptr(struct v4v_ring_info *ring_info, uint32_t rx_ptr)
 {
     uint8_t *dst = v4v_ring_map_page(ring_info, 0);
     uint32_t *p = (uint32_t *)(dst + offsetof(v4v_ring_t, rx_ptr));
+    int ret = 0;
 
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&ring_info->lock));
 
-   if ( !dst ) {
-       //v4v_dprintk("%s: PROBLHMA !dist\n",__func__);
-       return -EFAULT;
-   }
-   write_atomic(p, rx_ptr);
-   mb();
-   return 0;
+    if ( !dst ) {
+        //v4v_dprintk("%s: PROBLHMA !dist\n",__func__);
+        ret = -EFAULT;
+	goto out;
+    }
+    write_atomic(p, rx_ptr);
+    wmb();
+
+out:
+    v4v_dprintk_out();
+    return ret;
 }
+#endif
 
 static int
 v4v_update_tx_ptr(struct v4v_ring_info *ring_info, uint32_t tx_ptr)
 {
     uint8_t *dst = v4v_ring_map_page(ring_info, 0);
     uint32_t *p = (uint32_t *)(dst + offsetof(v4v_ring_t, tx_ptr));
+    int ret = 0;
 
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&ring_info->lock));
 
     if ( !dst ) {
 	//v4v_dprintk("%s: PROBLHMA !dist\n",__func__);
-        return -EFAULT;
+        ret = -EFAULT;
+        goto out;
     }
     write_atomic(p, tx_ptr);
-    mb();
-    return 0;
+    wmb();
+
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 static int
@@ -377,10 +419,13 @@ v4v_copy_from_guest_maybe(void *dst, void *src,
 {
     int rc = 0;
 
+    v4v_dprintk_in();
     if ( src )
         memcpy(dst, src, len);
     else
         rc = __copy_from_guest(dst, src_hnd, len);
+    v4v_dprintk("dst:%p, src:%p, len:%#x\n", dst, src, len);
+    v4v_dprintk_out();
     return rc;
 }
 
@@ -393,25 +438,31 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
 {
     int page = offset >> PAGE_SHIFT;
     uint8_t *dst;
+    int ret = 0;
     
-    v4v_dprintk("%s: page = %d, offset = %d, page_shift = %d\n", __func__, page, (int) offset, PAGE_SHIFT);
+    v4v_dprintk_in();
+    v4v_dprintk("page = %d, offset = %d, page_shift = %d\n", page, (int) offset, PAGE_SHIFT);
     ASSERT(spin_is_locked(&ring_info->lock));
 
     page = page % (int)ring_info->npage;
     offset &= PAGE_SIZE - 1;
-    v4v_dprintk("%s: offset = %d, after &=PAGE_SIZE-1\n", __func__,(int) offset);
+    v4v_dprintk("offset = %d, after &=PAGE_SIZE-1\n", (int) offset);
+    v4v_dprintk("page:%d, offset =%#x, len=%#x, src=%p\n", page, offset, len, src);
+    v4v_dprintk("offset+len: %#x\n", offset + len);
     while ( (offset + len) > PAGE_SIZE )
     {
         dst = v4v_ring_map_page(ring_info, page);
         if ( !dst ) {
-	    v4v_dprintk("%s: PROBLHMA !dist, page=%d, %d, %d\n",__func__, page, PAGE_SHIFT, (int)offset);
-            return -EFAULT;
+	    v4v_dprintk("PROBLHMA !dist, page=%d, %d, %d\n",page, PAGE_SHIFT, (int)offset);
+            ret = -EFAULT;
+            goto out;
 	}
 
         if ( v4v_copy_from_guest_maybe(dst + offset, src, src_hnd,
                                        PAGE_SIZE - offset) ) {
-	    v4v_dprintk("%s: PROBLHMA copy_from_guest_maybe\n",__func__);
-            return -EFAULT;
+	    v4v_dprintk("PROBLHMA copy_from_guest_maybe\n");
+            ret = -EFAULT;
+            goto out;
 	}
 	/*jo mod*/
         unmap_domain_page(ring_info->mfn_mapping[page]);
@@ -423,24 +474,33 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
             src += (PAGE_SIZE - offset);
         else
             guest_handle_add_offset(src_hnd, PAGE_SIZE - offset);
+        v4v_dprintk("page:%d, offset =%#x, len=%#x, src=%p\n", page, offset, len, src);
         offset = 0;
+        v4v_dprintk("just before loop: offset+len: %#x\n", offset + len);
+        //page = page % (int)ring_info->npage;
     }
 
-    dst = v4v_ring_map_page(ring_info, page);
+        dst = v4v_ring_map_page(ring_info, page);
     //v4v_dprintk("%s: npage = %d page = %d\n", __func__, (int)ring_info->npage, page);
     if ( !dst ) {
 	 //v4v_dprintk("%s: PROBLHMA !dist after ring_map_page\n",__func__);
-        return -EFAULT;
+        ret = -EFAULT;
+        goto out;
     }
+    v4v_dprintk("dst+offset:%p, len=%#x, src=%p\n", dst+offset, len, src);
     if ( v4v_copy_from_guest_maybe(dst + offset, src, src_hnd, len) ) {
-	//v4v_dprintk("%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
-        return -EFAULT;
+	printk("%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
+        ret = -EFAULT;
+        goto out;
     }
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
     ring_info->mfn_mapping[page] = NULL;
     /*jo mod end*/
-    return 0;
+
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 static int
@@ -448,24 +508,32 @@ v4v_ringbuf_get_rx_ptr(struct domain *d, struct v4v_ring_info *ring_info,
                         uint32_t * rx_ptr)
 {
     v4v_ring_t *ringp;
+    int ret = 0;
 
-    if ( ring_info->npage == 0 )
-        return -1;
+    v4v_dprintk_in();
+    if ( ring_info->npage == 0 ) {
+        ret = -1;
+        goto out;
+    }
 
     ringp = map_domain_page(mfn_x(ring_info->mfns[0]));
 
     //v4v_dprintk("v4v_ringbuf_payload_space: mapped %p to %p\n",
     //            (void *)mfn_x(ring_info->mfns[0]), ringp);
-    if ( !ringp )
-        return -1;
+    if ( !ringp ) {
+        ret = -1;
+        goto out;
+    }
 
     write_atomic(rx_ptr, ringp->rx_ptr);
-    mb();
+    wmb();
 
     //v4v_dprintk("v4v_ringbuf_payload_space: mapped %p to %p\n",
     //            (void *)mfn_x(ring_info->mfns[0]), ringp);
     unmap_domain_page(ringp);
-    return 0;
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 uint32_t
@@ -474,16 +542,21 @@ v4v_ringbuf_payload_space(struct domain * d, struct v4v_ring_info * ring_info)
     v4v_ring_t ring;
     int32_t ret;
 
+    v4v_dprintk_in();
     ring.tx_ptr = ring_info->tx_ptr;
     ring.len = ring_info->len;
 
-    if ( v4v_ringbuf_get_rx_ptr(d, ring_info, &ring.rx_ptr) )
-        return 0;
+    if ( v4v_ringbuf_get_rx_ptr(d, ring_info, &ring.rx_ptr) ) {
+        ret = 0;
+        goto out;
+     }
 
     //v4v_dprintk("v4v_ringbuf_payload_space:tx_ptr=%li rx_ptr=%li\n",
     //            (unsigned long)ring.tx_ptr, (unsigned long)ring.rx_ptr);
-    if ( ring.rx_ptr == ring.tx_ptr )
-        return ring.len - sizeof (struct v4v_ring_message_header);
+    if ( ring.rx_ptr == ring.tx_ptr ) {
+        ret = ring.len - sizeof (struct v4v_ring_message_header);
+        goto out;
+    }
 
     ret = ring.rx_ptr - ring.tx_ptr;
     if ( ret < 0 )
@@ -492,6 +565,8 @@ v4v_ringbuf_payload_space(struct domain * d, struct v4v_ring_info * ring_info)
     ret -= sizeof (struct v4v_ring_message_header);
     ret -= V4V_ROUNDUP(1);
 
+out:
+    v4v_dprintk_out();
     return (ret < 0) ? 0 : ret;
 }
 
@@ -499,22 +574,32 @@ static long
 v4v_iov_count(XEN_GUEST_HANDLE(v4v_iov_t) iovs, int niov)
 {
     v4v_iov_t iov;
-    size_t ret = 0;
+    size_t ret = 0, niovs = 0;
 
+    v4v_dprintk_in();
     while ( niov-- )
     {
-        if ( copy_from_guest(&iov, iovs, 1) )
-            return -EFAULT;
+        if ( (ret = copy_from_guest(&iov, iovs, 1)) ) {
+	    printk("%s: failed, ret= %d\n", __func__, (int)ret);
+            ret = -EFAULT;
+            goto out;
+	}
+	ret = 0;
 
-        ret += iov.iov_len;
+        niovs += iov.iov_len;
+        ret = niovs;
 
         /* message bigger than 2G can't be sent */
-        if (ret > 2L * 1024 * 1024 * 1024)
-            return -EMSGSIZE;
+        if (niovs > 2L * 1024 * 1024 * 1024) {
+            ret = -EMSGSIZE;
+            goto out;
+        }
 
         guest_handle_add_offset(iovs, 1);
     }
 
+out:
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -534,14 +619,17 @@ v4v_ringbuf_insertv(struct domain *d,
 
     ASSERT(spin_is_locked(&ring_info->lock));
 
+    v4v_dprintk_in();
     happy_ret = len;
 
     /*jo : trace*/
     //v4v_dprintk("Mpainei sthn insertv\n");
 
     if ( (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header) ) >=
-            ring_info->len)
-        return -EMSGSIZE;
+            ring_info->len) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
 
     do
     {
@@ -559,25 +647,30 @@ v4v_ringbuf_insertv(struct domain *d,
                     (int)ring.tx_ptr, (int)ring.rx_ptr, (int)ring.len, (int)ring_info->tx_ptr);
 
         if ( ring.rx_ptr == ring.tx_ptr ) {
+
             sp = ring_info->len;
+#if 1
 	    /*jo magic*/
 	    if ( ring.tx_ptr != 0 ) {
 		ring.rx_ptr = 0;
 		ring.tx_ptr = 0;
 		ring_info->tx_ptr = 0;
 		if( (ret = v4v_update_tx_ptr(ring_info, ring.tx_ptr)) ) {
-	            //v4v_dprintk("%s : failed to update tx_ptr\n",__func__);
+	            printk("%s : failed to update tx_ptr\n",__func__);
 		    v4v_ring_unmap(ring_info);
-		    return ret;   
+                    goto out;
 		}
+#if 1
 		if( (ret = v4v_update_rx_ptr(ring_info, ring.rx_ptr)) ) {
 		    //v4v_dprintk("%s : failed to update rx_ptr\n",__func__);
 		    v4v_ring_unmap(ring_info);
-		    return ret;
+                    goto out;
 		}
+#endif
 		//v4v_dprintk("%s : rx_ptr, tx_ptr modified!!!\n", __func__);
 	    }
             /*jo magic end*/
+#endif
         }
         else
         {
@@ -585,10 +678,12 @@ v4v_ringbuf_insertv(struct domain *d,
             if ( sp < 0 )
                 sp += ring.len;
         }
+        v4v_dprintk("space:%i\n", sp);
+
 
         if ( (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)) >= sp )
         {
-            //v4v_dprintk("EAGAIN\n");
+            v4v_dprintk("EAGAIN len+header:%#lx\n", (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)));
             ret = -EAGAIN;
             break;
         }
@@ -606,21 +701,26 @@ v4v_ringbuf_insertv(struct domain *d,
 	//v4v_dprintk("INSERTV : meta to 2o break\n");
 
         ring.tx_ptr += sizeof (mh);
-        if ( ring.tx_ptr == ring_info->len )
+        if ( ring.tx_ptr == ring_info->len ) {
+            //v4v_dprintk("%s: tx=%d, mh= %lu\n", __func__, (int)ring.tx_ptr, sizeof(mh));
+            v4v_dprintk("tx==LEN tx=%d, will zero tx out, \n", (int)ring.tx_ptr);
             ring.tx_ptr = 0;
-        //v4v_dprintk("%s: tx=%d, mh= %lu\n", __func__, (int)ring.tx_ptr, sizeof(mh));
+	}
+        v4v_dprintk("tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
         while ( niov-- )
         {
             XEN_GUEST_HANDLE(uint8_t) buf_hnd;
             v4v_iov_t iov;
+            v4v_dprintk("loop start: tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
-            if ( copy_from_guest(&iov, iovs, 1) )
+            if ( (ret = copy_from_guest(&iov, iovs, 1)) )
             {
+		printk("%s:, ret = %d\n", __func__, ret);
                 ret = -EFAULT;
-		//v4v_dprintk("INSETV : PROBLHMA copy_from_guest\n");
                 break;
             }
+	    ret = 0;
 	    
             /*jo : trace*/
 	   // v4v_dprintk("iov_base = %s",iov.iov_base);
@@ -630,11 +730,11 @@ v4v_ringbuf_insertv(struct domain *d,
             if ( unlikely(!guest_handle_okay(buf_hnd, len)) )
             {
                 ret = -EFAULT;
-		//v4v_dprintk("INSERTV :PROBLHMA guest_handle_okay\n");
+		printk("INSERTV :PROBLHMA guest_handle_okay\n");
                 break;
             }
 
-            sp = ring.len - ring.tx_ptr;
+            sp = ring.len - ring.tx_ptr - sizeof (v4v_ring_t);
 
             if ( len > sp )
             {
@@ -656,6 +756,7 @@ v4v_ringbuf_insertv(struct domain *d,
                     NULL, buf_hnd, len);
             if ( ret ) {
 		//v4v_dprintk("INSERTV :PROBLHMA after v4v_memcpy_to_guest\n");
+		printk("%s:, ret = %d\n", __func__, ret);
                 break;
 	    }
             ring.tx_ptr += len;
@@ -664,17 +765,20 @@ v4v_ringbuf_insertv(struct domain *d,
                 ring.tx_ptr = 0;
 
             guest_handle_add_offset(iovs, 1);
+            v4v_dprintk("loop end: tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
         }
         if ( ret ) {
-	    //v4v_dprintk("INSERTV :PROBLHMA after while niov\n");
+	    v4v_dprintk("INSERTV :PROBLHMA after while niov\n");
             break;
 	}
         ring.tx_ptr = V4V_ROUNDUP(ring.tx_ptr);
+        v4v_dprintk("roundup tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
         if ( ring.tx_ptr >= ring_info->len )
             ring.tx_ptr -= ring_info->len;
+        v4v_dprintk("before barrier tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
-        mb();
+	wmb();
         ring_info->tx_ptr = ring.tx_ptr;
         if ( (ret = v4v_update_tx_ptr(ring_info, ring.tx_ptr)) ) {
 	    //v4v_dprintk("INSERTV :PROBLHMA v4v_update_tx_ptr\n");
@@ -688,6 +792,8 @@ v4v_ringbuf_insertv(struct domain *d,
 
     v4v_ring_unmap(ring_info);
 
+out:
+    v4v_dprintk_out();
     return ret ? ret : happy_ret;
 }
 
@@ -697,8 +803,10 @@ v4v_ringbuf_insertv(struct domain *d,
 static void
 v4v_pending_remove_ent(struct v4v_pending_ent *ent)
 {
+    v4v_dprintk_in();
     hlist_del(&ent->node);
     xfree(ent);
+    v4v_dprintk_out();
 }
 
 static void
@@ -707,9 +815,11 @@ v4v_pending_remove_all(struct v4v_ring_info *info)
     struct hlist_node *node, *next;
     struct v4v_pending_ent *pending_ent;
 
+    v4v_dprintk_in();
     ASSERT(spin_is_locked(&info->lock));
     hlist_for_each_entry_safe(pending_ent, node, next, &info->pending,
             node) v4v_pending_remove_ent(pending_ent);
+    v4v_dprintk_out();
 }
 
 static void
@@ -718,6 +828,7 @@ v4v_pending_notify(struct domain *caller_d, struct hlist_head *to_notify)
     struct hlist_node *node, *next;
     struct v4v_pending_ent *pending_ent;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_locked(&v4v_lock));
 
     hlist_for_each_entry_safe(pending_ent, node, next, to_notify, node)
@@ -727,6 +838,7 @@ v4v_pending_notify(struct domain *caller_d, struct hlist_head *to_notify)
         xfree(pending_ent);
     }
 
+    v4v_dprintk_out();
 }
 
 static void
@@ -736,6 +848,7 @@ v4v_pending_find(struct domain *d, struct v4v_ring_info *ring_info,
     struct hlist_node *node, *next;
     struct v4v_pending_ent *ent;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_locked(&d->v4v->lock));
 
     spin_lock(&ring_info->lock);
@@ -748,6 +861,7 @@ v4v_pending_find(struct domain *d, struct v4v_ring_info *ring_info,
         }
     }
     spin_unlock(&ring_info->lock);
+    v4v_dprintk_out();
 }
 
 /*caller must have L3 */
@@ -755,11 +869,14 @@ static int
 v4v_pending_queue(struct v4v_ring_info *ring_info, domid_t src_id, int len)
 {
     struct v4v_pending_ent *ent = xmalloc(struct v4v_pending_ent);
+    int ret = 0;
+    v4v_dprintk_in();
 
     if ( !ent )
     {
         v4v_dprintk("ENOMEM\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
 
     ent->len = len;
@@ -767,6 +884,8 @@ v4v_pending_queue(struct v4v_ring_info *ring_info, domid_t src_id, int len)
 
     hlist_add_head(&ent->node, &ring_info->pending);
 
+out:
+    v4v_dprintk_out();
     return 0;
 }
 
@@ -776,18 +895,24 @@ v4v_pending_requeue(struct v4v_ring_info *ring_info, domid_t src_id, int len)
 {
     struct hlist_node *node;
     struct v4v_pending_ent *ent;
+    int ret = 0;
 
+    v4v_dprintk_in();
     hlist_for_each_entry(ent, node, &ring_info->pending, node)
     {
         if ( ent->id == src_id )
         {
             if ( ent->len < len )
                 ent->len = len;
-            return 0;
+            ret = 0;
+            goto out;
         }
     }
 
-    return v4v_pending_queue(ring_info, src_id, len);
+    ret = v4v_pending_queue(ring_info, src_id, len);
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 
@@ -798,6 +923,7 @@ v4v_pending_cancel(struct v4v_ring_info *ring_info, domid_t src_id)
     struct hlist_node *node, *next;
     struct v4v_pending_ent *ent;
 
+    v4v_dprintk_in();
     hlist_for_each_entry_safe(ent, node, next, &ring_info->pending, node)
     {
         if ( ent->id == src_id)
@@ -806,6 +932,7 @@ v4v_pending_cancel(struct v4v_ring_info *ring_info, domid_t src_id)
             xfree(ent);
         }
     }
+    v4v_dprintk_out();
 }
 
 /*
@@ -820,11 +947,14 @@ v4v_fill_ring_data(struct domain *src_d,
     v4v_ring_data_ent_t ent;
     struct domain *dst_d;
     struct v4v_ring_info *ring_info;
+    int ret = 0;
 
-    if ( copy_from_guest(&ent, data_ent_hnd, 1) )
+    v4v_dprintk_in();
+    if ( (ret = copy_from_guest(&ent, data_ent_hnd, 1)) )
     {
-        v4v_dprintk("EFAULT\n");
-        return -EFAULT;
+        printk("%s: ret=%d\n", __func__, ret);
+        ret = -EFAULT;
+        goto out;
     }
 
     //v4v_dprintk("v4v_fill_ring_data: ent.ring.domain=%d,ent.ring.port=%u\n",
@@ -877,12 +1007,16 @@ v4v_fill_ring_data(struct domain *src_d,
     if ( dst_d )
         put_domain(dst_d);
 
-    if ( copy_field_to_guest(data_ent_hnd, &ent, flags) )
+    if ( (ret = copy_field_to_guest(data_ent_hnd, &ent, flags)) )
     {
         //v4v_dprintk("EFAULT\n");
-        return -EFAULT;
+        printk("%s: ret=%d\n", __func__, ret);
+        ret = -EFAULT;
+        goto out;
     }
-    return 0;
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 /*Called should hold no more than R(L1) */
@@ -892,6 +1026,7 @@ v4v_fill_ring_datas(struct domain *d, int nent,
 {
     int ret = 0;
 
+    v4v_dprintk_in();
     read_lock(&v4v_lock);
     while ( !ret && nent-- )
     {
@@ -899,6 +1034,7 @@ v4v_fill_ring_datas(struct domain *d, int nent,
         guest_handle_add_offset(data_ent_hnd, 1);
     }
     read_unlock(&v4v_lock);
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -916,24 +1052,28 @@ v4v_find_ring_mfns(struct domain *d, struct v4v_ring_info *ring_info,
     struct page_info *page;
     int ret = 0;
 
+    v4v_dprintk_in();
     if ( (npage << PAGE_SHIFT) < ring_info->len )
     {
         v4v_dprintk("EINVAL\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     mfns = xmalloc_array(mfn_t, npage);
     if ( !mfns )
     {
         v4v_dprintk("ENOMEM\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
 
     mfn_mapping = xmalloc_array(uint8_t *, npage);
     if ( !mfn_mapping )
     {
         xfree(mfns);
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
 
     for ( i = 0; i < npage; ++i )
@@ -986,6 +1126,9 @@ v4v_find_ring_mfns(struct domain *d, struct v4v_ring_info *ring_info,
         xfree(mfn_mapping);
         xfree(mfns);
     }
+
+out:
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -996,14 +1139,16 @@ v4v_ring_find_info(struct domain *d, v4v_ring_id_t *id)
     uint16_t hash;
     struct hlist_node *node;
     struct v4v_ring_info *ring_info;
+    struct v4v_ring_info * ret = NULL;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_locked(&d->v4v->lock));
 
     hash = v4v_hash_fn(id);
 
-    v4v_dprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
+    v4v_ddprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
                 d->v4v, (int)hash, d->v4v->ring_hash[hash].first, id);
-    v4v_dprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
+    v4v_ddprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
                 id->addr.port, id->addr.domain, id->partner);
 
     hlist_for_each_entry(ring_info, node, &d->v4v->ring_hash[hash], node)
@@ -1016,11 +1161,14 @@ v4v_ring_find_info(struct domain *d, v4v_ring_id_t *id)
              //cmpid->partner == id->partner)
         {
             //v4v_dprintk("ring_find_info: ring_info=%p\n", ring_info);
-            return ring_info;
+            ret = ring_info;
+            goto out;
         }
     }
     //v4v_dprintk("ring_find_info: no ring_info found\n");
-    return NULL;
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 static struct v4v_ring_info *
@@ -1029,28 +1177,36 @@ v4v_ring_find_info_by_addr(struct domain *d, struct v4v_addr *a, domid_t p)
     v4v_ring_id_t id;
     struct v4v_ring_info *ret;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_locked(&d->v4v->lock));
 
-    if ( !a )
-        return NULL;
+    if ( !a ) {
+        ret = NULL;
+        goto out;
+    }
 
     id.addr.port = a->port;
     id.addr.domain = d->domain_id;
     //id.partner = p;
 
     ret = v4v_ring_find_info(d, &id);
-    if ( ret )
-        return ret;
+    if ( ret ) {
+        goto out;
+    }
 
     id.partner = V4V_DOMID_ANY;
 
-    return v4v_ring_find_info(d, &id);
+    ret = v4v_ring_find_info(d, &id);
+out:
+    v4v_dprintk_out();
+    return ret;
 }
 
 static void v4v_ring_remove_mfns(struct domain *d, struct v4v_ring_info *ring_info)
 {
     int i;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_write_locked(&d->v4v->lock));
 
     if ( ring_info->mfns )
@@ -1064,11 +1220,13 @@ static void v4v_ring_remove_mfns(struct domain *d, struct v4v_ring_info *ring_in
         xfree(ring_info->mfn_mapping);
     ring_info->mfns = NULL;
 
+    v4v_dprintk_out();
 }
 
 static void
 v4v_ring_remove_info(struct domain *d, struct v4v_ring_info *ring_info)
 {
+    v4v_dprintk_in();
     ASSERT(rw_is_write_locked(&d->v4v->lock));
 
     spin_lock(&ring_info->lock);
@@ -1080,6 +1238,7 @@ v4v_ring_remove_info(struct domain *d, struct v4v_ring_info *ring_info)
     spin_unlock(&ring_info->lock);
 
     xfree(ring_info);
+    v4v_dprintk_out();
 }
 
 /* Call from guest to unpublish a ring */
@@ -1090,6 +1249,7 @@ v4v_ring_remove(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd)
     struct v4v_ring_info *ring_info;
     int ret = 0;
 
+    v4v_dprintk_in();
     read_lock(&v4v_lock);
 
     do
@@ -1137,6 +1297,7 @@ v4v_ring_remove(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd)
     while ( 0 );
 
     read_unlock(&v4v_lock);
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -1150,10 +1311,12 @@ v4v_ring_add(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd,
     int need_to_insert = 0;
     int ret = 0;
 
+    v4v_dprintk_in();
     if ( (long)ring_hnd.p & (PAGE_SIZE - 1) )
     {
         //v4v_dprintk("EINVAL\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     read_lock(&v4v_lock);
@@ -1267,6 +1430,8 @@ v4v_ring_add(struct domain *d, XEN_GUEST_HANDLE(v4v_ring_t) ring_hnd,
     while ( 0 );
 
     read_unlock(&v4v_lock);
+out:
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -1281,6 +1446,7 @@ v4v_notify_ring(struct domain *d, struct v4v_ring_info *ring_info,
 {
     uint32_t space;
 
+    v4v_dprintk_in();
     ASSERT(rw_is_locked(&v4v_lock));
     ASSERT(rw_is_locked(&d->v4v->lock));
 
@@ -1289,6 +1455,7 @@ v4v_notify_ring(struct domain *d, struct v4v_ring_info *ring_info,
     spin_unlock(&ring_info->lock);
 
     v4v_pending_find(d, ring_info, space, to_notify);
+    v4v_dprintk_out();
 }
 
 /*notify hypercall*/
@@ -1301,13 +1468,15 @@ v4v_notify(struct domain *d,
     int i;
     int ret = 0;
 
+    v4v_dprintk_in();
     read_lock(&v4v_lock);
 
     if ( !d->v4v )
     {
         read_unlock(&v4v_lock);
         v4v_dprintk("!d->v4v, ENODEV\n");
-        return -ENODEV;
+        ret = -ENODEV;
+        goto out;
     }
 
     read_lock(&d->v4v->lock);
@@ -1368,6 +1537,8 @@ v4v_notify(struct domain *d,
 
     read_unlock(&v4v_lock);
 
+out:
+    v4v_dprintk_out();
     return ret;
 }
 
@@ -1629,10 +1800,12 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     struct v4v_ring_info *ring_info;
     int ret = 0;
 
+    v4v_dprintk_in();
     if ( !dst_addr )
     {
         v4v_dprintk("!dst_addr, EINVAL\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     read_lock(&v4v_lock);
@@ -1640,7 +1813,8 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     {
         read_unlock(&v4v_lock);
         v4v_dprintk("!src_d->v4v, EINVAL\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     src_id.addr.port = src_addr->port;
@@ -1653,7 +1827,8 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
     {
         read_unlock(&v4v_lock);
         v4v_dprintk("!dst_d, ECONNREFUSED\n");
-        return -ECONNREFUSED;
+        ret = -ECONNREFUSED;
+        goto out;
     }
 
     if ( v4vtables_check(src_addr, dst_addr) != 0 )
@@ -1663,7 +1838,8 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
                  "V4V: VIPTables REJECTED %i:%i -> %i:%i\n",
                  src_addr->domain, src_addr->port,
                  dst_addr->domain, dst_addr->port);
-        return -ECONNREFUSED;
+        ret = -ECONNREFUSED;
+        goto out;
     }
 
     do
@@ -1724,17 +1900,21 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
 
     put_domain(dst_d);
     read_unlock(&v4v_lock);
+out:
+    v4v_dprintk_out();
     return ret;
 }
 
 static void
 v4v_info(struct domain *d, v4v_info_t *info)
 {
+    v4v_dprintk_in();
     read_lock(&d->v4v->lock);
     info->ring_magic = V4V_RING_MAGIC;
     info->data_magic = V4V_RING_DATA_MAGIC;
     info->evtchn = d->v4v->evtchn_port;
     read_unlock(&d->v4v->lock);
+    v4v_dprintk_out();
 }
 
 /*
@@ -1747,6 +1927,7 @@ do_v4v_op(int cmd, XEN_GUEST_HANDLE(void) arg1,
 {
     struct domain *d = current->domain;
     long rc = -EFAULT;
+    v4v_dprintk_in();
 
     //v4v_dprintk("->do_v4v_op(%d,%p,%p,%d,%d)\n", cmd,
     //            (void *)arg1.p, (void *)arg2.p, (int) arg3, (int) arg4);
@@ -1851,6 +2032,7 @@ do_v4v_op(int cmd, XEN_GUEST_HANDLE(void) arg1,
 out:
     domain_unlock(d);
     //v4v_dprintk("<-do_v4v_op()=%d\n", (int)rc);
+    v4v_dprintk_out();
     return rc;
 }
 
@@ -1863,6 +2045,7 @@ v4v_destroy(struct domain *d)
 {
     int i;
 
+    v4v_dprintk_in();
     BUG_ON(!d->is_dying);
     write_lock(&v4v_lock);
 
@@ -1886,6 +2069,7 @@ v4v_destroy(struct domain *d)
 
     d->v4v = NULL;
     write_unlock(&v4v_lock);
+    v4v_dprintk_out();
 }
 
 int
@@ -1894,15 +2078,18 @@ v4v_init(struct domain *d)
     struct v4v_domain *v4v;
     evtchn_port_t port;
     int i;
-    int rc;
+    int rc = 0;
 
+    v4v_dprintk_in();
     v4v = xmalloc(struct v4v_domain);
-    if ( !v4v )
-        return -ENOMEM;
+    if ( !v4v ) {
+        rc = -ENOMEM;
+        goto out;
+    }
 
     rc = evtchn_alloc_unbound_domain(d, &port, d->domain_id, 0);
-    if ( rc )
-        return rc;
+    if ( rc ) 
+        goto out;
 
     rwlock_init(&v4v->lock);
 
@@ -1914,7 +2101,9 @@ v4v_init(struct domain *d)
     d->v4v = v4v;
     write_unlock(&v4v_lock);
 
-    return 0;
+out:
+    v4v_dprintk_out();
+    return rc;
 }
 
 
@@ -1936,6 +2125,7 @@ dump_domain_ring(struct domain *d, struct v4v_ring_info *ring_info)
         printk(KERN_ERR "   Failed to read rx_ptr\n");
         return;
     }
+
 
     printk(KERN_ERR "   tx_ptr=%d rx_ptr=%d len=%d\n",
            (int)ring_info->tx_ptr, (int)rx_ptr, (int)ring_info->len);
