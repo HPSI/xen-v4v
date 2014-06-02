@@ -172,13 +172,24 @@ static DEFINE_RWLOCK(v4vtables_rules_lock);
 
 
 
-#define V4V_DEBUG
+#define V4V_ANANOS_DEBUG
+//#define V4V_DEBUG
 #define V4V_EXTRA_DEBUG
 /*
  * Debugs
  */
+#ifdef V4V_ANANOS_DEBUG
+#define v4v_aprintk(format, args...)                                                    \
+    do {                                        				        \
+        printk("%d,D%d:%s " format,                 				\
+               __LINE__, current->domain->domain_id, __func__, ## args );   	\
+    } while ( 1 == 0 )
+#else
+#define v4v_aprintk(format, ... ) (void)0
+#endif
+
 #ifdef V4V_EXTRA_DEBUG
-#define v4v_ddprintk(format, args...) v4v_dprintk(format, ## args)
+#define v4v_ddprintk(format, args...) v4v_aprintk(format, ## args)
 #else
 #define v4v_ddprintk(format, ... ) (void)0
 #endif
@@ -301,7 +312,7 @@ v4v_ring_map_page(struct v4v_ring_info *ring_info, int i)
         return ring_info->mfn_mapping[i];
     ring_info->mfn_mapping[i] = map_domain_page(mfn_x(ring_info->mfns[i]));
 
-    v4v_ddprintk("mapping page %p to %p\n",
+    v4v_dprintk("mapping page %p to %p\n",
                 (void *)mfn_x(ring_info->mfns[i]),
                 ring_info->mfn_mapping[i]);
     v4v_dprintk_out();
@@ -321,9 +332,6 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
     ASSERT(spin_is_locked(&ring_info->lock));
     offset &= PAGE_SIZE - 1;
 
-    v4v_dprintk("offset = %d, after &=PAGE_SIZE-1\n", (int) offset);
-    v4v_dprintk("page:%d, offset =%#x, len=%#x, dst=%p\n", page, offset, len, dst);
-    v4v_dprintk("offset+len: %#x\n", offset + len);
     while ( (offset + len) > PAGE_SIZE )
     {
         src = v4v_ring_map_page(ring_info, page);
@@ -331,13 +339,8 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
         if ( !src )
             return -EFAULT;
 
-        v4v_dprintk("memcpy(%p,%p+%d,%d)\n",
-                    dst, src, offset,
-                    (int)(PAGE_SIZE - offset));
         memcpy(dst, src + offset, PAGE_SIZE - offset);
 
-        printk(KERN_INFO "%s: page:%d, offset=%#x, len=%#x, dst=%p, src=%p\n", __func__, page, offset, len, dst, src);
-        //v4v_hexdump(dst,PAGE_SIZE-offset);
         /*jo mod*/
         unmap_domain_page(ring_info->mfn_mapping[page]);
         ring_info->mfn_mapping[page] = NULL;
@@ -346,19 +349,14 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
         page = page % (int)ring_info->npage;
         len -= PAGE_SIZE - offset;
         dst += PAGE_SIZE - offset;
-        v4v_dprintk("page:%d, offset =%#x, len=%#x, dst=%p\n", page, offset, len, dst);
         offset = 0;
-        v4v_dprintk("just before loop check: offset+len: %#x\n", offset + len);
     }
 
     src = v4v_ring_map_page(ring_info, page);
     if ( !src )
         return -EFAULT;
 
-    v4v_dprintk("memcpy(%p,%p+%#x,%#x)\n", dst, src, offset, len);
     memcpy(dst, src + offset, len);
-    printk(KERN_INFO "%s: page:%d, offset=%#x, len=%#x, dst=%p, src=%p\n", __func__, page, offset, len, dst, src);
-    //v4v_hexdump(dst,PAGE_SIZE-offset);
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
     ring_info->mfn_mapping[page] = NULL;
@@ -405,7 +403,7 @@ v4v_update_tx_ptr(struct v4v_ring_info *ring_info, uint32_t tx_ptr)
     ASSERT(spin_is_locked(&ring_info->lock));
 
     if ( !dst ) {
-	//v4v_dprintk("%s: PROBLHMA !dist\n",__func__);
+	printk(KERN_ERR "%s: PROBLHMA !dist\n",__func__);
         ret = -EFAULT;
         goto out;
     }
@@ -425,17 +423,14 @@ v4v_copy_from_guest_maybe(void *dst, void *src,
     int rc = 0;
 
     v4v_dprintk_in();
-    printk(KERN_INFO "%s: dst:%p, src:%p, src_hnd.p:%p, len:%#x\n", __func__, dst, src, src_hnd.p, len);
     if ( src )
         memcpy(dst, src, len);
     else
         rc = __copy_from_guest(dst, src_hnd, len);
-    //v4v_hexdump(src ? src : src_hnd.p - 0x40, len + 0x80);
-    if (len < 0x100)
-        v4v_hexdump(dst, len);
-    v4v_dprintk("dst:%p, src:%p, len:%#x\n", dst, src, len);
+
+    v4v_aprintk("rc:%d, dst:%p, src:%p, src_hnd:%p, len:%#x\n", rc, dst, src, src_hnd.p, len);
+
     v4v_dprintk_out();
-    printk(KERN_INFO "%s: rc:%d\n", __func__, rc);
     return rc;
 }
 
@@ -451,76 +446,55 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
     int ret = 0;
     
     v4v_dprintk_in();
-    v4v_dprintk("page = %d, offset = %d, page_shift = %d\n", page, (int) offset, PAGE_SHIFT);
     ASSERT(spin_is_locked(&ring_info->lock));
 
-    page = page % (int)ring_info->npage;
+    //page = page % (int)ring_info->npage;
     offset &= PAGE_SIZE - 1;
-    v4v_dprintk("offset = %d, after &=PAGE_SIZE-1\n", (int) offset);
-    v4v_dprintk("page:%d, offset =%#x, len=%#x, src=%p\n", page, offset, len, src);
-    v4v_dprintk("offset+len: %#x\n", offset + len);
     while ( (offset + len) > PAGE_SIZE ) {
         dst = v4v_ring_map_page(ring_info, page);
         if ( !dst ) {
-	    v4v_dprintk("PROBLHMA !dist, page=%d, %d, %d\n",page, PAGE_SHIFT, (int)offset);
+            printk(KERN_ERR "%s: PROBLHMA !dist, page=%d, %d, %d\n", __func__, page, PAGE_SHIFT, (int)offset);
             ret = -EFAULT;
             goto out;
         }
-        if (!page && !offset)
-            offset+=sizeof(v4v_ring_t);
+        //if (!page && !offset)
+        //    offset+=sizeof(v4v_ring_t);
 
+        v4v_aprintk("dst:%p, src:%p, src_hnd:%p, offset:%#x, len:%#x\n", dst, src, src_hnd.p, offset, (unsigned)PAGE_SIZE - offset);
         if ( v4v_copy_from_guest_maybe(dst + offset, src, src_hnd,
                                        PAGE_SIZE - offset) ) {
-	    v4v_dprintk("PROBLHMA copy_from_guest_maybe\n");
+            printk(KERN_ERR "%s: PROBLHMA copy_from_guest_maybe\n", __func__);
             ret = -EFAULT;
             goto out;
-	}
-	/*jo mod*/
-        printk(KERN_INFO "%s: page:%d, offset =%#x, len=%ld, dst=%p, src=%p, src_hnd.p=%p\n", __func__, page, offset, PAGE_SIZE-offset, dst, src, src_hnd.p);
-        //v4v_hexdump((src ? src : src_hnd.p), PAGE_SIZE-offset);
-	//v4v_hexdump(dst+offset, PAGE_SIZE-offset);
-        if (len < 0x100) {
-            v4v_hexdump(dst+offset, len);
-	}
-	unmap_domain_page(ring_info->mfn_mapping[page]);
-	ring_info->mfn_mapping[page] = NULL;
+	    }
+        /*jo mod*/
+        unmap_domain_page(ring_info->mfn_mapping[page]);
+        ring_info->mfn_mapping[page] = NULL;
         /*jo mod end*/
         page++;
-        page = page % (int)ring_info->npage;
+        //page = page % (int)ring_info->npage;
         len -= PAGE_SIZE - offset;
         if ( src )
             src += (PAGE_SIZE - offset);
         else
             guest_handle_add_offset(src_hnd, PAGE_SIZE - offset);
-        //v4v_hexdump((src ? src : src_hnd.p), len);
-        v4v_dprintk("page:%d, offset =%#x, len=%#x, src=%p\n", page, offset, len, src);
         offset = 0;
-        v4v_dprintk("just before loop: offset+len: %#x\n", offset + len);
-        //page = page % (int)ring_info->npage;
     }
 
     dst = v4v_ring_map_page(ring_info, page);
-    //v4v_dprintk("%s: npage = %d page = %d\n", __func__, (int)ring_info->npage, page);
     if ( !dst ) {
-	//v4v_dprintk("%s: PROBLHMA !dist after ring_map_page\n",__func__);
+        printk(KERN_ERR "%s: PROBLHMA !dist after ring_map_page\n",__func__);
         ret = -EFAULT;
         goto out;
     }
-    if (!page && !offset) { 
-        offset+=sizeof(v4v_ring_t);
-        printk(KERN_INFO "%s: offset=%#x\n", __func__, offset);
-    }
-    printk(KERN_INFO "%s: dst+offset:%p, len=%#x, src=%p\n", __func__, dst+offset, len, src);
-    v4v_dprintk("dst+offset:%p, len=%#x, src=%p\n", dst+offset, len, src);
+    //    if (!page && !offset) { 
+    //        offset+=sizeof(v4v_ring_t);
+    //    }
+    v4v_aprintk("dst:%p, src:%p, src_hnd:%p, offset:%#x, len:%#x\n", dst, src, src_hnd.p, offset, len);
     if ( v4v_copy_from_guest_maybe(dst + offset, src, src_hnd, len) ) {
-	printk("%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
+        printk(KERN_ERR "%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
         ret = -EFAULT;
         goto out;
-    }
-    printk(KERN_INFO "%s: page:%d, offset =%#x, len=%#x, dst=%p, src=%p, src_hnd.p=%p\n", __func__, page, offset, len, dst, src, src_hnd.p);
-    //v4v_hexdump((src ? src : src_hnd.p), len);
-    if (len < 0x100) {
-        v4v_hexdump(dst+offset, len);
     }
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
@@ -547,8 +521,6 @@ v4v_ringbuf_get_rx_ptr(struct domain *d, struct v4v_ring_info *ring_info,
 
     ringp = map_domain_page(mfn_x(ring_info->mfns[0]));
 
-    //v4v_dprintk("v4v_ringbuf_payload_space: mapped %p to %p\n",
-    //            (void *)mfn_x(ring_info->mfns[0]), ringp);
     if ( !ringp ) {
         ret = -1;
         goto out;
@@ -557,8 +529,6 @@ v4v_ringbuf_get_rx_ptr(struct domain *d, struct v4v_ring_info *ring_info,
     write_atomic(rx_ptr, ringp->rx_ptr);
     wmb();
 
-    //v4v_dprintk("v4v_ringbuf_payload_space: mapped %p to %p\n",
-    //            (void *)mfn_x(ring_info->mfns[0]), ringp);
     unmap_domain_page(ringp);
 out:
     v4v_dprintk_out();
@@ -580,8 +550,6 @@ v4v_ringbuf_payload_space(struct domain * d, struct v4v_ring_info * ring_info)
         goto out;
      }
 
-    //v4v_dprintk("v4v_ringbuf_payload_space:tx_ptr=%li rx_ptr=%li\n",
-    //            (unsigned long)ring.tx_ptr, (unsigned long)ring.rx_ptr);
     if ( ring.rx_ptr == ring.tx_ptr ) {
         ret = ring.len - sizeof (struct v4v_ring_message_header);
         goto out;
@@ -609,7 +577,7 @@ v4v_iov_count(XEN_GUEST_HANDLE(v4v_iov_t) iovs, int niov)
     while ( niov-- )
     {
         if ( (ret = copy_from_guest(&iov, iovs, 1)) ) {
-	    printk("%s: failed, ret= %d\n", __func__, (int)ret);
+	    printk(KERN_ERR "%s: failed, ret= %d\n", __func__, (int)ret);
             ret = -EFAULT;
             goto out;
 	}
@@ -651,8 +619,8 @@ v4v_ringbuf_insertv(struct domain *d,
     v4v_dprintk_in();
     happy_ret = len;
 
-    /*jo : trace*/
-    //v4v_dprintk("Mpainei sthn insertv\n");
+    v4v_aprintk("rounduplen: %#lx, sizeof(ring_msg_hdr):%#lx, ring_info->len:%#x\n",
+                V4V_ROUNDUP(len), sizeof (struct v4v_ring_message_header), ring_info->len);
 
     if ( (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header) ) >=
             ring_info->len) {
@@ -662,21 +630,17 @@ v4v_ringbuf_insertv(struct domain *d,
 
     do
     {
+        v4v_aprintk("ring_info: %p, ring:%p, sizeof(ring):%#lx\n",
+                    ring_info, &ring, sizeof(ring));
         if ( (ret = v4v_memcpy_from_guest_ring(&ring, ring_info, 0,
                                                sizeof (ring))) )
             break;
-     
-        /*jo : trace*/
-	//v4v_dprintk("INSERTV : meta to 1o break\n");
 
         ring.tx_ptr = ring_info->tx_ptr;
         ring.len = ring_info->len;
 
-        v4v_dprintk("ring.tx_ptr=%d ring.rx_ptr=%d ring.len=%d ring_info->tx_ptr=%d\n",
-                    (int)ring.tx_ptr, (int)ring.rx_ptr, (int)ring.len, (int)ring_info->tx_ptr);
-
+        v4v_aprintk("ring->tx_ptr: %#x, ring->rx_ptr:%#x\n", ring.tx_ptr, ring.rx_ptr);
         if ( ring.rx_ptr == ring.tx_ptr ) {
-
             sp = ring_info->len;
 #ifdef JO_MAGIC
 	    /*jo magic*/
@@ -690,11 +654,11 @@ v4v_ringbuf_insertv(struct domain *d,
                     goto out;
 		}
 		if( (ret = v4v_update_rx_ptr(ring_info, ring.rx_ptr)) ) {
-		    //v4v_dprintk("%s : failed to update rx_ptr\n",__func__);
+		    v4v_dprintk("%s : failed to update rx_ptr\n",__func__);
 		    v4v_ring_unmap(ring_info);
                     goto out;
 		}
-		//v4v_dprintk("%s : rx_ptr, tx_ptr modified!!!\n", __func__);
+		v4v_dprintk("%s : rx_ptr, tx_ptr modified!!!\n", __func__);
 	    }
             /*jo magic end*/
 #endif
@@ -705,12 +669,12 @@ v4v_ringbuf_insertv(struct domain *d,
             if ( sp < 0 )
                 sp += ring.len;
         }
-        v4v_dprintk("space:%i\n", sp);
+        v4v_aprintk("space:%#x\n", sp);
 
 
         if ( (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)) >= sp )
         {
-            v4v_dprintk("EAGAIN len+header:%#lx\n", (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)));
+            printk(KERN_ERR "%s: EAGAIN len+header:%#lx\n", __func__, (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)));
             ret = -EAGAIN;
             break;
         }
@@ -719,111 +683,99 @@ v4v_ringbuf_insertv(struct domain *d,
         mh.source = src_id->addr;
         mh.message_type = proto;
 
+        v4v_aprintk("ring->tx_ptr: %#x\n", ring.tx_ptr);
         if ( (ret = v4v_memcpy_to_guest_ring(ring_info,
                                              ring.tx_ptr + sizeof (v4v_ring_t),
                                              &mh, empty_hnd,
                                              sizeof (mh))) )
             break;
-        /*jo : trace*/
-	//v4v_dprintk("INSERTV : meta to 2o break\n");
 
         ring.tx_ptr += sizeof (mh);
         if ( ring.tx_ptr >= ring_info->len ) {
-            //v4v_dprintk("%s: tx=%d, mh= %lu\n", __func__, (int)ring.tx_ptr, sizeof(mh));
             ring.tx_ptr -= ring_info->len;
-            v4v_dprintk("tx>=LEN tx=%d, will rewind tx , \n", (int)ring.tx_ptr);
-	}
-        v4v_dprintk("tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
+	    }
 
+        v4v_aprintk("going to parse niovs: ring->tx_ptr: %#x, \n", ring.tx_ptr);
         while ( niov-- )
         {
             XEN_GUEST_HANDLE(uint8_t) buf_hnd;
             v4v_iov_t iov;
-            v4v_dprintk("loop start: tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
             if ( (ret = copy_from_guest(&iov, iovs, 1)) )
             {
-		printk("%s:, ret = %d\n", __func__, ret);
+                printk(KERN_ERR "%s:, ret = %d\n", __func__, ret);
                 ret = -EFAULT;
                 break;
             }
-	    ret = 0;
+            ret = 0;
 	    
-            /*jo : trace*/
-	   // v4v_dprintk("iov_base = %s",iov.iov_base);
+            v4v_aprintk("iov[%d].{base:%p, len:%#x\n", niov + 1, (char*)iov.iov_base, iov.iov_len);
             buf_hnd.p = (uint8_t *)iov.iov_base; //FIXME
             len = iov.iov_len;
-	    printk(KERN_INFO "%s: iov_base:%p, len:%#lx\n", __func__, (uint8_t *)iov.iov_base, len);
-	    //v4v_hexdump((uint8_t *)iov.iov_base, len);
 
             if ( unlikely(!guest_handle_okay(buf_hnd, len)) )
             {
+                printk(KERN_ERR "%s: PROBLHMA guest_handle_okay\n", __func__);
                 ret = -EFAULT;
-		printk("INSERTV :PROBLHMA guest_handle_okay\n");
                 break;
             }
 
             sp = ring.len - ring.tx_ptr;
-            v4v_dprintk("space:%#x\n", sp);
+            v4v_aprintk("space (len - tx_ptr):%#x\n", sp);
 
             if ( len > sp )
             {
-		v4v_dprintk("len:%#lx sp:%#x, tx:%#x\n", len, sp, ring.tx_ptr);
+                v4v_aprintk("ring->tx_ptr: %#x, buf_hnd:%p, sp:%#x\n", ring.tx_ptr, buf_hnd.p, sp);
                 ret = v4v_memcpy_to_guest_ring(ring_info,
                         ring.tx_ptr + sizeof (v4v_ring_t),
                         NULL, buf_hnd, sp);
                 if ( ret ) {
-		    v4v_dprintk("INSERTV :PROBLHMA v4v_memcpy (len>sp)\n");
+                    v4v_dprintk("INSERTV :PROBLHMA v4v_memcpy (len>sp)\n");
                     break;
-		}
+		        }
                 ring.tx_ptr += sp;
 
                 if ( ring.tx_ptr >= ring_info->len )
                     ring.tx_ptr -= ring_info->len;
-                v4v_dprintk("(len>sp): tx=%#x, \n", ring.tx_ptr);
                 len -= sp;
                 guest_handle_add_offset(buf_hnd, sp);
+                v4v_aprintk("len:%#lx, buf:%p, ring->tx_ptr: %#x\n", len, buf_hnd.p, ring.tx_ptr);
             }
-            v4v_dprintk("len:%#lx, space:%#x\n", len, sp);
 
+            v4v_aprintk("ring->tx_ptr: %#x, buf_hnd:%p, sp:%#x\n", ring.tx_ptr, buf_hnd.p, sp);
             ret = v4v_memcpy_to_guest_ring(ring_info,
                     ring.tx_ptr + sizeof (v4v_ring_t),
                     NULL, buf_hnd, len);
             if ( ret ) {
-		//v4v_dprintk("INSERTV :PROBLHMA after v4v_memcpy_to_guest\n");
-		printk("%s:, ret = %d\n", __func__, ret);
+                printk(KERN_ERR "%s:, ret = %d\n", __func__, ret);
                 break;
-	    }
+            }
             ring.tx_ptr += len;
 
             if ( ring.tx_ptr >= ring_info->len )
                 ring.tx_ptr -= ring_info->len;
 
+            v4v_aprintk("len:%#lx, buf:%p, ring->tx_ptr: %#x\n", len, buf_hnd.p, ring.tx_ptr);
             guest_handle_add_offset(iovs, 1);
-            v4v_dprintk("loop end: tx=%#x\n", ring.tx_ptr);
         }
         if ( ret ) {
-	    v4v_dprintk("INSERTV :PROBLHMA after while niov\n");
+            printk(KERN_ERR "%s: :PROBLHMA after while niov\n", __func__);
             break;
-	}
+        }
         ring.tx_ptr = V4V_ROUNDUP(ring.tx_ptr);
-        //v4v_dprintk("roundup tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
         if ( ring.tx_ptr >= ring_info->len )
             ring.tx_ptr -= ring_info->len;
-        v4v_dprintk("before barrier tx=%d, mh= %lu\n", (int)ring.tx_ptr, sizeof(mh));
 
-	wmb();
+        v4v_aprintk("ring->tx_ptr: %#x\n", ring.tx_ptr);
+
+        wmb();
         ring_info->tx_ptr = ring.tx_ptr;
         if ( (ret = v4v_update_tx_ptr(ring_info, ring.tx_ptr)) ) {
-	    //v4v_dprintk("INSERTV :PROBLHMA v4v_update_tx_ptr\n");
+            printk(KERN_ERR "%s:PROBLHMA v4v_update_tx_ptr\n", __func__);
             break;
-	}
-    }
-    while ( 0 );
-
-    //v4v_dprintk("%s : EXITING ring.tx_ptr=%d ring.rx_ptr=%d ring.len=%d ring_info->tx_ptr=%d\n", __func__,
-    //                (int)ring.tx_ptr, (int)ring.rx_ptr, (int)ring.len, (int)ring_info->tx_ptr);
+        }
+    } while ( 0 );
 
     v4v_ring_unmap(ring_info);
 
@@ -831,8 +783,6 @@ out:
     v4v_dprintk_out();
     return ret ? ret : happy_ret;
 }
-
-
 
 /* pending */
 static void
@@ -992,8 +942,8 @@ v4v_fill_ring_data(struct domain *src_d,
         goto out;
     }
 
-    //v4v_dprintk("v4v_fill_ring_data: ent.ring.domain=%d,ent.ring.port=%u\n",
-    //            (int)ent.ring.domain, (int)ent.ring.port);
+    v4v_aprintk("v4v_fill_ring_data: ent.ring.domain=%d,ent.ring.port=%u\n",
+                (int)ent.ring.domain, (int)ent.ring.port);
 
     ent.flags = 0;
 
@@ -1181,9 +1131,9 @@ v4v_ring_find_info(struct domain *d, v4v_ring_id_t *id)
 
     hash = v4v_hash_fn(id);
 
-    v4v_ddprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
+    v4v_dprintk("ring_find_info: d->v4v=%p, d->v4v->ring_hash[%d]=%p id=%p\n",
                 d->v4v, (int)hash, d->v4v->ring_hash[hash].first, id);
-    v4v_ddprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
+    v4v_dprintk("ring_find_info: id.addr.port=%d id.addr.domain=%d id.addr.partner=%d\n",
                 id->addr.port, id->addr.domain, id->partner);
 
     hlist_for_each_entry(ring_info, node, &d->v4v->ring_hash[hash], node)
@@ -1906,17 +1856,17 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
             }
 
             spin_lock(&ring_info->lock);
-    	    //v4v_dprintk("dst_d:%#lx, ring_info:%#lx,  niov:%#lx, len:%#lx\n", (unsigned long) dst_d, (unsigned long) ring_info, (unsigned long) niov, (unsigned long) len);
+    	    v4v_aprintk("niov:%#lx, len:%#lx\n", niov, len);
             ret =
                 v4v_ringbuf_insertv(dst_d, ring_info, &src_id, proto, iovs,
                         niov, len);
             if ( ret == -EAGAIN )
             {
-                v4v_dprintk("v4v_ringbuf_insertv failed, EAGAIN\n");
+                printk(KERN_ERR "%s: v4v_ringbuf_insertv failed, EAGAIN\n", __func__);
                 /* Schedule a wake up on the event channel when space is there */
                 if ( v4v_pending_requeue(ring_info, src_d->domain_id, len) )
                 {
-                    v4v_dprintk("v4v_pending_requeue failed, ENOMEM\n");
+                    printk(KERN_ERR "%s:v4v_pending_requeue failed, ENOMEM\n", __func__);
                     ret = -ENOMEM;
                 }
             }
