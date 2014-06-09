@@ -172,9 +172,9 @@ static DEFINE_RWLOCK(v4vtables_rules_lock);
 
 
 
-#define V4V_ANANOS_DEBUG
+//#define V4V_ANANOS_DEBUG
 //#define V4V_DEBUG
-#define V4V_EXTRA_DEBUG
+//#define V4V_EXTRA_DEBUG
 /*
  * Debugs
  */
@@ -339,6 +339,7 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
         if ( !src )
             return -EFAULT;
 
+        v4v_aprintk("dst:%p, src:%p, offset:%#x, len:%#lx\n", dst, src, offset, PAGE_SIZE-offset);
         memcpy(dst, src + offset, PAGE_SIZE - offset);
 
         /*jo mod*/
@@ -356,6 +357,7 @@ v4v_memcpy_from_guest_ring(void *_dst, struct v4v_ring_info *ring_info,
     if ( !src )
         return -EFAULT;
 
+    v4v_aprintk("dst:%p, src:%p, offset:%#x, len:%#x\n", dst, src, offset, len);
     memcpy(dst, src + offset, len);
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
@@ -451,6 +453,7 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
     //page = page % (int)ring_info->npage;
     offset &= PAGE_SIZE - 1;
     while ( (offset + len) > PAGE_SIZE ) {
+        v4v_aprintk("tx_ptr:%#x, offset+len: %#x\n", ring_info->tx_ptr, offset+len);
         dst = v4v_ring_map_page(ring_info, page);
         if ( !dst ) {
             printk(KERN_ERR "%s: PROBLHMA !dist, page=%d, %d, %d\n", __func__, page, PAGE_SHIFT, (int)offset);
@@ -495,6 +498,9 @@ v4v_memcpy_to_guest_ring(struct v4v_ring_info *ring_info,
         printk(KERN_ERR "%s: PROBLHMA from_guet_maybe after ring_map_page\n",__func__);
         ret = -EFAULT;
         goto out;
+    }
+    if (len < 0x100) {
+        //v4v_hexdump(dst+offset, len);
     }
     /*jo mod*/
     unmap_domain_page(ring_info->mfn_mapping[page]);
@@ -674,7 +680,7 @@ v4v_ringbuf_insertv(struct domain *d,
 
         if ( (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)) >= sp )
         {
-            printk(KERN_ERR "%s: EAGAIN len+header:%#lx\n", __func__, (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)));
+            //printk(KERN_ERR "%s: EAGAIN len+header:%#lx\n", __func__, (V4V_ROUNDUP(len) + sizeof (struct v4v_ring_message_header)));
             ret = -EAGAIN;
             break;
         }
@@ -720,8 +726,9 @@ v4v_ringbuf_insertv(struct domain *d,
                 break;
             }
 
+            //sp = ring.len - (ring.tx_ptr + sizeof(v4v_ring_t));
             sp = ring.len - ring.tx_ptr;
-            v4v_aprintk("space (len - tx_ptr):%#x\n", sp);
+            v4v_aprintk("space (len - tx_ptr):%#x, len:%#lx, len-sp:%#lx\n", sp, len, len-sp);
 
             if ( len > sp )
             {
@@ -732,11 +739,13 @@ v4v_ringbuf_insertv(struct domain *d,
                 if ( ret ) {
                     v4v_dprintk("INSERTV :PROBLHMA v4v_memcpy (len>sp)\n");
                     break;
-		        }
-                ring.tx_ptr += sp;
+                }
+                ring.tx_ptr = 0;
 
+#if 0
                 if ( ring.tx_ptr >= ring_info->len )
                     ring.tx_ptr -= ring_info->len;
+#endif
                 len -= sp;
                 guest_handle_add_offset(buf_hnd, sp);
                 v4v_aprintk("len:%#lx, buf:%p, ring->tx_ptr: %#x\n", len, buf_hnd.p, ring.tx_ptr);
@@ -752,8 +761,8 @@ v4v_ringbuf_insertv(struct domain *d,
             }
             ring.tx_ptr += len;
 
-            if ( ring.tx_ptr >= ring_info->len )
-                ring.tx_ptr -= ring_info->len;
+            if ( ring.tx_ptr == ring_info->len )
+                ring.tx_ptr = 0;
 
             v4v_aprintk("len:%#lx, buf:%p, ring->tx_ptr: %#x\n", len, buf_hnd.p, ring.tx_ptr);
             guest_handle_add_offset(iovs, 1);
@@ -883,6 +892,7 @@ v4v_pending_requeue(struct v4v_ring_info *ring_info, domid_t src_id, int len)
     int ret = 0;
 
     v4v_dprintk_in();
+    //printk("pending requeue\n");
     hlist_for_each_entry(ent, node, &ring_info->pending, node)
     {
         if ( ent->id == src_id )
@@ -1862,7 +1872,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
                         niov, len);
             if ( ret == -EAGAIN )
             {
-                printk(KERN_ERR "%s: v4v_ringbuf_insertv failed, EAGAIN\n", __func__);
+                //printk(KERN_ERR "%s: v4v_ringbuf_insertv failed, EAGAIN\n", __func__);
                 /* Schedule a wake up on the event channel when space is there */
                 if ( v4v_pending_requeue(ring_info, src_d->domain_id, len) )
                 {
@@ -1874,6 +1884,7 @@ v4v_sendv(struct domain *src_d, v4v_addr_t * src_addr,
 
             if ( ret >= 0 )
             {
+		//printk(KERN_INFO ":%d->%d:signal domain\n", src_d->domain_id, dst_d->domain_id);
                 v4v_signal_domain(dst_d);
             }
 
