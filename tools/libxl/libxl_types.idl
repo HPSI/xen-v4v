@@ -5,24 +5,39 @@
 
 namespace("libxl_")
 
-libxl_defbool = Builtin("defbool", passby=PASS_BY_REFERENCE)
+libxl_defbool = Builtin("defbool", json_parse_type="JSON_STRING", passby=PASS_BY_REFERENCE, copy_fn=None,
+                        check_default_fn="libxl__defbool_is_default")
+libxl_domid = Builtin("domid", json_gen_fn = "yajl_gen_integer", json_parse_fn = "libxl__uint32_parse_json",
+                      json_parse_type = "JSON_INTEGER", autogenerate_json = False, copy_fn=None)
+libxl_devid = Builtin("devid", json_gen_fn = "yajl_gen_integer", json_parse_fn = "libxl__int_parse_json",
+                      json_parse_type = "JSON_INTEGER", autogenerate_json = False, signed = True, init_val="-1",
+                      copy_fn=None)
+libxl_uuid = Builtin("uuid", json_parse_type="JSON_STRING", passby=PASS_BY_REFERENCE, check_default_fn="libxl_uuid_is_nil",
+                     copy_fn="libxl_uuid_copy")
+libxl_mac = Builtin("mac", json_parse_type="JSON_STRING", passby=PASS_BY_REFERENCE, check_default_fn="libxl__mac_is_default",
+                    copy_fn="libxl_mac_copy")
+libxl_bitmap = Builtin("bitmap", json_parse_type="JSON_ARRAY", dispose_fn="libxl_bitmap_dispose", passby=PASS_BY_REFERENCE,
+                       check_default_fn="libxl_bitmap_is_empty", copy_fn="libxl_bitmap_copy_alloc")
+libxl_cpuid_policy_list = Builtin("cpuid_policy_list", dispose_fn="libxl_cpuid_dispose", passby=PASS_BY_REFERENCE,
+                                  json_parse_type="JSON_ARRAY", check_default_fn="libxl__cpuid_policy_is_empty",
+                                  copy_fn="libxl_cpuid_policy_list_copy")
 
-libxl_domid = Builtin("domid", json_fn = "yajl_gen_integer", autogenerate_json = False)
-libxl_devid = Builtin("devid", json_fn = "yajl_gen_integer", autogenerate_json = False, signed = True, init_val="-1")
-libxl_uuid = Builtin("uuid", passby=PASS_BY_REFERENCE)
-libxl_mac = Builtin("mac", passby=PASS_BY_REFERENCE)
-libxl_bitmap = Builtin("bitmap", dispose_fn="libxl_bitmap_dispose", passby=PASS_BY_REFERENCE)
-libxl_cpuid_policy_list = Builtin("cpuid_policy_list", dispose_fn="libxl_cpuid_dispose", passby=PASS_BY_REFERENCE)
-
-libxl_string_list = Builtin("string_list", dispose_fn="libxl_string_list_dispose", passby=PASS_BY_REFERENCE)
-libxl_key_value_list = Builtin("key_value_list", dispose_fn="libxl_key_value_list_dispose", passby=PASS_BY_REFERENCE)
-libxl_hwcap = Builtin("hwcap", passby=PASS_BY_REFERENCE)
+libxl_string_list = Builtin("string_list", dispose_fn="libxl_string_list_dispose", passby=PASS_BY_REFERENCE,
+                            json_parse_type="JSON_ARRAY", check_default_fn="libxl__string_list_is_empty",
+                            copy_fn="libxl_string_list_copy")
+libxl_key_value_list = Builtin("key_value_list", dispose_fn="libxl_key_value_list_dispose", passby=PASS_BY_REFERENCE,
+                               json_parse_type="JSON_MAP", check_default_fn="libxl__key_value_list_is_empty",
+                               copy_fn="libxl_key_value_list_copy")
+libxl_hwcap = Builtin("hwcap", passby=PASS_BY_REFERENCE, json_parse_type="JSON_ARRAY",
+                      check_default_fn="libxl__hwcap_is_default", copy_fn="libxl_hwcap_copy")
+libxl_ms_vm_genid = Builtin("ms_vm_genid", passby=PASS_BY_REFERENCE, check_default_fn="libxl_ms_vm_genid_is_zero",
+                            copy_fn="libxl_ms_vm_genid_copy")
 
 #
 # Specific integer types
 #
 
-MemKB = UInt(64, init_val = "LIBXL_MEMKB_DEFAULT")
+MemKB = UInt(64, init_val = "LIBXL_MEMKB_DEFAULT", json_gen_fn = "libxl__uint64_gen_json")
 
 #
 # Constants / Enumerations
@@ -49,7 +64,7 @@ libxl_domain_type = Enumeration("domain_type", [
     (-1, "INVALID"),
     (1, "HVM"),
     (2, "PV"),
-    ], init_val = -1)
+    ], init_val = "LIBXL_DOMAIN_TYPE_INVALID")
 
 libxl_device_model_version = Enumeration("device_model_version", [
     (0, "UNKNOWN"),
@@ -95,7 +110,7 @@ libxl_action_on_shutdown = Enumeration("action_on_shutdown", [
 
     (5, "COREDUMP_DESTROY"),
     (6, "COREDUMP_RESTART"),
-    ], init_val = 1)
+    ], init_val = "LIBXL_ACTION_ON_SHUTDOWN_DESTROY")
 
 libxl_trigger = Enumeration("trigger", [
     (0, "UNKNOWN"),
@@ -154,7 +169,7 @@ libxl_vga_interface_type = Enumeration("vga_interface_type", [
     (1, "CIRRUS"),
     (2, "STD"),
     (3, "NONE"),
-    ], init_val = 1)
+    ], init_val = "LIBXL_VGA_INTERFACE_TYPE_CIRRUS")
 
 libxl_vendor_device = Enumeration("vendor_device", [
     (0, "NONE"),
@@ -215,6 +230,7 @@ libxl_dominfo = Struct("dominfo",[
     ("uuid",        libxl_uuid),
     ("domid",       libxl_domid),
     ("ssidref",     uint32),
+    ("ssid_label",  string),
     ("running",     bool),
     ("blocked",     bool),
     ("paused",      bool),
@@ -240,6 +256,7 @@ libxl_dominfo = Struct("dominfo",[
 
 libxl_cpupoolinfo = Struct("cpupoolinfo", [
     ("poolid",      uint32),
+    ("pool_name",   string),
     ("sched",       libxl_scheduler),
     ("n_dom",       uint32),
     ("cpumap",      libxl_bitmap)
@@ -270,11 +287,13 @@ libxl_domain_create_info = Struct("domain_create_info",[
     ("hap",          libxl_defbool),
     ("oos",          libxl_defbool),
     ("ssidref",      uint32),
+    ("ssid_label",   string),
     ("name",         string),
     ("uuid",         libxl_uuid),
     ("xsdata",       libxl_key_value_list),
     ("platformdata", libxl_key_value_list),
     ("poolid",       uint32),
+    ("pool_name",    string),
     ("run_hotplug_scripts",libxl_defbool),
     ("pvh",          libxl_defbool),
     ("driver_domain",libxl_defbool),
@@ -283,8 +302,6 @@ libxl_domain_create_info = Struct("domain_create_info",[
 libxl_domain_restore_params = Struct("domain_restore_params", [
     ("checkpointed_stream", integer),
     ])
-
-MemKB = UInt(64, init_val = "LIBXL_MEMKB_DEFAULT")
 
 libxl_domain_sched_params = Struct("domain_sched_params",[
     ("sched",        libxl_scheduler),
@@ -301,6 +318,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
     ("avail_vcpus",     libxl_bitmap),
     ("cpumap",          libxl_bitmap),
     ("nodemap",         libxl_bitmap),
+    ("vcpu_hard_affinity", Array(libxl_bitmap, "num_vcpu_hard_affinity")),
     ("numa_placement",  libxl_defbool),
     ("tsc_mode",        libxl_tsc_mode),
     ("max_memkb",       MemKB),
@@ -309,6 +327,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
     ("shadow_memkb",    MemKB),
     ("rtc_timeoffset",  uint32),
     ("exec_ssidref",    uint32),
+    ("exec_ssid_label", string),
     ("localtime",       libxl_defbool),
     ("disable_migrate", libxl_defbool),
     ("cpuid",           libxl_cpuid_policy_list),
@@ -319,6 +338,7 @@ libxl_domain_build_info = Struct("domain_build_info",[
     # if you set device_model you must set device_model_version too
     ("device_model",     string),
     ("device_model_ssidref", uint32),
+    ("device_model_ssid_label", string),
 
     # extra parameters pass directly to qemu, NULL terminated
     ("extra",            libxl_string_list),
@@ -373,6 +393,8 @@ libxl_domain_build_info = Struct("domain_build_info",[
                                        ("xen_platform_pci", libxl_defbool),
                                        ("usbdevice_list",   libxl_string_list),
                                        ("vendor_device",    libxl_vendor_device),
+                                       # See libxl_ms_vm_genid_generate()
+                                       ("ms_vm_genid",      libxl_ms_vm_genid),
                                        ])),
                  ("pv", Struct(None, [("kernel", string),
                                       ("slack_memkb", MemKB),
@@ -416,6 +438,8 @@ libxl_device_disk = Struct("device_disk", [
     ("removable", integer),
     ("readwrite", integer),
     ("is_cdrom", integer),
+    ("direct_io_safe", bool),
+    ("discard_enable", libxl_defbool),
     ])
 
 libxl_device_nic = Struct("device_nic", [
@@ -514,7 +538,8 @@ libxl_vcpuinfo = Struct("vcpuinfo", [
     ("blocked", bool),
     ("running", bool),
     ("vcpu_time", uint64), # total vcpu time ran (ns)
-    ("cpumap", libxl_bitmap), # current cpu's affinities
+    ("cpumap", libxl_bitmap), # current hard cpu affinity
+    ("cpumap_soft", libxl_bitmap), # current soft cpu affinity
     ], dir=DIR_OUT)
 
 libxl_physinfo = Struct("physinfo", [
@@ -575,7 +600,7 @@ libxl_event_type = Enumeration("event_type", [
 
 libxl_ev_user = UInt(64)
 
-libxl_ev_link = Builtin("ev_link", passby=PASS_BY_REFERENCE, private=True)
+libxl_ev_link = Builtin("ev_link", json_parse_type="JSON_STRING", passby=PASS_BY_REFERENCE, private=True)
 
 libxl_event = Struct("event",[
     ("link",     libxl_ev_link),

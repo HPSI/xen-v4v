@@ -187,19 +187,7 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
     } else if (b_info->avail_vcpus.size > HVM_MAX_VCPUS)
         return ERROR_FAIL;
 
-    if (!b_info->cpumap.size) {
-        if (libxl_cpu_bitmap_alloc(CTX, &b_info->cpumap, 0))
-            return ERROR_FAIL;
-        libxl_bitmap_set_any(&b_info->cpumap);
-    }
-
     libxl_defbool_setdefault(&b_info->numa_placement, true);
-
-    if (!b_info->nodemap.size) {
-        if (libxl_node_bitmap_alloc(CTX, &b_info->nodemap, 0))
-            return ERROR_FAIL;
-        libxl_bitmap_set_any(&b_info->nodemap);
-    }
 
     if (b_info->max_memkb == LIBXL_MEMKB_DEFAULT)
         b_info->max_memkb = 32 * 1024;
@@ -292,6 +280,13 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
         libxl_defbool_setdefault(&b_info->u.hvm.usb,                false);
         libxl_defbool_setdefault(&b_info->u.hvm.xen_platform_pci,   true);
 
+        libxl_defbool_setdefault(&b_info->u.hvm.spice.enable, false);
+        if (!libxl_defbool_val(b_info->u.hvm.spice.enable) &&
+            (b_info->u.hvm.spice.usbredirection > 0) ){
+            b_info->u.hvm.spice.usbredirection = 0;
+            LOG(WARN, "spice disabled, disabling usbredirection");
+        }
+
         if (!b_info->u.hvm.usbversion &&
             (b_info->u.hvm.spice.usbredirection > 0) )
             b_info->u.hvm.usbversion = 2;
@@ -324,7 +319,6 @@ int libxl__domain_build_info_setdefault(libxl__gc *gc,
             libxl_defbool_setdefault(&b_info->u.hvm.sdl.opengl, false);
         }
 
-        libxl_defbool_setdefault(&b_info->u.hvm.spice.enable, false);
         if (libxl_defbool_val(b_info->u.hvm.spice.enable)) {
             libxl_defbool_setdefault(&b_info->u.hvm.spice.disable_ticketing,
                                      false);
@@ -479,7 +473,7 @@ int libxl__domain_make(libxl__gc *gc, libxl_domain_create_info *info,
     *domid = -1;
 
     /* Ultimately, handle is an array of 16 uint8_t, same as uuid */
-    libxl_uuid_copy((libxl_uuid *)handle, &info->uuid);
+    libxl_uuid_copy(ctx, (libxl_uuid *)handle, &info->uuid);
 
     ret = xc_domain_create(ctx->xch, info->ssidref, handle, flags, domid);
     if (ret < 0) {
@@ -584,12 +578,7 @@ retry_transaction:
                         ARRAY_SIZE(rwperm));
     }
 
-    if (info->type == LIBXL_DOMAIN_TYPE_HVM)
-        libxl__xs_mkdir(gc, t,
-            libxl__sprintf(gc, "%s/hvmloader/generation-id-address", dom_path),
-                        rwperm, ARRAY_SIZE(rwperm));
-
-                    vm_list = libxl_list_vm(ctx, &nb_vm);
+    vm_list = libxl_list_vm(ctx, &nb_vm);
     if (!vm_list) {
         LOG(ERROR, "cannot get number of running guests");
         rc = ERROR_FAIL;
@@ -723,6 +712,63 @@ static void initiate_domain_create(libxl__egc *egc,
     memset(&dcs->build_state, 0, sizeof(dcs->build_state));
 
     domid = 0;
+
+    if (d_config->c_info.ssid_label) {
+        char *s = d_config->c_info.ssid_label;
+        ret = libxl_flask_context_to_sid(ctx, s, strlen(s),
+                                         &d_config->c_info.ssidref);
+        if (ret) {
+            if (errno == ENOSYS) {
+                LOG(WARN, "XSM Disabled: init_seclabel not supported");
+                ret = 0;
+            } else {
+                LOG(ERROR, "Invalid init_seclabel: %s", s);
+                goto error_out;
+            }
+        }
+    }
+
+    if (d_config->b_info.exec_ssid_label) {
+        char *s = d_config->b_info.exec_ssid_label;
+        ret = libxl_flask_context_to_sid(ctx, s, strlen(s),
+                                         &d_config->b_info.exec_ssidref);
+        if (ret) {
+            if (errno == ENOSYS) {
+                LOG(WARN, "XSM Disabled: seclabel not supported");
+                ret = 0;
+            } else {
+                LOG(ERROR, "Invalid seclabel: %s", s);
+                goto error_out;
+            }
+        }
+    }
+
+    if (d_config->b_info.device_model_ssid_label) {
+        char *s = d_config->b_info.device_model_ssid_label;
+        ret = libxl_flask_context_to_sid(ctx, s, strlen(s),
+                                         &d_config->b_info.device_model_ssidref);
+        if (ret) {
+            if (errno == ENOSYS) {
+                LOG(WARN,"XSM Disabled: device_model_stubdomain_seclabel not supported");
+                ret = 0;
+            } else {
+                LOG(ERROR, "Invalid device_model_stubdomain_seclabel: %s", s);
+                goto error_out;
+            }
+        }
+    }
+
+    if (d_config->c_info.pool_name) {
+        d_config->c_info.poolid = -1;
+        libxl_cpupool_qualifier_to_cpupoolid(ctx, d_config->c_info.pool_name,
+                                             &d_config->c_info.poolid,
+                                             NULL);
+    }
+    if (!libxl_cpupoolid_is_valid(ctx, d_config->c_info.poolid)) {
+        LOG(ERROR, "Illegal pool specified: %s", d_config->c_info.pool_name);
+        ret = ERROR_INVAL;
+        goto error_out;
+    }
 
     /* If target_memkb is smaller than max_memkb, the subsequent call
      * to libxc when building HVM domain will enable PoD mode.
@@ -903,7 +949,7 @@ static void domcreate_bootloader_done(libxl__egc *egc,
         goto out;
     }
     libxl__xc_domain_restore(egc, dcs,
-                             hvm, pae, superpages, 1);
+                             hvm, pae, superpages);
     return;
 
  out:
@@ -911,7 +957,7 @@ static void domcreate_bootloader_done(libxl__egc *egc,
 }
 
 void libxl__srm_callout_callback_restore_results(unsigned long store_mfn,
-          unsigned long console_mfn, unsigned long genidad, void *user)
+          unsigned long console_mfn, void *user)
 {
     libxl__save_helper_state *shs = user;
     libxl__domain_create_state *dcs = CONTAINER_OF(shs, *dcs, shs);
@@ -920,7 +966,6 @@ void libxl__srm_callout_callback_restore_results(unsigned long store_mfn,
 
     state->store_mfn =            store_mfn;
     state->console_mfn =          console_mfn;
-    state->vm_generationid_addr = genidad;
     shs->need_results =           0;
 }
 

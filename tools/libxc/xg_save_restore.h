@@ -259,6 +259,9 @@
 #define XC_SAVE_ID_HVM_ACCESS_RING_PFN  -16
 #define XC_SAVE_ID_HVM_SHARING_RING_PFN -17
 #define XC_SAVE_ID_TOOLSTACK          -18 /* Optional toolstack specific info */
+/* These are a pair; it is an error for one to exist without the other */
+#define XC_SAVE_ID_HVM_IOREQ_SERVER_PFN -19
+#define XC_SAVE_ID_HVM_NR_IOREQ_SERVER_PAGES -20
 
 /*
 ** We process save/restore/migrate in batches of pages; the below
@@ -357,10 +360,10 @@ static inline int get_platform_info(xc_interface *xch, uint32_t dom,
 #define is_mapped(pfn_type) (!((pfn_type) & 0x80000000UL))
 
 
-#define GET_FIELD(_p, _f) ((dinfo->guest_width==8) ? ((_p)->x64._f) : ((_p)->x32._f))
+#define GET_FIELD(_p, _f, _w) (((_w) == 8) ? ((_p)->x64._f) : ((_p)->x32._f))
 
-#define SET_FIELD(_p, _f, _v) do {              \
-    if (dinfo->guest_width == 8)                \
+#define SET_FIELD(_p, _f, _v, _w) do {          \
+    if ((_w) == 8)                              \
         (_p)->x64._f = (_v);                    \
     else                                        \
         (_p)->x32._f = (_v);                    \
@@ -376,23 +379,16 @@ static inline int get_platform_info(xc_interface *xch, uint32_t dom,
               ? ((uint64_t)(_c)) << 12                                  \
               : (((uint32_t)(_c) << 12) | ((uint32_t)(_c) >> 20))))
 
-#define MEMCPY_FIELD(_d, _s, _f) do {                              \
-    if (dinfo->guest_width == 8)                                   \
+#define MEMCPY_FIELD(_d, _s, _f, _w) do {                          \
+    if ((_w) == 8)                                                 \
         memcpy(&(_d)->x64._f, &(_s)->x64._f,sizeof((_d)->x64._f)); \
     else                                                           \
         memcpy(&(_d)->x32._f, &(_s)->x32._f,sizeof((_d)->x32._f)); \
 } while (0)
 
-#define MEMSET_ARRAY_FIELD(_p, _f, _v) do {                        \
-    if (dinfo->guest_width == 8)                                   \
+#define MEMSET_ARRAY_FIELD(_p, _f, _v, _w) do {                    \
+    if ((_w) == 8)                                                 \
         memset(&(_p)->x64._f[0], (_v), sizeof((_p)->x64._f));      \
     else                                                           \
         memset(&(_p)->x32._f[0], (_v), sizeof((_p)->x32._f));      \
 } while (0)
-
-#ifndef MAX
-#define MAX(_a, _b) ((_a) >= (_b) ? (_a) : (_b))
-#endif
-#ifndef MIN
-#define MIN(_a, _b) ((_a) <= (_b) ? (_a) : (_b))
-#endif

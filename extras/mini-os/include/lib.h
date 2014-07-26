@@ -52,10 +52,19 @@
 #include <stddef.h>
 #include <xen/xen.h>
 #include <xen/event_channel.h>
-#include <sys/queue.h>
 #include "gntmap.h"
 
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#define BUILD_BUG_ON(cond) ({ _Static_assert(!(cond), "!(" #cond ")"); })
+#define BUILD_BUG_ON_ZERO(cond) \
+    sizeof(struct { _Static_assert(!(cond), "!(" #cond ")"); })
+#else
+#define BUILD_BUG_ON_ZERO(cond) sizeof(struct { int:-!!(cond); })
+#define BUILD_BUG_ON(cond) ((void)BUILD_BUG_ON_ZERO(cond))
+#endif
+
 #ifdef HAVE_LIBC
+#include <sys/queue.h>
 #include <stdio.h>
 #else
 #include <lib-gpl.h>

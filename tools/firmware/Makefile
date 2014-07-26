@@ -17,13 +17,15 @@ SUBDIRS-$(CONFIG_ROMBIOS) += vgabios
 SUBDIRS-$(CONFIG_ROMBIOS) += etherboot
 SUBDIRS-y += hvmloader
 
+LD32BIT-$(CONFIG_FreeBSD) := LD32BIT_FLAG=-melf_i386_fbsd
+
 ovmf-dir:
 	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(OVMF_UPSTREAM_URL) $(OVMF_UPSTREAM_REVISION) ovmf-dir
 	cp ovmf-makefile ovmf-dir/Makefile;
 
 seabios-dir:
-	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_TAG) seabios-dir
-	cp seabios-config seabios-dir/.config;
+	GIT=$(GIT) $(XEN_ROOT)/scripts/git-checkout.sh $(SEABIOS_UPSTREAM_URL) $(SEABIOS_UPSTREAM_REVISION) seabios-dir
+	$(MAKE) -C seabios-dir defconfig
 
 .PHONY: all
 all: $(SUBDIRS-y)
@@ -36,7 +38,7 @@ ifeq ($(CONFIG_ROMBIOS),y)
 	false ; \
 	fi
 endif
-	$(MAKE) PYTHON=$(PYTHON) subdirs-$@
+	$(MAKE) $(LD32BIT-y) CC=$(CC) PYTHON=$(PYTHON) subdirs-$@
 
 
 .PHONY: install
@@ -60,7 +62,7 @@ subdir-distclean-seabios-dir: .phony
 	rm -rf seabios-dir seabios-dir-remote
 
 .PHONY: ovmf-dir-force-update
-ovmf-dir-force-update:
+ovmf-dir-force-update: ovmf-dir
 	set -ex; \
 	if [ "$(OVMF_UPSTREAM_REVISION)" ]; then \
 		cd ovmf-dir-remote; \
@@ -74,12 +76,12 @@ subdir-clean-ovmf:
 	fi
 
 .PHONY: seabios-dir-force-update
-seabios-dir-force-update:
+seabios-dir-force-update: seabios-dir
 	set -ex; \
-	if [ "$(SEABIOS_UPSTREAM_TAG)" ]; then \
+	if [ "$(SEABIOS_UPSTREAM_REVISION)" ]; then \
 		cd seabios-dir-remote; \
 		$(GIT) fetch origin; \
-		$(GIT) reset --hard $(SEABIOS_UPSTREAM_TAG); \
+		$(GIT) reset --hard $(SEABIOS_UPSTREAM_REVISION); \
 	fi
 
 subdir-clean-seabios-dir:

@@ -205,6 +205,29 @@ void libxl_string_list_dispose(libxl_string_list *psl)
     free(sl);
 }
 
+void libxl_string_list_copy(libxl_ctx *ctx,
+                            libxl_string_list *dst,
+                            libxl_string_list *src)
+{
+    GC_INIT(ctx);
+    int i, len;
+
+    if (!*src) {
+        *dst = NULL;
+        goto out;
+    }
+
+    len = libxl_string_list_length(src);
+    /* one extra slot for sentinel */
+    *dst = libxl__calloc(NOGC, len + 1, sizeof(char *));
+
+    for (i = 0; i < len; i++)
+        (*dst)[i] = libxl__strdup(NOGC, (*src)[i]);
+
+out:
+    GC_FREE;
+}
+
 int libxl_string_list_length(const libxl_string_list *psl)
 {
     int i = 0;
@@ -212,6 +235,19 @@ int libxl_string_list_length(const libxl_string_list *psl)
     if (*psl)
         while ((*psl)[i])
             i++;
+
+    return i;
+}
+
+int libxl_key_value_list_length(libxl_key_value_list *pkvl)
+{
+    int i = 0;
+    libxl_key_value_list kvl = *pkvl;
+
+    if (kvl) {
+        while (kvl[2 * i]) /* Only checks keys */
+            i++;
+    }
 
     return i;
 }
@@ -232,9 +268,33 @@ void libxl_key_value_list_dispose(libxl_key_value_list *pkvl)
     free(kvl);
 }
 
-#define LIBXL__DEFBOOL_DEFAULT (0)
-#define LIBXL__DEFBOOL_FALSE (-1)
-#define LIBXL__DEFBOOL_TRUE (1)
+void libxl_key_value_list_copy(libxl_ctx *ctx,
+                               libxl_key_value_list *dst,
+                               libxl_key_value_list *src)
+{
+    GC_INIT(ctx);
+    int i, len;
+
+    if (*src == NULL) {
+        *dst = NULL;
+        goto out;
+    }
+
+    len = libxl_key_value_list_length(src);
+    /* one extra slot for sentinel */
+    *dst = libxl__calloc(NOGC, len * 2 + 1, sizeof(char *));
+
+    for (i = 0; i < len * 2; i += 2) {
+        (*dst)[i] = libxl__strdup(NOGC, (*src)[i]);
+        if ((*src)[i+1])
+            (*dst)[i+1] = libxl__strdup(NOGC, (*src)[i+1]);
+        else
+            (*dst)[i+1] = NULL;
+    }
+
+out:
+    GC_FREE;
+}
 
 void libxl_defbool_set(libxl_defbool *db, bool b)
 {
@@ -266,11 +326,11 @@ bool libxl_defbool_val(libxl_defbool db)
 const char *libxl_defbool_to_string(libxl_defbool b)
 {
     if (b.val < 0)
-        return "False";
+        return LIBXL__DEFBOOL_STR_FALSE;
     else if (b.val > 0)
-        return "True";
+        return LIBXL__DEFBOOL_STR_TRUE;
     else
-        return "<default>";
+        return LIBXL__DEFBOOL_STR_DEFAULT;
 }
 
 /******************************************************************************/
@@ -520,12 +580,18 @@ int libxl_domain_preserve(libxl_ctx *ctx, uint32_t domid,
     return 0;
 }
 
-static void xcinfo2xlinfo(const xc_domaininfo_t *xcinfo,
+static void xcinfo2xlinfo(libxl_ctx *ctx,
+                          const xc_domaininfo_t *xcinfo,
                           libxl_dominfo *xlinfo)
 {
+    size_t size;
+
     memcpy(&(xlinfo->uuid), xcinfo->handle, sizeof(xen_domain_handle_t));
     xlinfo->domid = xcinfo->domain;
     xlinfo->ssidref = xcinfo->ssidref;
+    if (libxl_flask_sid_to_context(ctx, xlinfo->ssidref,
+                                   &xlinfo->ssid_label, &size) < 0)
+        xlinfo->ssid_label = NULL;
 
     xlinfo->dying    = !!(xcinfo->flags&XEN_DOMINF_dying);
     xlinfo->shutdown = !!(xcinfo->flags&XEN_DOMINF_shutdown);
@@ -572,7 +638,7 @@ libxl_dominfo * libxl_list_domain(libxl_ctx *ctx, int *nb_domain_out)
     }
 
     for (i = 0; i < ret; i++) {
-        xcinfo2xlinfo(&info[i], &ptr[i]);
+        xcinfo2xlinfo(ctx, &info[i], &ptr[i]);
     }
     *nb_domain_out = ret;
     return ptr;
@@ -591,7 +657,7 @@ int libxl_domain_info(libxl_ctx *ctx, libxl_dominfo *info_r,
     if (ret==0 || xcinfo.domain != domid) return ERROR_INVAL;
 
     if (info_r)
-        xcinfo2xlinfo(&xcinfo, info_r);
+        xcinfo2xlinfo(ctx, &xcinfo, info_r);
     return 0;
 }
 
@@ -619,6 +685,11 @@ static int cpupool_info(libxl__gc *gc,
     }
 
     info->poolid = xcinfo->cpupool_id;
+    info->pool_name = libxl_cpupoolid_to_name(CTX, info->poolid);
+    if (!info->pool_name) {
+        rc = ERROR_FAIL;
+        goto out;
+    }
     info->sched = xcinfo->sched_id;
     info->n_dom = xcinfo->n_dom;
     rc = libxl_cpu_bitmap_alloc(CTX, &info->cpumap, 0);
@@ -876,7 +947,7 @@ int libxl__domain_pvcontrol_available(libxl__gc *gc, uint32_t domid)
 {
     libxl_ctx *ctx = libxl__gc_owner(gc);
 
-    unsigned long pvdriver = 0;
+    uint64_t pvdriver = 0;
     int ret;
 
     libxl_domain_type domtype = libxl__domain_type(gc, domid);
@@ -886,7 +957,7 @@ int libxl__domain_pvcontrol_available(libxl__gc *gc, uint32_t domid)
     if (domtype == LIBXL_DOMAIN_TYPE_PV)
         return 1;
 
-    ret = xc_get_hvm_param(ctx->xch, domid, HVM_PARAM_CALLBACK_IRQ, &pvdriver);
+    ret = xc_hvm_param_get(ctx->xch, domid, HVM_PARAM_CALLBACK_IRQ, &pvdriver);
     if (ret<0) {
         LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "getting HVM callback IRQ");
         return ERROR_FAIL;
@@ -1648,8 +1719,12 @@ int libxl_vncviewer_exec(libxl_ctx *ctx, uint32_t domid, int autopass)
     vnc_port = libxl__xs_read(gc, XBT_NULL,
                             libxl__sprintf(gc,
                             "/local/domain/%d/console/vnc-port", domid));
-    if ( vnc_port )
-        port = atoi(vnc_port) - 5900;
+    if (!vnc_port) {
+        LOG(ERROR, "Cannot get vnc-port of domain %d", domid);
+        goto x_fail;
+    }
+
+    port = atoi(vnc_port) - 5900;
 
     vnc_listen = libxl__xs_read(gc, XBT_NULL,
                                 libxl__sprintf(gc,
@@ -1999,7 +2074,7 @@ int libxl_devid_to_device_vtpm(libxl_ctx *ctx,
         if(devid == vtpms[i].devid) {
             vtpm->backend_domid = vtpms[i].backend_domid;
             vtpm->devid = vtpms[i].devid;
-            libxl_uuid_copy(&vtpm->uuid, &vtpms[i].uuid);
+            libxl_uuid_copy(ctx, &vtpm->uuid, &vtpms[i].uuid);
             rc = 0;
             break;
         }
@@ -2015,6 +2090,8 @@ int libxl_devid_to_device_vtpm(libxl_ctx *ctx,
 int libxl__device_disk_setdefault(libxl__gc *gc, libxl_device_disk *disk)
 {
     int rc;
+
+    libxl_defbool_setdefault(&disk->discard_enable, !!disk->readwrite);
 
     rc = libxl__resolve_domid(gc, disk->backend_domname, &disk->backend_domid);
     if (rc < 0) return rc;
@@ -2205,6 +2282,13 @@ static void device_disk_add(libxl__egc *egc, uint32_t domid,
         flexarray_append(back, disk->readwrite ? "w" : "r");
         flexarray_append(back, "device-type");
         flexarray_append(back, disk->is_cdrom ? "cdrom" : "disk");
+        if (disk->direct_io_safe) {
+            flexarray_append(back, "direct-io-safe");
+            flexarray_append(back, "1");
+        }
+        flexarray_append_pair(back, "discard-enable",
+                              libxl_defbool_val(disk->discard_enable) ?
+                              "1" : "0");
 
         flexarray_append(front, "backend-id");
         flexarray_append(front, libxl__sprintf(gc, "%d", disk->backend_domid));
@@ -2831,8 +2915,7 @@ int libxl__device_nic_setdefault(libxl__gc *gc, libxl_device_nic *nic,
         nic->model = strdup("rtl8139");
         if (!nic->model) return ERROR_NOMEM;
     }
-    if (!nic->mac[0] && !nic->mac[1] && !nic->mac[2] &&
-        !nic->mac[3] && !nic->mac[4] && !nic->mac[5]) {
+    if (libxl__mac_is_default(&nic->mac)) {
         const uint8_t *r;
         libxl_uuid uuid;
 
@@ -3171,9 +3254,9 @@ const char *libxl__device_nic_devname(libxl__gc *gc,
 {
     switch (type) {
     case LIBXL_NIC_TYPE_VIF:
-        return GCSPRINTF("vif%u.%d", domid, devid);
+        return GCSPRINTF(NETBACK_NIC_NAME, domid, devid);
     case LIBXL_NIC_TYPE_VIF_IOEMU:
-        return GCSPRINTF("vif%u.%d" TAP_DEVICE_SUFFIX, domid, devid);
+        return GCSPRINTF(NETBACK_NIC_NAME TAP_DEVICE_SUFFIX, domid, devid);
     default:
         abort();
     }
@@ -4156,10 +4239,13 @@ retry_transaction:
         abort_transaction = 1;
         goto out;
     }
-    xcinfo2xlinfo(&info, &ptr);
+
+    libxl_dominfo_init(&ptr);
+    xcinfo2xlinfo(ctx, &info, &ptr);
     uuid = libxl__uuid2string(gc, ptr.uuid);
     libxl__xs_write(gc, t, libxl__sprintf(gc, "/vm/%s/memory", uuid),
             "%"PRIu32, new_target_memkb / 1024);
+    libxl_dominfo_dispose(&ptr);
 
 out:
     if (!xs_transaction_end(ctx->xsh, t, abort_transaction)
@@ -4574,12 +4660,17 @@ libxl_vcpuinfo *libxl_list_vcpu(libxl_ctx *ctx, uint32_t domid,
         libxl_bitmap_init(&ptr->cpumap);
         if (libxl_cpu_bitmap_alloc(ctx, &ptr->cpumap, 0))
             goto err;
+        libxl_bitmap_init(&ptr->cpumap_soft);
+        if (libxl_cpu_bitmap_alloc(ctx, &ptr->cpumap_soft, 0))
+            goto err;
         if (xc_vcpu_getinfo(ctx->xch, domid, *nr_vcpus_out, &vcpuinfo) == -1) {
             LOGE(ERROR, "getting vcpu info");
             goto err;
         }
+
         if (xc_vcpu_getaffinity(ctx->xch, domid, *nr_vcpus_out,
-                                ptr->cpumap.map) == -1) {
+                                ptr->cpumap.map, ptr->cpumap_soft.map,
+                                XEN_VCPUAFFINITY_SOFT|XEN_VCPUAFFINITY_HARD) == -1) {
             LOGE(ERROR, "getting vcpu affinity");
             goto err;
         }
@@ -4595,33 +4686,105 @@ libxl_vcpuinfo *libxl_list_vcpu(libxl_ctx *ctx, uint32_t domid,
 
 err:
     libxl_bitmap_dispose(&ptr->cpumap);
+    libxl_bitmap_dispose(&ptr->cpumap_soft);
     free(ret);
     GC_FREE;
     return NULL;
 }
 
 int libxl_set_vcpuaffinity(libxl_ctx *ctx, uint32_t domid, uint32_t vcpuid,
-                           libxl_bitmap *cpumap)
+                           const libxl_bitmap *cpumap_hard,
+                           const libxl_bitmap *cpumap_soft)
 {
-    if (xc_vcpu_setaffinity(ctx->xch, domid, vcpuid, cpumap->map)) {
-        LIBXL__LOG_ERRNO(ctx, LIBXL__LOG_ERROR, "setting vcpu affinity");
-        return ERROR_FAIL;
+    GC_INIT(ctx);
+    libxl_bitmap hard, soft;
+    int rc, flags = 0;
+
+    libxl_bitmap_init(&hard);
+    libxl_bitmap_init(&soft);
+
+    if (!cpumap_hard && !cpumap_soft) {
+        rc = ERROR_INVAL;
+        goto out;
     }
-    return 0;
+
+    /*
+     * Xen wants writable hard and/or soft cpumaps, to put back in them
+     * the effective hard and/or soft affinity that will be used.
+     */
+    if (cpumap_hard) {
+        rc = libxl_cpu_bitmap_alloc(ctx, &hard, 0);
+        if (rc)
+            goto out;
+
+        libxl_bitmap_copy(ctx, &hard, cpumap_hard);
+        flags = XEN_VCPUAFFINITY_HARD;
+    }
+    if (cpumap_soft) {
+        rc = libxl_cpu_bitmap_alloc(ctx, &soft, 0);
+        if (rc)
+            goto out;
+
+        libxl_bitmap_copy(ctx, &soft, cpumap_soft);
+        flags |= XEN_VCPUAFFINITY_SOFT;
+    }
+
+    if (xc_vcpu_setaffinity(ctx->xch, domid, vcpuid,
+                            cpumap_hard ? hard.map : NULL,
+                            cpumap_soft ? soft.map : NULL,
+                            flags)) {
+        LOGE(ERROR, "setting vcpu affinity");
+        rc = ERROR_FAIL;
+        goto out;
+    }
+
+    /*
+     * Let's check the results. Hard affinity will never be empty, but it
+     * is possible that Xen will use something different from what we asked
+     * for various reasons. If that's the case, report it.
+     */
+    if (cpumap_hard &&
+        !libxl_bitmap_equal(cpumap_hard, &hard, 0))
+        LOG(DEBUG, "New hard affinity for vcpu %d has unreachable cpus",
+        vcpuid);
+    /*
+     * Soft affinity can both be different from what asked and empty. Check
+     * for (and report) both.
+     */
+    if (cpumap_soft) {
+        if (!libxl_bitmap_equal(cpumap_soft, &soft, 0))
+            LOG(DEBUG, "New soft affinity for vcpu %d has unreachable cpus",
+                vcpuid);
+        if (libxl_bitmap_is_empty(&soft))
+            LOG(WARN, "all cpus in soft affinity of vcpu %d are unreachable."
+                " Only hard affinity will be considered for scheduling",
+                vcpuid);
+    }
+
+    rc = 0;
+ out:
+    libxl_bitmap_dispose(&hard);
+    libxl_bitmap_dispose(&soft);
+    GC_FREE;
+    return rc;
 }
 
 int libxl_set_vcpuaffinity_all(libxl_ctx *ctx, uint32_t domid,
-                               unsigned int max_vcpus, libxl_bitmap *cpumap)
+                               unsigned int max_vcpus,
+                               const libxl_bitmap *cpumap_hard,
+                               const libxl_bitmap *cpumap_soft)
 {
+    GC_INIT(ctx);
     int i, rc = 0;
 
     for (i = 0; i < max_vcpus; i++) {
-        if (libxl_set_vcpuaffinity(ctx, domid, i, cpumap)) {
-            LIBXL__LOG(ctx, LIBXL__LOG_WARNING,
-                       "failed to set affinity for %d", i);
+        if (libxl_set_vcpuaffinity(ctx, domid, i, cpumap_hard, cpumap_soft)) {
+            LOG(WARN, "failed to set affinity for %d", i);
             rc = ERROR_FAIL;
         }
     }
+
+    GC_FREE;
     return rc;
 }
 
@@ -5062,7 +5225,7 @@ static int libxl__domain_s3_resume(libxl__gc *gc, int domid)
     case LIBXL_DOMAIN_TYPE_HVM:
         switch (libxl__device_model_version_running(gc, domid)) {
         case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN_TRADITIONAL:
-            rc = xc_set_hvm_param(CTX->xch, domid, HVM_PARAM_ACPI_S_STATE, 0);
+            rc = xc_hvm_param_set(CTX->xch, domid, HVM_PARAM_ACPI_S_STATE, 0);
             break;
         case LIBXL_DEVICE_MODEL_VERSION_QEMU_XEN:
             rc = libxl__qmp_system_wakeup(gc, domid);
@@ -5661,6 +5824,22 @@ int libxl_fd_set_cloexec(libxl_ctx *ctx, int fd, int cloexec)
 int libxl_fd_set_nonblock(libxl_ctx *ctx, int fd, int nonblock)
   { return fd_set_flags(ctx,fd, F_GETFL,F_SETFL,"FL", O_NONBLOCK, nonblock); }
 
+
+void libxl_hwcap_copy(libxl_ctx *ctx,libxl_hwcap *dst, libxl_hwcap *src)
+{
+    int i;
+
+    for (i = 0; i < 8; i++)
+        (*dst)[i] = (*src)[i];
+}
+
+void libxl_mac_copy(libxl_ctx *ctx, libxl_mac *dst, libxl_mac *src)
+{
+    int i;
+
+    for (i = 0; i < 6; i++)
+        (*dst)[i] = (*src)[i];
+}
 /*
  * Local variables:
  * mode: C

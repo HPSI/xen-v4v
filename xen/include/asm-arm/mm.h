@@ -5,6 +5,7 @@
 #include <xen/kernel.h>
 #include <asm/page.h>
 #include <public/xen.h>
+#include <xen/domain_page.h>
 
 /* Align Xen to a 2 MiB boundary. */
 #define XEN_PADDR_ALIGN (1 << 21)
@@ -209,6 +210,8 @@ static inline void __iomem *ioremap_wc(paddr_t start, size_t len)
 #define paddr_to_pfn(pa)  ((unsigned long)((pa) >> PAGE_SHIFT))
 #define paddr_to_pdx(pa)    pfn_to_pdx(paddr_to_pfn(pa))
 
+/* Page-align address and convert to frame number format */
+#define paddr_to_pfn_aligned(paddr)    paddr_to_pfn(PAGE_ALIGN(paddr))
 
 static inline paddr_t __virt_to_maddr(vaddr_t va)
 {
@@ -233,9 +236,9 @@ static inline void *maddr_to_virt(paddr_t ma)
 }
 #endif
 
-static inline int gvirt_to_maddr(vaddr_t va, paddr_t *pa)
+static inline int gvirt_to_maddr(vaddr_t va, paddr_t *pa, unsigned int flags)
 {
-    uint64_t par = gva_to_ma_par(va);
+    uint64_t par = gva_to_ma_par(va, flags);
     if ( par & PAR_F )
         return -EFAULT;
     *pa = (par & PADDR_MASK & PAGE_MASK) | ((unsigned long) va & ~PAGE_MASK);
@@ -272,6 +275,9 @@ static inline void *page_to_virt(const struct page_info *pg)
 struct domain *page_get_owner_and_reference(struct page_info *page);
 void put_page(struct page_info *page);
 int  get_page(struct page_info *page, struct domain *domain);
+
+struct page_info *get_page_from_gva(struct domain *d, vaddr_t va,
+                                    unsigned long flags);
 
 /*
  * The MPT (machine->physical mapping table) is an array of word-sized
@@ -340,6 +346,8 @@ static inline void put_page_and_type(struct page_info *page)
     put_page_type(page);
     put_page(page);
 }
+
+void clear_and_clean_page(struct page_info *page);
 
 #endif /*  __ARCH_ARM_MM__ */
 /*

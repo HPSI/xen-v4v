@@ -20,6 +20,12 @@ APPEND_INCLUDES and APPEND_LIB instead when possible.])
 
 AC_CANONICAL_HOST
 
+case $host_vendor in
+rumpxen) CONFIG_RUMP=y; rump=true ;;
+*)       CONFIG_RUMP=n; rump=false ;;
+esac
+AC_SUBST(CONFIG_RUMP)
+
 AC_SYS_LARGEFILE
 
 case $ac_cv_sys_file_offset_bits in #(
@@ -34,11 +40,11 @@ AC_SUBST(FILE_OFFSET_BITS)
 m4_include([../m4/savevar.m4])
 m4_include([../m4/features.m4])
 m4_include([../m4/path_or_fail.m4])
+m4_include([../m4/checkpolicy.m4])
+m4_include([../m4/set_cflags_ldflags.m4])
 m4_include([../m4/python_version.m4])
 m4_include([../m4/python_devel.m4])
 m4_include([../m4/ocaml.m4])
-m4_include([../m4/checkpolicy.m4])
-m4_include([../m4/set_cflags_ldflags.m4])
 m4_include([../m4/uuid.m4])
 m4_include([../m4/pkg.m4])
 m4_include([../m4/curses.m4])
@@ -54,19 +60,41 @@ AX_ARG_DEFAULT_ENABLE([monitors], [Disable xenstat and xentop monitoring tools])
 AX_ARG_DEFAULT_ENABLE([ocamltools], [Disable Ocaml tools])
 AX_ARG_DEFAULT_ENABLE([xsmpolicy], [Disable XSM policy compilation])
 AX_ARG_DEFAULT_DISABLE([ovmf], [Enable OVMF])
-AX_ARG_DEFAULT_ENABLE([rombios], [Disable ROM BIOS])
 AX_ARG_DEFAULT_ENABLE([seabios], [Disable SeaBIOS])
 AX_ARG_DEFAULT_ENABLE([debug], [Disable debug build of tools])
 AX_ARG_DEFAULT_DISABLE([blktap1], [Enable blktap1 tools])
 
+dnl Enable blktap2 on Linux only.
+AC_ARG_ENABLE([blktap2],
+    AS_HELP_STRING([--enable-blktap2],
+                   [Enable blktap2, (DEFAULT is on for Linux, otherwise off)]),,[
+    case "$host_os" in
+        linux*)
+           enable_blktap2="yes";;
+        *) enable_blktap2="no";;
+    esac
+])
+AS_IF([test "x$enable_blktap2" = "xyes"], [
+AC_DEFINE([HAVE_BLKTAP2], [1], [Blktap2 enabled])
+    blktap2=y],[
+    blktap2=n
+])
+AC_SUBST(blktap2)
+
+
 AC_ARG_ENABLE([qemu-traditional],
     AS_HELP_STRING([--enable-qemu-traditional],
-                   [Enable qemu traditional device model, (DEFAULT is on for x86, otherwise off)]),,[
+                   [Enable qemu traditional device model, (DEFAULT is on for Linux or NetBSD x86, otherwise off)]),,[
     case "$host_cpu" in
         i[[3456]]86|x86_64)
            enable_qemu_traditional="yes";;
         *) enable_qemu_traditional="no";;
     esac
+    case "$host_os" in
+        freebsd*)
+           enable_qemu_traditional="no";;
+    esac
+
 ])
 AS_IF([test "x$enable_qemu_traditional" = "xyes"], [
 AC_DEFINE([HAVE_QEMU_TRADITIONAL], [1], [Qemu traditional enabled])
@@ -74,6 +102,22 @@ AC_DEFINE([HAVE_QEMU_TRADITIONAL], [1], [Qemu traditional enabled])
     qemu_traditional=n
 ])
 AC_SUBST(qemu_traditional)
+
+AC_ARG_ENABLE([rombios],
+    AS_HELP_STRING([--enable-rombios],
+                   [Enable ROMBIOS, (DEFAULT is on if qemu-traditional is enabled, otherwise off)]),,[
+    AS_IF([test "x$enable_qemu_traditional" = "xyes"], [
+        enable_rombios="yes"
+    ], [
+        enable_rombios="no"
+    ])
+])
+AS_IF([test "x$enable_rombios" = "xyes"], [
+AC_DEFINE([HAVE_ROMBIOS], [1], [ROMBIOS enabled])
+    rombios=y],[
+    rombios=n
+])
+AC_SUBST(rombios)
 
 AC_ARG_WITH([system-qemu],
     AS_HELP_STRING([--with-system-qemu@<:@=PATH@:>@],
@@ -117,6 +161,16 @@ AC_ARG_WITH([system-ovmf],
     esac
 ],[])
 AC_SUBST(ovmf_path)
+
+AC_ARG_WITH([extra-qemuu-configure-args],
+    AS_HELP_STRING([--with-extra-qemuu-configure-args@<:@="--ARG1 ..."@:>@],
+       [List of additional configure options for upstream qemu]),[
+    case $withval in
+        no) EXTRA_QEMUU_CONFIGURE_ARGS= ;;
+        *)  EXTRA_QEMUU_CONFIGURE_ARGS=$withval ;;
+    esac
+],[])
+AC_SUBST(EXTRA_QEMUU_CONFIGURE_ARGS)
 
 AC_ARG_VAR([PREPEND_INCLUDES],
     [List of include folders to prepend to CFLAGS (without -I)])
@@ -185,6 +239,8 @@ AS_IF([test "$cross_compiling" != yes], [
     AX_CHECK_PYTHON_DEVEL()
 ])
 
+if ! $rump; then
+
 AX_PATH_PROG_OR_FAIL([XGETTEXT], [xgettext])
 dnl as86, ld86, bcc and iasl are only required when the host system is x86*.
 dnl "host" here means the platform on which the hypervisor and tools is
@@ -214,7 +270,9 @@ AC_CHECK_HEADER([lzo/lzo1x.h], [
 AC_CHECK_LIB([lzo2], [lzo1x_decompress], [zlib="$zlib -DHAVE_LZO1X -llzo2"])
 ])
 AC_SUBST(zlib)
+AS_IF([test "x$enable_blktap1" = "xyes" || test "x$enable_blktap2" = "xyes"], [
 AC_CHECK_LIB([aio], [io_setup], [], [AC_MSG_ERROR([Could not find libaio])])
+])
 AC_SUBST(system_aio)
 AC_CHECK_LIB([crypto], [MD5], [], [AC_MSG_ERROR([Could not find libcrypto])])
 AX_CHECK_EXTFS
@@ -235,7 +293,9 @@ AC_CHECK_LIB([fdt], [fdt_create], [], [AC_MSG_ERROR([Could not find libfdt])])
 esac
 
 # Checks for header files.
-AC_CHECK_HEADERS([yajl/yajl_version.h sys/eventfd.h])
+AC_CHECK_HEADERS([yajl/yajl_version.h sys/eventfd.h valgrind/memcheck.h utmp.h])
+
+fi # ! $rump
 
 AC_OUTPUT()
 

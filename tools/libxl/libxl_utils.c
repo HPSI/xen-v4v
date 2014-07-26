@@ -108,6 +108,37 @@ int libxl_domain_qualifier_to_domid(libxl_ctx *ctx, const char *name,
     return rv;
 }
 
+static int qualifier_to_id(const char *p, uint32_t *id_r)
+{
+    int i, alldigit;
+
+    alldigit = 1;
+    for (i = 0; p[i]; i++) {
+        if (!isdigit((uint8_t)p[i])) {
+            alldigit = 0;
+            break;
+        }
+    }
+
+    if (i > 0 && alldigit) {
+        *id_r = strtoul(p, NULL, 10);
+        return 0;
+    } else {
+        /* check here if it's a uuid and do proper conversion */
+    }
+    return 1;
+}
+
+int libxl_cpupool_qualifier_to_cpupoolid(libxl_ctx *ctx, const char *p,
+                                         uint32_t *poolid_r,
+                                         int *was_name_r)
+{
+    int was_name;
+
+    was_name = qualifier_to_id(p, poolid_r);
+    if (was_name_r) *was_name_r = was_name;
+    return was_name ? libxl_name_to_cpupoolid(ctx, p, poolid_r) : 0;
+}
 
 char *libxl_cpupoolid_to_name(libxl_ctx *ctx, uint32_t poolid)
 {
@@ -505,7 +536,7 @@ int libxl_uuid_to_device_vtpm(libxl_ctx *ctx, uint32_t domid,
         if(!libxl_uuid_compare(uuid, &vtpms[i].uuid)) {
             vtpm->backend_domid = vtpms[i].backend_domid;
             vtpm->devid = vtpms[i].devid;
-            libxl_uuid_copy(&vtpm->uuid, &vtpms[i].uuid);
+            libxl_uuid_copy(ctx, &vtpm->uuid, &vtpms[i].uuid);
             rc = 0;
             break;
         }
@@ -581,6 +612,19 @@ void libxl_bitmap_copy(libxl_ctx *ctx, libxl_bitmap *dptr,
     assert(dptr->size == sptr->size);
     sz = dptr->size = sptr->size;
     memcpy(dptr->map, sptr->map, sz * sizeof(*dptr->map));
+}
+
+void libxl_bitmap_copy_alloc(libxl_ctx *ctx,
+                             libxl_bitmap *dptr,
+                             const libxl_bitmap *sptr)
+{
+    GC_INIT(ctx);
+
+    dptr->map = libxl__calloc(NOGC, sptr->size, sizeof(*sptr->map));
+    dptr->size = sptr->size;
+    memcpy(dptr->map, sptr->map, sptr->size * sizeof(*sptr->map));
+
+    GC_FREE;
 }
 
 int libxl_bitmap_is_full(const libxl_bitmap *bitmap)
@@ -980,6 +1024,40 @@ int libxl_domid_valid_guest(uint32_t domid)
     /* returns 1 if the value _could_ be a valid guest domid, 0 otherwise
      * does not check whether the domain actually exists */
     return domid > 0 && domid < DOMID_FIRST_RESERVED;
+}
+
+void libxl_string_copy(libxl_ctx *ctx, char **dst, char **src)
+{
+    GC_INIT(ctx);
+
+    if (*src)
+        *dst = libxl__strdup(NOGC, *src);
+    else
+        *dst = NULL;
+
+    GC_FREE;
+}
+
+/*
+ * Fill @buf with @len random bytes.
+ */
+int libxl__random_bytes(libxl__gc *gc, uint8_t *buf, size_t len)
+{
+    static const char *dev = "/dev/urandom";
+    int fd;
+    int ret;
+
+    fd = open(dev, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGE(ERROR, "failed to open \"%s\"", dev);
+        return ERROR_FAIL;
+    }
+
+    ret = libxl_read_exactly(CTX, fd, buf, len, dev, NULL);
+
+    close(fd);
+
+    return ret;
 }
 
 /*

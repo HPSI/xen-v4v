@@ -202,10 +202,15 @@ int xc_domain_node_getaffinity(xc_interface *xch,
 int xc_vcpu_setaffinity(xc_interface *xch,
                         uint32_t domid,
                         int vcpu,
-                        xc_cpumap_t cpumap)
+                        xc_cpumap_t cpumap_hard_inout,
+                        xc_cpumap_t cpumap_soft_inout,
+                        uint32_t flags)
 {
     DECLARE_DOMCTL;
-    DECLARE_HYPERCALL_BUFFER(uint8_t, local);
+    DECLARE_HYPERCALL_BOUNCE(cpumap_hard_inout, 0,
+                             XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
+    DECLARE_HYPERCALL_BOUNCE(cpumap_soft_inout, 0,
+                             XC_HYPERCALL_BUFFER_BOUNCE_BOTH);
     int ret = -1;
     int cpusize;
 
@@ -213,31 +218,37 @@ int xc_vcpu_setaffinity(xc_interface *xch,
     if (cpusize <= 0)
     {
         PERROR("Could not get number of cpus");
-        goto out;
+        return -1;
     }
 
-    local = xc_hypercall_buffer_alloc(xch, local, cpusize);
-    if ( local == NULL )
+    HYPERCALL_BOUNCE_SET_SIZE(cpumap_hard_inout, cpusize);
+    HYPERCALL_BOUNCE_SET_SIZE(cpumap_soft_inout, cpusize);
+
+    if ( xc_hypercall_bounce_pre(xch, cpumap_hard_inout) ||
+         xc_hypercall_bounce_pre(xch, cpumap_soft_inout) )
     {
-        PERROR("Could not allocate memory for setvcpuaffinity domctl hypercall");
+        PERROR("Could not allocate hcall buffers for DOMCTL_setvcpuaffinity");
         goto out;
     }
 
     domctl.cmd = XEN_DOMCTL_setvcpuaffinity;
     domctl.domain = (domid_t)domid;
-    domctl.u.vcpuaffinity.vcpu    = vcpu;
+    domctl.u.vcpuaffinity.vcpu = vcpu;
+    domctl.u.vcpuaffinity.flags = flags;
 
-    memcpy(local, cpumap, cpusize);
-
-    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap.bitmap, local);
-
-    domctl.u.vcpuaffinity.cpumap.nr_bits = cpusize * 8;
+    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap_hard.bitmap,
+                         cpumap_hard_inout);
+    domctl.u.vcpuaffinity.cpumap_hard.nr_bits = cpusize * 8;
+    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap_soft.bitmap,
+                         cpumap_soft_inout);
+    domctl.u.vcpuaffinity.cpumap_soft.nr_bits = cpusize * 8;
 
     ret = do_domctl(xch, &domctl);
 
-    xc_hypercall_buffer_free(xch, local);
-
  out:
+    xc_hypercall_bounce_post(xch, cpumap_hard_inout);
+    xc_hypercall_bounce_post(xch, cpumap_soft_inout);
+
     return ret;
 }
 
@@ -245,10 +256,13 @@ int xc_vcpu_setaffinity(xc_interface *xch,
 int xc_vcpu_getaffinity(xc_interface *xch,
                         uint32_t domid,
                         int vcpu,
-                        xc_cpumap_t cpumap)
+                        xc_cpumap_t cpumap_hard,
+                        xc_cpumap_t cpumap_soft,
+                        uint32_t flags)
 {
     DECLARE_DOMCTL;
-    DECLARE_HYPERCALL_BUFFER(uint8_t, local);
+    DECLARE_HYPERCALL_BOUNCE(cpumap_hard, 0, XC_HYPERCALL_BUFFER_BOUNCE_OUT);
+    DECLARE_HYPERCALL_BOUNCE(cpumap_soft, 0, XC_HYPERCALL_BUFFER_BOUNCE_OUT);
     int ret = -1;
     int cpusize;
 
@@ -256,29 +270,37 @@ int xc_vcpu_getaffinity(xc_interface *xch,
     if (cpusize <= 0)
     {
         PERROR("Could not get number of cpus");
-        goto out;
+        return -1;
     }
 
-    local = xc_hypercall_buffer_alloc(xch, local, cpusize);
-    if (local == NULL)
+    HYPERCALL_BOUNCE_SET_SIZE(cpumap_hard, cpusize);
+    HYPERCALL_BOUNCE_SET_SIZE(cpumap_soft, cpusize);
+
+    if ( xc_hypercall_bounce_pre(xch, cpumap_hard) ||
+         xc_hypercall_bounce_pre(xch, cpumap_soft) )
     {
-        PERROR("Could not allocate memory for getvcpuaffinity domctl hypercall");
+        PERROR("Could not allocate hcall buffers for DOMCTL_getvcpuaffinity");
         goto out;
     }
 
     domctl.cmd = XEN_DOMCTL_getvcpuaffinity;
     domctl.domain = (domid_t)domid;
     domctl.u.vcpuaffinity.vcpu = vcpu;
+    domctl.u.vcpuaffinity.flags = flags;
 
-    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap.bitmap, local);
-    domctl.u.vcpuaffinity.cpumap.nr_bits = cpusize * 8;
+    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap_hard.bitmap,
+                         cpumap_hard);
+    domctl.u.vcpuaffinity.cpumap_hard.nr_bits = cpusize * 8;
+    set_xen_guest_handle(domctl.u.vcpuaffinity.cpumap_soft.bitmap,
+                         cpumap_soft);
+    domctl.u.vcpuaffinity.cpumap_soft.nr_bits = cpusize * 8;
 
     ret = do_domctl(xch, &domctl);
 
-    memcpy(cpumap, local, cpusize);
+ out:
+    xc_hypercall_bounce_post(xch, cpumap_hard);
+    xc_hypercall_bounce_post(xch, cpumap_soft);
 
-    xc_hypercall_buffer_free(xch, local);
-out:
     return ret;
 }
 
@@ -1242,7 +1264,7 @@ int xc_domain_send_trigger(xc_interface *xch,
     return do_domctl(xch, &domctl);
 }
 
-int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long value)
+int xc_hvm_param_set(xc_interface *handle, domid_t dom, uint32_t param, uint64_t value)
 {
     DECLARE_HYPERCALL;
     DECLARE_HYPERCALL_BUFFER(xen_hvm_param_t, arg);
@@ -1263,7 +1285,7 @@ int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long
     return rc;
 }
 
-int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long *value)
+int xc_hvm_param_get(xc_interface *handle, domid_t dom, uint32_t param, uint64_t *value)
 {
     DECLARE_HYPERCALL;
     DECLARE_HYPERCALL_BUFFER(xen_hvm_param_t, arg);
@@ -1281,6 +1303,276 @@ int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long
     rc = do_xen_hypercall(handle, &hypercall);
     *value = arg->value;
     xc_hypercall_buffer_free(handle, arg);
+    return rc;
+}
+
+int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long value)
+{
+    return xc_hvm_param_set(handle, dom, param, value);
+}
+
+int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long *value)
+{
+    uint64_t v;
+    int ret;
+
+    ret = xc_hvm_param_get(handle, dom, param, &v);
+    if (ret < 0)
+        return ret;
+    *value = v;
+    return 0;
+}
+
+int xc_hvm_create_ioreq_server(xc_interface *xch,
+                               domid_t domid,
+                               int handle_bufioreq,
+                               ioservid_t *id)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_create_ioreq_server_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_create_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->handle_bufioreq = !!handle_bufioreq;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    *id = arg->id;
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_get_ioreq_server_info(xc_interface *xch,
+                                 domid_t domid,
+                                 ioservid_t id,
+                                 xen_pfn_t *ioreq_pfn,
+                                 xen_pfn_t *bufioreq_pfn,
+                                 evtchn_port_t *bufioreq_port)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_get_ioreq_server_info_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_get_ioreq_server_info;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+    if ( rc != 0 )
+        goto done;
+
+    if ( ioreq_pfn )
+        *ioreq_pfn = arg->ioreq_pfn;
+
+    if ( bufioreq_pfn )
+        *bufioreq_pfn = arg->bufioreq_pfn;
+
+    if ( bufioreq_port )
+        *bufioreq_port = arg->bufioreq_port;
+
+done:
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_map_io_range_to_ioreq_server(xc_interface *xch, domid_t domid,
+                                        ioservid_t id, int is_mmio,
+                                        uint64_t start, uint64_t end)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_io_range_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_map_io_range_to_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+    arg->type = is_mmio ? HVMOP_IO_RANGE_MEMORY : HVMOP_IO_RANGE_PORT;
+    arg->start = start;
+    arg->end = end;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_unmap_io_range_from_ioreq_server(xc_interface *xch, domid_t domid,
+                                            ioservid_t id, int is_mmio,
+                                            uint64_t start, uint64_t end)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_io_range_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_unmap_io_range_from_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+    arg->type = is_mmio ? HVMOP_IO_RANGE_MEMORY : HVMOP_IO_RANGE_PORT;
+    arg->start = start;
+    arg->end = end;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_map_pcidev_to_ioreq_server(xc_interface *xch, domid_t domid,
+                                      ioservid_t id, uint16_t segment,
+                                      uint8_t bus, uint8_t device,
+                                      uint8_t function)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_io_range_t, arg);
+    int rc;
+
+    if (device > 0x1f || function > 0x7) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_map_io_range_to_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+    arg->type = HVMOP_IO_RANGE_PCI;
+
+    /*
+     * The underlying hypercall will deal with ranges of PCI SBDF
+     * but, for simplicity, the API only uses singletons.
+     */
+    arg->start = arg->end = HVMOP_PCI_SBDF((uint64_t)segment,
+                                           (uint64_t)bus,
+                                           (uint64_t)device,
+                                           (uint64_t)function);
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_unmap_pcidev_from_ioreq_server(xc_interface *xch, domid_t domid,
+                                          ioservid_t id, uint16_t segment,
+                                          uint8_t bus, uint8_t device,
+                                          uint8_t function)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_io_range_t, arg);
+    int rc;
+
+    if (device > 0x1f || function > 0x7) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_unmap_io_range_from_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+    arg->type = HVMOP_IO_RANGE_PCI;
+    arg->start = arg->end = HVMOP_PCI_SBDF((uint64_t)segment,
+                                           (uint64_t)bus,
+                                           (uint64_t)device,
+                                           (uint64_t)function);
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_destroy_ioreq_server(xc_interface *xch,
+                                domid_t domid,
+                                ioservid_t id)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_destroy_ioreq_server_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_destroy_ioreq_server;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
+    return rc;
+}
+
+int xc_hvm_set_ioreq_server_state(xc_interface *xch,
+                                  domid_t domid,
+                                  ioservid_t id,
+                                  int enabled)
+{
+    DECLARE_HYPERCALL;
+    DECLARE_HYPERCALL_BUFFER(xen_hvm_set_ioreq_server_state_t, arg);
+    int rc;
+
+    arg = xc_hypercall_buffer_alloc(xch, arg, sizeof(*arg));
+    if ( arg == NULL )
+        return -1;
+
+    hypercall.op     = __HYPERVISOR_hvm_op;
+    hypercall.arg[0] = HVMOP_set_ioreq_server_state;
+    hypercall.arg[1] = HYPERCALL_BUFFER_AS_ARG(arg);
+
+    arg->domid = domid;
+    arg->id = id;
+    arg->enabled = !!enabled;
+
+    rc = do_xen_hypercall(xch, &hypercall);
+
+    xc_hypercall_buffer_free(xch, arg);
     return rc;
 }
 
@@ -1449,16 +1741,22 @@ int xc_domain_bind_pt_irq(
     bind->hvm_domid = domid;
     bind->irq_type = irq_type;
     bind->machine_irq = machine_irq;
-    if ( irq_type == PT_IRQ_TYPE_PCI ||
-         irq_type == PT_IRQ_TYPE_MSI_TRANSLATE )
+    switch ( irq_type )
     {
+    case PT_IRQ_TYPE_PCI:
+    case PT_IRQ_TYPE_MSI_TRANSLATE:
         bind->u.pci.bus = bus;
-        bind->u.pci.device = device;    
+        bind->u.pci.device = device;
         bind->u.pci.intx = intx;
-    } 
-    else if ( irq_type == PT_IRQ_TYPE_ISA )
+        break;
+    case PT_IRQ_TYPE_ISA:
         bind->u.isa.isa_irq = isa_irq;
-    
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+
     rc = do_domctl(xch, &domctl);
     return rc;
 }
@@ -1484,11 +1782,22 @@ int xc_domain_unbind_pt_irq(
     bind->hvm_domid = domid;
     bind->irq_type = irq_type;
     bind->machine_irq = machine_irq;
-    bind->u.pci.bus = bus;
-    bind->u.pci.device = device;    
-    bind->u.pci.intx = intx;
-    bind->u.isa.isa_irq = isa_irq;
-    
+    switch ( irq_type )
+    {
+    case PT_IRQ_TYPE_PCI:
+    case PT_IRQ_TYPE_MSI_TRANSLATE:
+        bind->u.pci.bus = bus;
+        bind->u.pci.device = device;
+        bind->u.pci.intx = intx;
+        break;
+    case PT_IRQ_TYPE_ISA:
+        bind->u.isa.isa_irq = isa_irq;
+        break;
+    default:
+        errno = EINVAL;
+        return -1;
+    }
+
     rc = do_domctl(xch, &domctl);
     return rc;
 }
@@ -1608,8 +1917,8 @@ int xc_map_domain_meminfo(xc_interface *xch, int domid,
         goto failed;
     }
     for ( i = 0; i < minfo->p2m_size; i++ )
-        minfo->pfn_type[i] = pfn_to_mfn(i, minfo->p2m_table,
-                                        minfo->guest_width);
+        minfo->pfn_type[i] = xc_pfn_to_mfn(i, minfo->p2m_table,
+                                           minfo->guest_width);
 
     /* Retrieve PFN types in batches */
     for ( i = 0; i < minfo->p2m_size ; i+=1024 )

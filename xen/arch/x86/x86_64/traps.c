@@ -79,14 +79,14 @@ static void _show_registers(
            regs->gs, regs->ss, regs->cs);
 }
 
-void show_registers(struct cpu_user_regs *regs)
+void show_registers(const struct cpu_user_regs *regs)
 {
     struct cpu_user_regs fault_regs = *regs;
     unsigned long fault_crs[8];
     enum context context;
     struct vcpu *v = current;
 
-    if ( has_hvm_container_vcpu(v) && guest_mode(regs) )
+    if ( guest_mode(regs) && has_hvm_container_vcpu(v) )
     {
         struct segment_register sreg;
         context = CTXT_hvm_guest;
@@ -223,7 +223,6 @@ void show_page_walk(unsigned long addr)
            l1_table_offset(addr), l1e_get_intpte(l1e), pfn);
 }
 
-void double_fault(void);
 void do_double_fault(struct cpu_user_regs *regs)
 {
     unsigned int cpu;
@@ -380,40 +379,12 @@ static int write_stack_trampoline(
 void __devinit subarch_percpu_traps_init(void)
 {
     char *stack_bottom, *stack;
-    int   cpu = smp_processor_id();
-
-    if ( cpu == 0 )
-    {
-        /* Specify dedicated interrupt stacks for NMI, #DF, and #MC. */
-        set_intr_gate(TRAP_double_fault, &double_fault);
-        set_ist(&idt_table[TRAP_double_fault],  IST_DF);
-        set_ist(&idt_table[TRAP_nmi],           IST_NMI);
-        set_ist(&idt_table[TRAP_machine_check], IST_MCE);
-
-        /*
-         * The 32-on-64 hypercall entry vector is only accessible from ring 1.
-         * Also note that this is a trap gate, not an interrupt gate.
-         */
-        _set_gate(idt_table+HYPERCALL_VECTOR, 15, 1, &compat_hypercall);
-
-        /* Fast trap for int80 (faster than taking the #GP-fixup path). */
-        _set_gate(idt_table+0x80, 15, 3, &int80_direct_trap);
-    }
 
     stack_bottom = (char *)get_stack_bottom();
     stack        = (char *)((unsigned long)stack_bottom & ~(STACK_SIZE - 1));
 
     /* IST_MAX IST pages + 1 syscall page + 1 guard page + primary stack. */
     BUILD_BUG_ON((IST_MAX + 2) * PAGE_SIZE + PRIMARY_STACK_SIZE > STACK_SIZE);
-
-    /* Machine Check handler has its own per-CPU 4kB stack. */
-    this_cpu(init_tss).ist[IST_MCE-1] = (unsigned long)&stack[IST_MCE * PAGE_SIZE];
-
-    /* Double-fault handler has its own per-CPU 4kB stack. */
-    this_cpu(init_tss).ist[IST_DF-1] = (unsigned long)&stack[IST_DF * PAGE_SIZE];
-
-    /* NMI handler has its own per-CPU 4kB stack. */
-    this_cpu(init_tss).ist[IST_NMI-1] = (unsigned long)&stack[IST_NMI * PAGE_SIZE];
 
     /* Trampoline for SYSCALL entry from long mode. */
     stack = &stack[IST_MAX * PAGE_SIZE]; /* Skip the IST stacks. */
@@ -436,10 +407,7 @@ void __devinit subarch_percpu_traps_init(void)
 
     /* Common SYSCALL parameters. */
     wrmsr(MSR_STAR, 0, (FLAT_RING3_CS32<<16) | __HYPERVISOR_CS);
-    wrmsr(MSR_SYSCALL_MASK,
-          X86_EFLAGS_VM|X86_EFLAGS_RF|X86_EFLAGS_NT|
-          X86_EFLAGS_DF|X86_EFLAGS_IF|X86_EFLAGS_TF,
-          0U);
+    wrmsr(MSR_SYSCALL_MASK, XEN_SYSCALL_MASK, 0U);
 }
 
 void init_int80_direct_trap(struct vcpu *v)

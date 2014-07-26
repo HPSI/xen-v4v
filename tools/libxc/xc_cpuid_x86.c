@@ -276,13 +276,12 @@ static void xc_cpuid_hvm_policy(
 {
     DECLARE_DOMCTL;
     char brand[13];
-    unsigned long nestedhvm;
-    unsigned long pae;
+    uint64_t val;
     int is_pae, is_nestedhvm;
     uint64_t xfeature_mask;
 
-    xc_get_hvm_param(xch, domid, HVM_PARAM_PAE_ENABLED, &pae);
-    is_pae = !!pae;
+    xc_hvm_param_get(xch, domid, HVM_PARAM_PAE_ENABLED, &val);
+    is_pae = !!val;
 
     /* Detecting Xen's atitude towards XSAVE */
     memset(&domctl, 0, sizeof(domctl));
@@ -291,8 +290,8 @@ static void xc_cpuid_hvm_policy(
     do_domctl(xch, &domctl);
     xfeature_mask = domctl.u.vcpuextstate.xfeature_mask;
 
-    xc_get_hvm_param(xch, domid, HVM_PARAM_NESTEDHVM, &nestedhvm);
-    is_nestedhvm = !!nestedhvm;
+    xc_hvm_param_get(xch, domid, HVM_PARAM_NESTEDHVM, &val);
+    is_nestedhvm = !!val;
 
     switch ( input[0] )
     {
@@ -375,6 +374,7 @@ static void xc_cpuid_hvm_policy(
                         bitmaskof(X86_FEATURE_RTM)  |
                         bitmaskof(X86_FEATURE_RDSEED)  |
                         bitmaskof(X86_FEATURE_ADX)  |
+                        bitmaskof(X86_FEATURE_SMAP) |
                         bitmaskof(X86_FEATURE_FSGSBASE));
         } else
             regs[1] = 0;
@@ -560,6 +560,17 @@ static int xc_cpuid_policy(
     const unsigned int *input, unsigned int *regs)
 {
     xc_dominfo_t        info;
+
+    /*
+     * For hypervisor leaves (0x4000XXXX) only 0x4000xx00.EAX[7:0] bits (max
+     * number of leaves) can be set by user. Hypervisor will enforce this so
+     * all other bits are don't-care and we can set them to zero.
+     */
+    if ( (input[0] & 0xffff0000) == 0x40000000 )
+    {
+        regs[0] = regs[1] = regs[2] = regs[3] = 0;
+        return 0;
+    }
 
     if ( xc_domain_getinfo(xch, domid, 1, &info) == 0 )
         return -EINVAL;

@@ -7,16 +7,11 @@
 #ifndef _OS_H_
 #define _OS_H_
 
-#if __GNUC__ == 2 && __GNUC_MINOR__ < 96
-#define __builtin_expect(x, expected_value) (x)
-#endif
-#define unlikely(x)  __builtin_expect((x),0)
-#define likely(x)  __builtin_expect((x),1)
-
 #define smp_processor_id() 0
 
 
 #ifndef __ASSEMBLY__
+#include <mini-os/compiler.h>
 #include <mini-os/types.h>
 #include <mini-os/hypervisor.h>
 #include <mini-os/kernel.h>
@@ -64,8 +59,6 @@ extern shared_info_t *HYPERVISOR_shared_info;
 void trap_init(void);
 void trap_fini(void);
 
-void arch_init(start_info_t *si);
-void arch_print_info(void);
 void arch_fini(void);
 
 

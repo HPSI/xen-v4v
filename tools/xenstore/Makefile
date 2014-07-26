@@ -13,9 +13,10 @@ CLIENTS += xenstore-write xenstore-ls xenstore-watch
 
 XENSTORED_OBJS = xenstored_core.o xenstored_watch.o xenstored_domain.o xenstored_transaction.o xs_lib.o talloc.o utils.o tdb.o hashtable.o
 
-XENSTORED_OBJS_$(CONFIG_Linux) = xenstored_linux.o xenstored_posix.o
+XENSTORED_OBJS_$(CONFIG_Linux) = xenstored_posix.o
 XENSTORED_OBJS_$(CONFIG_SunOS) = xenstored_solaris.o xenstored_posix.o xenstored_probes.o
-XENSTORED_OBJS_$(CONFIG_NetBSD) = xenstored_netbsd.o xenstored_posix.o
+XENSTORED_OBJS_$(CONFIG_NetBSD) = xenstored_posix.o
+XENSTORED_OBJS_$(CONFIG_FreeBSD) = xenstored_posix.o
 XENSTORED_OBJS_$(CONFIG_MiniOS) = xenstored_minios.o
 
 XENSTORED_OBJS += $(XENSTORED_OBJS_y)
@@ -27,7 +28,13 @@ LIBXENSTORE := libxenstore.a
 xenstore xenstore-control: CFLAGS += -static
 endif
 
-ALL_TARGETS = libxenstore.so libxenstore.a clients xs_tdb_dump xenstored
+ALL_TARGETS = libxenstore.a clients
+ifneq ($(nosharedlibs),y)
+ALL_TARGETS += libxenstore.so
+endif
+ifeq ($(XENSTORE_XENSTORED),y)
+ALL_TARGETS += xs_tdb_dump xenstored
+endif
 
 ifeq ($(CONFIG_Linux),y)
 ALL_TARGETS += init-xenstore-domain
@@ -86,7 +93,7 @@ libxenstore.so.$(MAJOR): libxenstore.so.$(MAJOR).$(MINOR)
 xs.opic: CFLAGS += -DUSE_PTHREAD
 
 libxenstore.so.$(MAJOR).$(MINOR): xs.opic xs_lib.opic
-	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenstore.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(SOCKET_LIBS) -lpthread $(APPEND_LDFLAGS)
+	$(CC) $(LDFLAGS) $(PTHREAD_LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenstore.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(SOCKET_LIBS) $(PTHREAD_LIBS) $(APPEND_LDFLAGS)
 
 libxenstore.a: xs.o xs_lib.o
 	$(AR) rcs $@ $^
@@ -113,15 +120,17 @@ install: all
 	$(INSTALL_DIR) $(DESTDIR)$(SBINDIR)
 	$(INSTALL_DIR) $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL_DIR) $(DESTDIR)$(INCLUDEDIR)/xenstore-compat
+ifeq ($(XENSTORE_XENSTORED),y)
 	$(INSTALL_DIR) $(DESTDIR)/var/lib/xenstored
 	$(INSTALL_PROG) xenstored $(DESTDIR)$(SBINDIR)
+endif
 	$(INSTALL_PROG) xenstore-control $(DESTDIR)$(BINDIR)
 	$(INSTALL_PROG) xenstore $(DESTDIR)$(BINDIR)
 	set -e ; for c in $(CLIENTS) ; do \
 		ln -f $(DESTDIR)$(BINDIR)/xenstore $(DESTDIR)$(BINDIR)/$${c} ; \
 	done
 	$(INSTALL_DIR) $(DESTDIR)$(LIBDIR)
-	$(INSTALL_PROG) libxenstore.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
+	$(INSTALL_SHLIB) libxenstore.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
 	ln -sf libxenstore.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenstore.so.$(MAJOR)
 	ln -sf libxenstore.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenstore.so
 	$(INSTALL_DATA) libxenstore.a $(DESTDIR)$(LIBDIR)

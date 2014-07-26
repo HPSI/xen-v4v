@@ -23,18 +23,14 @@ install:
 	CC="$(CC)" CFLAGS="$(CFLAGS) $(APPEND_LDFLAGS)" $(PYTHON) setup.py install \
 		$(PYTHON_PREFIX_ARG) --root="$(DESTDIR)" --force
 
-	$(INSTALL_DIR) $(DESTDIR)$(SBINDIR)
-
 .PHONY: test
 test:
 	export LD_LIBRARY_PATH=$$(readlink -f ../libxc):$$(readlink -f ../xenstore); $(PYTHON) test.py -b -u
 
 .PHONY: clean
 clean:
-	rm -f $(XENPATH)
-	rm -rf build/ *.pyc *.pyo *.o *.a *~ xen/util/auxbin.pyc
-	rm -f xen/lowlevel/xl/_pyxl_types.h
-	rm -f xen/lowlevel/xl/_pyxl_types.c
-	rm -f $(DEPS)
+	find . \( -name "*.py[ocd]" -o -name "*~" -o -name "_*.[hc]" \) -delete
+	rm -rf build/
+	rm -f $(XENPATH) $(DEPS)
 
 -include $(DEPS)

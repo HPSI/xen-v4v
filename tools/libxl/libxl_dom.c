@@ -212,18 +212,18 @@ static unsigned long timer_mode(const libxl_domain_build_info *info)
 static void hvm_set_conf_params(xc_interface *handle, uint32_t domid,
                                 libxl_domain_build_info *const info)
 {
-    xc_set_hvm_param(handle, domid, HVM_PARAM_PAE_ENABLED,
+    xc_hvm_param_set(handle, domid, HVM_PARAM_PAE_ENABLED,
                     libxl_defbool_val(info->u.hvm.pae));
 #if defined(__i386__) || defined(__x86_64__)
-    xc_set_hvm_param(handle, domid, HVM_PARAM_VIRIDIAN,
+    xc_hvm_param_set(handle, domid, HVM_PARAM_VIRIDIAN,
                     libxl_defbool_val(info->u.hvm.viridian));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_HPET_ENABLED,
+    xc_hvm_param_set(handle, domid, HVM_PARAM_HPET_ENABLED,
                     libxl_defbool_val(info->u.hvm.hpet));
 #endif
-    xc_set_hvm_param(handle, domid, HVM_PARAM_TIMER_MODE, timer_mode(info));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_VPT_ALIGN,
+    xc_hvm_param_set(handle, domid, HVM_PARAM_TIMER_MODE, timer_mode(info));
+    xc_hvm_param_set(handle, domid, HVM_PARAM_VPT_ALIGN,
                     libxl_defbool_val(info->u.hvm.vpt_align));
-    xc_set_hvm_param(handle, domid, HVM_PARAM_NESTEDHVM,
+    xc_hvm_param_set(handle, domid, HVM_PARAM_NESTEDHVM,
                     libxl_defbool_val(info->u.hvm.nested_hvm));
 }
 
@@ -241,27 +241,52 @@ int libxl__build_pre(libxl__gc *gc, uint32_t domid,
     }
 
     /*
-     * Check if the domain has any CPU affinity. If not, try to build
-     * up one. In case numa_place_domain() find at least a suitable
-     * candidate, it will affect info->nodemap accordingly; if it
-     * does not, it just leaves it as it is. This means (unless
-     * some weird error manifests) the subsequent call to
-     * libxl_domain_set_nodeaffinity() will do the actual placement,
-     * whatever that turns out to be.
+     * Check if the domain has any CPU or node affinity already. If not, try
+     * to build up the latter via automatic NUMA placement. In fact, in case
+     * numa_place_domain() manage to find a placement, in info->nodemap is
+     * updated accordingly; if it does not manage, info->nodemap is just left
+     * alone. It is then the the subsequent call to
+     * libxl_domain_set_nodeaffinity() that enacts the actual placement.
      */
     if (libxl_defbool_val(info->numa_placement)) {
-        if (!libxl_bitmap_is_full(&info->cpumap)) {
+        if (info->cpumap.size || info->num_vcpu_hard_affinity) {
             LOG(ERROR, "Can run NUMA placement only if no vcpu "
-                       "affinity is specified");
+                       "affinity is specified explicitly");
             return ERROR_INVAL;
         }
+        if (info->nodemap.size) {
+            LOG(ERROR, "Can run NUMA placement only if the domain does not "
+                       "have any NUMA node affinity set already");
+            return ERROR_INVAL;
+        }
+
+        rc = libxl_node_bitmap_alloc(ctx, &info->nodemap, 0);
+        if (rc)
+            return rc;
+        libxl_bitmap_set_any(&info->nodemap);
 
         rc = numa_place_domain(gc, domid, info);
         if (rc)
             return rc;
     }
-    libxl_domain_set_nodeaffinity(ctx, domid, &info->nodemap);
-    libxl_set_vcpuaffinity_all(ctx, domid, info->max_vcpus, &info->cpumap);
+    if (info->nodemap.size)
+        libxl_domain_set_nodeaffinity(ctx, domid, &info->nodemap);
+    /* As mentioned in libxl.h, vcpu_hard_array takes precedence */
+    if (info->num_vcpu_hard_affinity) {
+        int i;
+
+        for (i = 0; i < info->num_vcpu_hard_affinity; i++) {
+            if (libxl_set_vcpuaffinity(ctx, domid, i,
+                                       &info->vcpu_hard_affinity[i],
+                                       NULL)) {
+                LOG(ERROR, "setting affinity failed on vcpu `%d'", i);
+                return ERROR_FAIL;
+            }
+        }
+    } else if (info->cpumap.size)
+        libxl_set_vcpuaffinity_all(ctx, domid, info->max_vcpus,
+                                   &info->cpumap, NULL);
+
 
     if (xc_domain_setmaxmem(ctx->xch, domid, info->target_memkb +
         LIBXL_MAXMEM_CONSTANT) < 0) {
@@ -279,7 +304,6 @@ int libxl__build_pre(libxl__gc *gc, uint32_t domid,
 
     state->store_port = xc_evtchn_alloc_unbound(ctx->xch, domid, state->store_domid);
     state->console_port = xc_evtchn_alloc_unbound(ctx->xch, domid, state->console_domid);
-    state->vm_generationid_addr = 0;
 
     if (info->type == LIBXL_DOMAIN_TYPE_HVM)
         hvm_set_conf_params(ctx->xch, domid, info);
@@ -297,7 +321,7 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
     libxl_ctx *ctx = libxl__gc_owner(gc);
     char *dom_path, *vm_path;
     xs_transaction_t t;
-    char **ents, **hvm_ents;
+    char **ents;
     int i, rc;
 
     rc = libxl_domain_sched_params_set(CTX, domid, &info->sched_params);
@@ -314,6 +338,16 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
     libxl_cpuid_apply_policy(ctx, domid);
     if (info->cpuid != NULL)
         libxl_cpuid_set(ctx, domid, info->cpuid);
+
+    if (info->type == LIBXL_DOMAIN_TYPE_HVM
+        && !libxl_ms_vm_genid_is_zero(&info->u.hvm.ms_vm_genid)) {
+        rc = libxl__ms_vm_genid_set(gc, domid,
+                                    &info->u.hvm.ms_vm_genid);
+        if (rc) {
+            LOG(ERROR, "Failed to set VM Generation ID");
+            return rc;
+        }
+    }
 
     ents = libxl__calloc(gc, 12 + (info->max_vcpus * 2) + 2, sizeof(char *));
     ents[0] = "memory/static-max";
@@ -334,13 +368,6 @@ int libxl__build_post(libxl__gc *gc, uint32_t domid,
                             ? "online" : "offline";
     }
 
-    hvm_ents = NULL;
-    if (info->type == LIBXL_DOMAIN_TYPE_HVM) {
-        hvm_ents = libxl__calloc(gc, 3, sizeof(char *));
-        hvm_ents[0] = "hvmloader/generation-id-address";
-        hvm_ents[1] = GCSPRINTF("0x%lx", state->vm_generationid_addr);
-    }
-
     dom_path = libxl__xs_get_dompath(gc, domid);
     if (!dom_path) {
         return ERROR_FAIL;
@@ -351,9 +378,6 @@ retry_transaction:
     t = xs_transaction_start(ctx->xsh);
 
     libxl__xs_writev(gc, t, dom_path, ents);
-    if (info->type == LIBXL_DOMAIN_TYPE_HVM)
-        libxl__xs_writev(gc, t, dom_path, hvm_ents);
-
     libxl__xs_writev(gc, t, dom_path, local_ents);
     libxl__xs_writev(gc, t, vm_path, vms_ents);
 
@@ -490,6 +514,7 @@ static int hvm_build_set_params(xc_interface *handle, uint32_t domid,
 {
     struct hvm_info_table *va_hvm;
     uint8_t *va_map, sum;
+    uint64_t str_mfn, cons_mfn;
     int i;
 
     va_map = xc_map_foreign_range(handle, domid,
@@ -508,10 +533,13 @@ static int hvm_build_set_params(xc_interface *handle, uint32_t domid,
     va_hvm->checksum -= sum;
     munmap(va_map, XC_PAGE_SIZE);
 
-    xc_get_hvm_param(handle, domid, HVM_PARAM_STORE_PFN, store_mfn);
-    xc_get_hvm_param(handle, domid, HVM_PARAM_CONSOLE_PFN, console_mfn);
-    xc_set_hvm_param(handle, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
-    xc_set_hvm_param(handle, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
+    xc_hvm_param_get(handle, domid, HVM_PARAM_STORE_PFN, &str_mfn);
+    xc_hvm_param_get(handle, domid, HVM_PARAM_CONSOLE_PFN, &cons_mfn);
+    xc_hvm_param_set(handle, domid, HVM_PARAM_STORE_EVTCHN, store_evtchn);
+    xc_hvm_param_set(handle, domid, HVM_PARAM_CONSOLE_EVTCHN, console_evtchn);
+
+    *store_mfn = str_mfn;
+    *console_mfn = cons_mfn;
 
     xc_dom_gnttab_hvm_seed(handle, domid, *console_mfn, *store_mfn, console_domid, store_domid);
     return 0;
@@ -1070,15 +1098,15 @@ static void domain_suspend_callback_common(libxl__egc *egc,
                                            libxl__domain_suspend_state *dss)
 {
     STATE_AO_GC(dss->ao);
-    unsigned long hvm_s_state = 0, hvm_pvdrv = 0;
+    uint64_t hvm_s_state = 0, hvm_pvdrv = 0;
     int ret, rc;
 
     /* Convenience aliases */
     const uint32_t domid = dss->domid;
 
     if (dss->hvm) {
-        xc_get_hvm_param(CTX->xch, domid, HVM_PARAM_CALLBACK_IRQ, &hvm_pvdrv);
-        xc_get_hvm_param(CTX->xch, domid, HVM_PARAM_ACPI_S_STATE, &hvm_s_state);
+        xc_hvm_param_get(CTX->xch, domid, HVM_PARAM_CALLBACK_IRQ, &hvm_pvdrv);
+        xc_hvm_param_get(CTX->xch, domid, HVM_PARAM_ACPI_S_STATE, &hvm_s_state);
     }
 
     if ((hvm_s_state == 0) && (dss->guest_evtchn.port >= 0)) {
@@ -1451,18 +1479,22 @@ static void remus_domain_suspend_callback_common_done(libxl__egc *egc,
     libxl__xc_domain_saverestore_async_callback_done(egc, &dss->shs, ok);
 }
 
-static int libxl__remus_domain_resume_callback(void *data)
+static void libxl__remus_domain_resume_callback(void *data)
 {
+    int ok = 0;
     libxl__save_helper_state *shs = data;
+    libxl__egc *egc = shs->egc;
     libxl__domain_suspend_state *dss = CONTAINER_OF(shs, *dss, shs);
     STATE_AO_GC(dss->ao);
 
     /* Resumes the domain and the device model */
     if (libxl__domain_resume(gc, dss->domid, /* Fast Suspend */1))
-        return 0;
+        goto out;
 
     /* REMUS TODO: Deal with disk. Start a new network output buffer */
-    return 1;
+    ok = 1;
+out:
+    libxl__xc_domain_saverestore_async_callback_done(egc, shs, ok);
 }
 
 /*----- remus asynchronous checkpoint callback -----*/
@@ -1502,7 +1534,6 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
     STATE_AO_GC(dss->ao);
     int port;
     int rc = ERROR_FAIL;
-    unsigned long vm_generationid_addr;
 
     /* Convenience aliases */
     const uint32_t domid = dss->domid;
@@ -1521,19 +1552,10 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
 
     switch (type) {
     case LIBXL_DOMAIN_TYPE_HVM: {
-        char *path;
-        char *addr;
-
-        path = GCSPRINTF("%s/hvmloader/generation-id-address",
-                              libxl__xs_get_dompath(gc, domid));
-        addr = libxl__xs_read(gc, XBT_NULL, path);
-
-        vm_generationid_addr = (addr) ? strtoul(addr, NULL, 0) : 0;
         dss->hvm = 1;
         break;
     }
     case LIBXL_DOMAIN_TYPE_PV:
-        vm_generationid_addr = 0;
         dss->hvm = 0;
         break;
     default:
@@ -1580,7 +1602,7 @@ void libxl__domain_suspend(libxl__egc *egc, libxl__domain_suspend_state *dss)
     callbacks->switch_qemu_logdirty = libxl__domain_suspend_common_switch_qemu_logdirty;
     dss->shs.callbacks.save.toolstack_save = libxl__toolstack_save;
 
-    libxl__xc_domain_save(egc, dss, vm_generationid_addr);
+    libxl__xc_domain_save(egc, dss);
     return;
 
  out:

@@ -118,15 +118,15 @@ int __init check_nmi_watchdog (void)
 {
     static unsigned int __initdata prev_nmi_count[NR_CPUS];
     int cpu;
-    
+    bool_t ok = 1;
+
     if ( !nmi_watchdog )
         return 0;
 
-    printk("Testing NMI watchdog --- ");
+    printk("Testing NMI watchdog on all CPUs:");
 
     for_each_online_cpu ( cpu )
         prev_nmi_count[cpu] = nmi_count(cpu);
-    local_irq_enable();
 
     /* Wait for 10 ticks.  Busy-wait on all CPUs: the LAPIC counter that
      * the NMI watchdog uses only runs while the core's not halted */
@@ -137,12 +137,13 @@ int __init check_nmi_watchdog (void)
     for_each_online_cpu ( cpu )
     {
         if ( nmi_count(cpu) - prev_nmi_count[cpu] <= 5 )
-            printk("CPU#%d stuck. ", cpu);
-        else
-            printk("CPU#%d okay. ", cpu);
+        {
+            printk(" %d", cpu);
+            ok = 0;
+        }
     }
 
-    printk("\n");
+    printk(" %s\n", ok ? "ok" : "stuck");
 
     /*
      * Now that we know it works we can reduce NMI frequency to
@@ -431,7 +432,7 @@ int __init watchdog_setup(void)
     return 0;
 }
 
-void nmi_watchdog_tick(struct cpu_user_regs * regs)
+void nmi_watchdog_tick(const struct cpu_user_regs *regs)
 {
     unsigned int sum = this_cpu(nmi_timer_ticks);
 

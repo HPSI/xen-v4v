@@ -24,6 +24,7 @@
 #include "../config.h"
 #include "../util.h"
 #include <xen/hvm/hvm_xs_strings.h>
+#include <xen/hvm/params.h>
 
 #define ACPI_MAX_SECONDARY_TABLES 16
 
@@ -51,6 +52,7 @@ struct acpi_info {
     uint32_t madt_csum_addr;    /* 12   - Address of MADT checksum */
     uint32_t madt_lapic0_addr;  /* 16   - Address of first MADT LAPIC struct */
     uint32_t vm_gid_addr;       /* 20   - Address of VM generation id buffer */
+    uint64_t pci_hi_min, pci_hi_len; /* 24, 32 - PCI I/O hole boundaries */
 };
 
 /* Number of processor objects in the chosen DSDT. */
@@ -361,7 +363,6 @@ static int construct_secondary_tables(unsigned long *table_ptrs,
 static int new_vm_gid(struct acpi_info *acpi_info)
 {
     uint64_t vm_gid[2], *buf;
-    char addr[12];
     const char * s;
     char *end;
 
@@ -382,12 +383,9 @@ static int new_vm_gid(struct acpi_info *acpi_info)
         return 0;
     memcpy(buf, vm_gid, sizeof(vm_gid));
 
-    /* set into ACPI table and XenStore the address */
+    /* set into ACPI table and HVM param the address */
     acpi_info->vm_gid_addr = virt_to_phys(buf);
-    if ( snprintf(addr, sizeof(addr), "0x%lx", virt_to_phys(buf))
-         >= sizeof(addr) )
-        return 0;
-    xenstore_write("hvmloader/generation-id-address", addr);
+    hvm_param_set(HVM_PARAM_VM_GENERATION_ID_ADDR, acpi_info->vm_gid_addr);
 
     return 1;
 }
@@ -525,6 +523,11 @@ void acpi_build_tables(struct acpi_config *config, unsigned int physical)
     acpi_info->hpet_present = hpet_exists(ACPI_HPET_ADDRESS);
     acpi_info->pci_min = pci_mem_start;
     acpi_info->pci_len = pci_mem_end - pci_mem_start;
+    if ( pci_hi_mem_end > pci_hi_mem_start )
+    {
+        acpi_info->pci_hi_min = pci_hi_mem_start;
+        acpi_info->pci_hi_len = pci_hi_mem_end - pci_hi_mem_start;
+    }
 
     return;
 

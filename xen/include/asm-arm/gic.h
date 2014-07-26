@@ -18,69 +18,72 @@
 #ifndef __ASM_ARM_GIC_H__
 #define __ASM_ARM_GIC_H__
 
-#define GICD_CTLR       (0x000/4)
-#define GICD_TYPER      (0x004/4)
-#define GICD_IIDR       (0x008/4)
-#define GICD_IGROUPR    (0x080/4)
-#define GICD_IGROUPRN   (0x0FC/4)
-#define GICD_ISENABLER  (0x100/4)
-#define GICD_ISENABLERN (0x17C/4)
-#define GICD_ICENABLER  (0x180/4)
-#define GICD_ICENABLERN (0x1fC/4)
-#define GICD_ISPENDR    (0x200/4)
-#define GICD_ISPENDRN   (0x27C/4)
-#define GICD_ICPENDR    (0x280/4)
-#define GICD_ICPENDRN   (0x2FC/4)
-#define GICD_ISACTIVER  (0x300/4)
-#define GICD_ISACTIVERN (0x37C/4)
-#define GICD_ICACTIVER  (0x380/4)
-#define GICD_ICACTIVERN (0x3FC/4)
-#define GICD_IPRIORITYR (0x400/4)
-#define GICD_IPRIORITYRN (0x7F8/4)
-#define GICD_ITARGETSR  (0x800/4)
-#define GICD_ITARGETSRN (0xBF8/4)
-#define GICD_ICFGR      (0xC00/4)
-#define GICD_ICFGRN     (0xCFC/4)
-#define GICD_NSACR      (0xE00/4)
-#define GICD_NSACRN     (0xEFC/4)
-#define GICD_SGIR       (0xF00/4)
-#define GICD_CPENDSGIR  (0xF10/4)
-#define GICD_CPENDSGIRN (0xF1C/4)
-#define GICD_SPENDSGIR  (0xF20/4)
-#define GICD_SPENDSGIRN (0xF2C/4)
-#define GICD_ICPIDR2    (0xFE8/4)
+#define GICD_CTLR       (0x000)
+#define GICD_TYPER      (0x004)
+#define GICD_IIDR       (0x008)
+#define GICD_IGROUPR    (0x080)
+#define GICD_IGROUPRN   (0x0FC)
+#define GICD_ISENABLER  (0x100)
+#define GICD_ISENABLERN (0x17C)
+#define GICD_ICENABLER  (0x180)
+#define GICD_ICENABLERN (0x1fC)
+#define GICD_ISPENDR    (0x200)
+#define GICD_ISPENDRN   (0x27C)
+#define GICD_ICPENDR    (0x280)
+#define GICD_ICPENDRN   (0x2FC)
+#define GICD_ISACTIVER  (0x300)
+#define GICD_ISACTIVERN (0x37C)
+#define GICD_ICACTIVER  (0x380)
+#define GICD_ICACTIVERN (0x3FC)
+#define GICD_IPRIORITYR (0x400)
+#define GICD_IPRIORITYRN (0x7F8)
+#define GICD_ITARGETSR  (0x800)
+#define GICD_ITARGETSRN (0xBF8)
+#define GICD_ICFGR      (0xC00)
+#define GICD_ICFGRN     (0xCFC)
+#define GICD_NSACR      (0xE00)
+#define GICD_NSACRN     (0xEFC)
+#define GICD_SGIR       (0xF00)
+#define GICD_CPENDSGIR  (0xF10)
+#define GICD_CPENDSGIRN (0xF1C)
+#define GICD_SPENDSGIR  (0xF20)
+#define GICD_SPENDSGIRN (0xF2C)
+#define GICD_ICPIDR2    (0xFE8)
 
 #define GICD_SGI_TARGET_LIST_SHIFT   (24)
 #define GICD_SGI_TARGET_LIST_MASK    (0x3UL << GICD_SGI_TARGET_LIST_SHIFT)
 #define GICD_SGI_TARGET_LIST         (0UL<<GICD_SGI_TARGET_LIST_SHIFT)
+#define GICD_SGI_TARGET_LIST_VAL     (0)
 #define GICD_SGI_TARGET_OTHERS       (1UL<<GICD_SGI_TARGET_LIST_SHIFT)
+#define GICD_SGI_TARGET_OTHERS_VAL   (1)
 #define GICD_SGI_TARGET_SELF         (2UL<<GICD_SGI_TARGET_LIST_SHIFT)
+#define GICD_SGI_TARGET_SELF_VAL     (2)
 #define GICD_SGI_TARGET_SHIFT        (16)
 #define GICD_SGI_TARGET_MASK         (0xFFUL<<GICD_SGI_TARGET_SHIFT)
 #define GICD_SGI_GROUP1              (1UL<<15)
 #define GICD_SGI_INTID_MASK          (0xFUL)
 
-#define GICC_CTLR       (0x0000/4)
-#define GICC_PMR        (0x0004/4)
-#define GICC_BPR        (0x0008/4)
-#define GICC_IAR        (0x000C/4)
-#define GICC_EOIR       (0x0010/4)
-#define GICC_RPR        (0x0014/4)
-#define GICC_HPPIR      (0x0018/4)
-#define GICC_APR        (0x00D0/4)
-#define GICC_NSAPR      (0x00E0/4)
-#define GICC_DIR        (0x1000/4)
+#define GICC_CTLR       (0x0000)
+#define GICC_PMR        (0x0004)
+#define GICC_BPR        (0x0008)
+#define GICC_IAR        (0x000C)
+#define GICC_EOIR       (0x0010)
+#define GICC_RPR        (0x0014)
+#define GICC_HPPIR      (0x0018)
+#define GICC_APR        (0x00D0)
+#define GICC_NSAPR      (0x00E0)
+#define GICC_DIR        (0x1000)
 
-#define GICH_HCR        (0x00/4)
-#define GICH_VTR        (0x04/4)
-#define GICH_VMCR       (0x08/4)
-#define GICH_MISR       (0x10/4)
-#define GICH_EISR0      (0x20/4)
-#define GICH_EISR1      (0x24/4)
-#define GICH_ELSR0      (0x30/4)
-#define GICH_ELSR1      (0x34/4)
-#define GICH_APR        (0xF0/4)
-#define GICH_LR         (0x100/4)
+#define GICH_HCR        (0x00)
+#define GICH_VTR        (0x04)
+#define GICH_VMCR       (0x08)
+#define GICH_MISR       (0x10)
+#define GICH_EISR0      (0x20)
+#define GICH_EISR1      (0x24)
+#define GICH_ELSR0      (0x30)
+#define GICH_ELSR1      (0x34)
+#define GICH_APR        (0xF0)
+#define GICH_LR         (0x100)
 
 /* Register bits */
 #define GICD_CTL_ENABLE 0x1
@@ -114,21 +117,6 @@
 #define GICH_MISR_VGRP1E  (1 << 6)
 #define GICH_MISR_VGRP1D  (1 << 7)
 
-#define GICH_LR_VIRTUAL_MASK    0x3ff
-#define GICH_LR_VIRTUAL_SHIFT   0
-#define GICH_LR_PHYSICAL_MASK   0x3ff
-#define GICH_LR_PHYSICAL_SHIFT  10
-#define GICH_LR_STATE_MASK      0x3
-#define GICH_LR_STATE_SHIFT     28
-#define GICH_LR_PRIORITY_SHIFT  23
-#define GICH_LR_MAINTENANCE_IRQ (1<<19)
-#define GICH_LR_PENDING         (1<<28)
-#define GICH_LR_ACTIVE          (1<<29)
-#define GICH_LR_GRP1            (1<<30)
-#define GICH_LR_HW              (1<<31)
-#define GICH_LR_CPUID_SHIFT     9
-#define GICH_VTR_NRLRGS         0x3f
-
 /*
  * The minimum GICC_BPR is required to be in the range 0-3. We set
  * GICC_BPR to 0 but we must expect that it might be 3. This means we
@@ -149,41 +137,78 @@
 #define GIC_PRI_IRQ        0xa0
 #define GIC_PRI_IPI        0x90 /* IPIs must preempt normal interrupts */
 #define GIC_PRI_HIGHEST    0x80 /* Higher priorities belong to Secure-World */
+#define GIC_PRI_TO_GUEST(pri) (pri >> 3) /* GICH_LR and GICH_VMCR only support
+                                            5 bits for guest irq priority */
 
+#define GICH_LR_PENDING         1
+#define GICH_LR_ACTIVE          2
 
 #ifndef __ASSEMBLY__
 #include <xen/device_tree.h>
+#include <xen/irq.h>
+#include <asm-arm/vgic.h>
 
-#define DT_MATCH_GIC    DT_MATCH_COMPATIBLE("arm,cortex-a15-gic"), \
-                        DT_MATCH_COMPATIBLE("arm,cortex-a7-gic")
+#define DT_COMPAT_GIC_CORTEX_A15     "arm,cortex-a15-gic"
+#define DT_COMPAT_GIC_CORTEX_A7      "arm,cortex-a7-gic"
 
-extern int domain_vgic_init(struct domain *d);
-extern void domain_vgic_free(struct domain *d);
+#define DT_MATCH_GIC_V2 DT_MATCH_COMPATIBLE(DT_COMPAT_GIC_CORTEX_A15), \
+                        DT_MATCH_COMPATIBLE(DT_COMPAT_GIC_CORTEX_A7)
 
-extern int vcpu_vgic_init(struct vcpu *v);
+/*
+ * GICv2 register that needs to be saved/restored
+ * on VCPU context switch
+ */
+struct gic_v2 {
+    uint32_t hcr;
+    uint32_t vmcr;
+    uint32_t apr;
+    uint32_t lr[64];
+};
 
-extern void vgic_vcpu_inject_irq(struct vcpu *v, unsigned int irq,int virtual);
-extern void vgic_clear_pending_irqs(struct vcpu *v);
-extern struct pending_irq *irq_to_pending(struct vcpu *v, unsigned int irq);
+/*
+ * Union to hold underlying hw version context information
+ */
+union gic_state_data {
+    struct gic_v2 v2;
+};
 
-/* Program the GIC to route an interrupt with a dt_irq */
-extern void gic_route_dt_irq(const struct dt_irq *irq,
-                             const cpumask_t *cpu_mask,
-                             unsigned int priority);
-extern void gic_route_ppis(void);
-extern void gic_route_spis(void);
+/*
+ * Decode LR register content.
+ * The LR register format is different for GIC HW version
+ */
+struct gic_lr {
+   /* Physical IRQ */
+   uint32_t pirq;
+   /* Virtual IRQ */
+   uint32_t virq;
+   uint8_t priority;
+   uint8_t state;
+   uint8_t hw_status;
+   uint8_t grp;
+};
+
+enum gic_version {
+    GIC_V2,
+};
+
+extern enum gic_version gic_hw_version(void);
+
+/* Program the GIC to route an interrupt */
+extern void gic_route_irq_to_xen(struct irq_desc *desc, const cpumask_t *cpu_mask,
+                                 unsigned int priority);
+extern void gic_route_irq_to_guest(struct domain *, struct irq_desc *desc,
+                                   const cpumask_t *cpu_mask,
+                                   unsigned int priority);
 
 extern void gic_inject(void);
 extern void gic_clear_pending_irqs(struct vcpu *v);
 extern int gic_events_need_delivery(void);
 
 extern void __cpuinit init_maintenance_interrupt(void);
-extern void gic_set_guest_irq(struct vcpu *v, unsigned int irq,
-        unsigned int state, unsigned int priority);
+extern void gic_raise_guest_irq(struct vcpu *v, unsigned int irq,
+        unsigned int priority);
+extern void gic_raise_inflight_irq(struct vcpu *v, unsigned int virtual_irq);
 extern void gic_remove_from_queues(struct vcpu *v, unsigned int virtual_irq);
-extern int gic_route_irq_to_guest(struct domain *d,
-                                  const struct dt_irq *irq,
-                                  const char * devname);
 
 /* Accept an interrupt from the GIC and dispatch its handler */
 extern void gic_interrupt(struct cpu_user_regs *regs, int is_fiq);
@@ -206,6 +231,14 @@ enum gic_sgi {
     GIC_SGI_DUMP_STATE  = 1,
     GIC_SGI_CALL_FUNCTION = 2,
 };
+
+/* SGI irq mode types */
+enum gic_sgi_mode {
+    SGI_TARGET_LIST,
+    SGI_TARGET_OTHERS,
+    SGI_TARGET_SELF,
+};
+
 extern void send_SGI_mask(const cpumask_t *cpumask, enum gic_sgi sgi);
 extern void send_SGI_one(unsigned int cpu, enum gic_sgi sgi);
 extern void send_SGI_self(enum gic_sgi sgi);
@@ -220,6 +253,72 @@ extern unsigned int gic_number_lines(void);
 /* IRQ translation function for the device tree */
 int gic_irq_xlate(const u32 *intspec, unsigned int intsize,
                   unsigned int *out_hwirq, unsigned int *out_type);
+void gic_clear_lrs(struct vcpu *v);
+
+struct gic_info {
+    /* GIC version */
+    enum gic_version hw_version;
+    /* Number of GIC lines supported */
+    unsigned int nr_lines;
+    /* Number of LR registers */
+    uint8_t nr_lrs;
+    /* Maintenance irq number */
+    unsigned int maintenance_irq;
+};
+
+struct gic_hw_operations {
+    /* Hold GIC HW information */
+    const struct gic_info *info;
+    /* Save GIC registers */
+    void (*save_state)(struct vcpu *);
+    /* Restore GIC registers */
+    void (*restore_state)(const struct vcpu *);
+    /* Dump GIC LR register information */
+    void (*dump_state)(const struct vcpu *);
+    /* Map MMIO region of GIC */
+    int (*gicv_setup)(struct domain *);
+
+    /* hw_irq_controller to enable/disable/eoi host irq */
+    hw_irq_controller *gic_host_irq_type;
+
+    /* hw_irq_controller to enable/disable/eoi guest irq */
+    hw_irq_controller *gic_guest_irq_type;
+
+    /* End of Interrupt */
+    void (*eoi_irq)(struct irq_desc *irqd);
+    /* Deactivate/reduce priority of irq */
+    void (*deactivate_irq)(struct irq_desc *irqd);
+    /* Read IRQ id and Ack */
+    unsigned int (*read_irq)(void);
+    /* Set IRQ property */
+    void (*set_irq_properties)(struct irq_desc *desc,
+                               const cpumask_t *cpu_mask,
+                               unsigned int priority);
+    /* Send SGI */
+    void (*send_SGI)(enum gic_sgi sgi, enum gic_sgi_mode irqmode,
+                     const cpumask_t *online_mask);
+    /* Disable CPU physical and virtual interfaces */
+    void (*disable_interface)(void);
+    /* Update LR register with state and priority */
+    void (*update_lr)(int lr, const struct pending_irq *pending_irq,
+                      unsigned int state);
+    /* Update HCR status register */
+    void (*update_hcr_status)(uint32_t flag, bool_t set);
+    /* Clear LR register */
+    void (*clear_lr)(int lr);
+    /* Read LR register and populate gic_lr structure */
+    void (*read_lr)(int lr, struct gic_lr *);
+    /* Write LR register from gic_lr structure */
+    void (*write_lr)(int lr, const struct gic_lr *);
+    /* Read VMCR priority */
+    unsigned int (*read_vmcr_priority)(void);
+    /* Read APRn register */
+    unsigned int (*read_apr)(int apr_reg);
+    /* Secondary CPU init */
+    int (*secondary_init)(void);
+};
+
+void register_gic_ops(const struct gic_hw_operations *ops);
 
 #endif /* __ASSEMBLY__ */
 #endif

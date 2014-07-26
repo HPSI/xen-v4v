@@ -3,6 +3,7 @@
 
 #include <stdarg.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <xen/xen.h>
 #include <xen/hvm/hvm_info_table.h>
 
@@ -174,7 +175,6 @@ int printf(const char *fmt, ...) __attribute__ ((format (printf, 1, 2)));
 int vprintf(const char *fmt, va_list ap);
 
 /* Buffer output */
-typedef unsigned long size_t;
 int snprintf(char *buf, size_t size, const char *fmt, ...) __attribute__ ((format (printf, 3, 4)));
 
 /* Populate specified memory hole with RAM. */
@@ -209,6 +209,15 @@ const char *xenstore_read(const char *path, const char *default_resp);
  * zero on success or a xenstore error code on failure.
  */
 int xenstore_write(const char *path, const char *value);
+
+
+/* Get a HVM param.
+ */
+int hvm_param_get(uint32_t index, uint64_t *value);
+
+/* Set a HVM param.
+ */
+int hvm_param_set(uint32_t index, uint64_t value);
 
 /* Setup PCI bus */
 void pci_setup(void);

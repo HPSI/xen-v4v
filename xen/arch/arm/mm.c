@@ -845,7 +845,7 @@ static int create_xen_entries(enum xenmap_operation op,
                 BUG();
         }
     }
-    flush_xen_data_tlb_range_va_local(virt, PAGE_SIZE * nr_mfns);
+    flush_xen_data_tlb_range_va(virt, PAGE_SIZE * nr_mfns);
 
     rc = 0;
 
@@ -994,6 +994,7 @@ int xenmem_add_to_physmap_one(
     unsigned long mfn = 0;
     int rc;
     p2m_type_t t;
+    struct page_info *page = NULL;
 
     switch ( space )
     {
@@ -1041,7 +1042,6 @@ int xenmem_add_to_physmap_one(
     case XENMAPSPACE_gmfn_foreign:
     {
         struct domain *od;
-        struct page_info *page;
         p2m_type_t p2mt;
         od = rcu_lock_domain_by_any_id(foreign_domid);
         if ( od == NULL )
@@ -1090,6 +1090,14 @@ int xenmem_add_to_physmap_one(
 
     /* Map at new location. */
     rc = guest_physmap_add_entry(d, gpfn, mfn, 0, t);
+
+    /* If we fail to add the mapping, we need to drop the reference we
+     * took earlier on foreign pages */
+    if ( rc && space == XENMAPSPACE_gmfn_foreign )
+    {
+        ASSERT(page != NULL);
+        put_page(page);
+    }
 
     return rc;
 }
@@ -1235,6 +1243,16 @@ int is_iomem_page(unsigned long mfn)
         return 1;
     return 0;
 }
+
+void clear_and_clean_page(struct page_info *page)
+{
+    void *p = __map_domain_page(page);
+
+    clear_page(p);
+    clean_xen_dcache_va_range(p, PAGE_SIZE);
+    unmap_domain_page(p);
+}
+
 /*
  * Local variables:
  * mode: C

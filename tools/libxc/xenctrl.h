@@ -119,6 +119,16 @@ typedef struct xc_interface_core xc_interface;
 typedef struct xc_interface_core xc_evtchn;
 typedef struct xc_interface_core xc_gnttab;
 typedef struct xc_interface_core xc_gntshr;
+
+enum xc_error_code {
+  XC_ERROR_NONE = 0,
+  XC_INTERNAL_ERROR = 1,
+  XC_INVALID_KERNEL = 2,
+  XC_INVALID_PARAM = 3,
+  XC_OUT_OF_MEMORY = 4,
+  /* new codes need to be added to xc_error_level_to_desc too */
+};
+
 typedef enum xc_error_code xc_error_code;
 
 
@@ -262,6 +272,24 @@ typedef struct xc_hypercall_buffer xc_hypercall_buffer_t;
     xc_hypercall_buffer_t XC__HYPERCALL_BUFFER_NAME(_name) = { \
         .hbuf = NULL,                                          \
         .param_shadow = NULL,                                  \
+        HYPERCALL_BUFFER_INIT_NO_BOUNCE                        \
+    }
+
+/*
+ * Like DECLARE_HYPERCALL_BUFFER() but using an already allocated
+ * hypercall buffer, _hbuf.
+ *
+ * Useful when a hypercall buffer is passed to a function and access
+ * via the user pointer is required.
+ *
+ * See DECLARE_HYPERCALL_BUFFER_ARGUMENT() if the user pointer is not
+ * required.
+ */
+#define DECLARE_HYPERCALL_BUFFER_SHADOW(_type, _name, _hbuf)   \
+    _type *_name = _hbuf->hbuf;                                \
+    xc_hypercall_buffer_t XC__HYPERCALL_BUFFER_NAME(_name) = { \
+        .hbuf = (void *)-1,                                    \
+        .param_shadow = _hbuf,                                 \
         HYPERCALL_BUFFER_INIT_NO_BOUNCE                        \
     }
 
@@ -582,14 +610,65 @@ int xc_domain_node_getaffinity(xc_interface *xch,
                                uint32_t domind,
                                xc_nodemap_t nodemap);
 
+/**
+ * This function specifies the CPU affinity for a vcpu.
+ *
+ * There are two kinds of affinity. Soft affinity is on what CPUs a vcpu
+ * prefers to run. Hard affinity is on what CPUs a vcpu is allowed to run.
+ * If flags contains XEN_VCPUAFFINITY_SOFT, the soft affinity it is set to
+ * what cpumap_soft_inout contains. If flags contains XEN_VCPUAFFINITY_HARD,
+ * the hard affinity is set to what cpumap_hard_inout contains. Both flags
+ * can be set at the same time, in which case both soft and hard affinity are
+ * set to what the respective parameter contains.
+ *
+ * The function also returns the effective hard or/and soft affinity, still
+ * via the cpumap_soft_inout and cpumap_hard_inout parameters. Effective
+ * affinity is, in case of soft affinity, the intersection of soft affinity,
+ * hard affinity and the cpupool's online CPUs for the domain, and is returned
+ * in cpumap_soft_inout, if XEN_VCPUAFFINITY_SOFT is set in flags. In case of
+ * hard affinity, it is the intersection between hard affinity and the
+ * cpupool's online CPUs, and is returned in cpumap_hard_inout, if
+ * XEN_VCPUAFFINITY_HARD is set in flags. If both flags are set, both soft
+ * and hard affinity are returned in the respective parameter.
+ *
+ * We do report it back as effective affinity is what the Xen scheduler will
+ * actually use, and we thus allow checking whether or not that matches with,
+ * or at least is good enough for, the caller's purposes.
+ *
+ * @param xch a handle to an open hypervisor interface.
+ * @param domid the id of the domain to which the vcpu belongs
+ * @param vcpu the vcpu id wihin the domain
+ * @param cpumap_hard_inout specifies(/returns) the (effective) hard affinity
+ * @param cpumap_soft_inout specifies(/returns) the (effective) soft affinity
+ * @param flags what we want to set
+ */
 int xc_vcpu_setaffinity(xc_interface *xch,
                         uint32_t domid,
                         int vcpu,
-                        xc_cpumap_t cpumap);
+                        xc_cpumap_t cpumap_hard_inout,
+                        xc_cpumap_t cpumap_soft_inout,
+                        uint32_t flags);
+
+/**
+ * This function retrieves hard and soft CPU affinity of a vcpu,
+ * depending on what flags are set.
+ *
+ * Soft affinity is returned in cpumap_soft if XEN_VCPUAFFINITY_SOFT is set.
+ * Hard affinity is returned in cpumap_hard if XEN_VCPUAFFINITY_HARD is set.
+ *
+ * @param xch a handle to an open hypervisor interface.
+ * @param domid the id of the domain to which the vcpu belongs
+ * @param vcpu the vcpu id wihin the domain
+ * @param cpumap_hard is where hard affinity is returned
+ * @param cpumap_soft is where soft affinity is returned
+ * @param flags what we want get
+ */
 int xc_vcpu_getaffinity(xc_interface *xch,
                         uint32_t domid,
                         int vcpu,
-                        xc_cpumap_t cpumap);
+                        xc_cpumap_t cpumap_hard,
+                        xc_cpumap_t cpumap_soft,
+                        uint32_t flags);
 
 
 /**
@@ -1393,8 +1472,14 @@ int xc_get_pfn_list(xc_interface *xch, uint32_t domid, uint64_t *pfn_buf,
 int xc_copy_to_domain_page(xc_interface *xch, uint32_t domid,
                            unsigned long dst_pfn, const char *src_page);
 
-int xc_clear_domain_page(xc_interface *xch, uint32_t domid,
-                         unsigned long dst_pfn);
+int xc_clear_domain_pages(xc_interface *xch, uint32_t domid,
+                          unsigned long dst_pfn, int num);
+
+static inline int xc_clear_domain_page(xc_interface *xch, uint32_t domid,
+                                       unsigned long dst_pfn)
+{
+    return xc_clear_domain_pages(xch, domid, dst_pfn, 1);
+}
 
 int xc_mmuext_op(xc_interface *xch, struct mmuext_op *op, unsigned int nr_ops,
                  domid_t dom);
@@ -1742,15 +1827,6 @@ int xc_hvm_inject_trap(
  */
 
 
-enum xc_error_code {
-  XC_ERROR_NONE = 0,
-  XC_INTERNAL_ERROR = 1,
-  XC_INVALID_KERNEL = 2,
-  XC_INVALID_PARAM = 3,
-  XC_OUT_OF_MEMORY = 4,
-  /* new codes need to be added to xc_error_level_to_desc too */
-};
-
 #define XC_MAX_ERROR_MSG_LEN 1024
 typedef struct xc_error {
   enum xc_error_code code;
@@ -1783,9 +1859,155 @@ const xc_error *xc_get_last_error(xc_interface *handle);
  */
 void xc_clear_last_error(xc_interface *xch);
 
+int xc_hvm_param_set(xc_interface *handle, domid_t dom, uint32_t param, uint64_t value);
+int xc_hvm_param_get(xc_interface *handle, domid_t dom, uint32_t param, uint64_t *value);
 
+/* Deprecated: use xc_hvm_param_set/get() instead. */
 int xc_set_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long value);
 int xc_get_hvm_param(xc_interface *handle, domid_t dom, int param, unsigned long *value);
+
+/*
+ * IOREQ Server API. (See section on IOREQ Servers in public/hvm_op.h).
+ */
+
+/**
+ * This function instantiates an IOREQ Server.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm handle_bufioreq should the IOREQ Server handle buffered requests?
+ * @parm id pointer to an ioservid_t to receive the IOREQ Server id.
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_create_ioreq_server(xc_interface *xch,
+                               domid_t domid,
+                               int handle_bufioreq,
+                               ioservid_t *id);
+
+/**
+ * This function retrieves the necessary information to allow an
+ * emulator to use an IOREQ Server.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm ioreq_pfn pointer to a xen_pfn_t to receive the synchronous ioreq gmfn
+ * @parm bufioreq_pfn pointer to a xen_pfn_t to receive the buffered ioreq gmfn
+ * @parm bufioreq_port pointer to a evtchn_port_t to receive the buffered ioreq event channel
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_get_ioreq_server_info(xc_interface *xch,
+                                 domid_t domid,
+                                 ioservid_t id,
+                                 xen_pfn_t *ioreq_pfn,
+                                 xen_pfn_t *bufioreq_pfn,
+                                 evtchn_port_t *bufioreq_port);
+
+/**
+ * This function sets IOREQ Server state. An IOREQ Server
+ * will not be passed emulation requests until it is in
+ * the enabled state.
+ * Note that the contents of the ioreq_pfn and bufioreq_pfn are
+ * not meaningful until the IOREQ Server is in the enabled state.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm enabled the state.
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_set_ioreq_server_state(xc_interface *xch,
+                                  domid_t domid,
+                                  ioservid_t id,
+                                  int enabled);
+
+/**
+ * This function registers a range of memory or I/O ports for emulation.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm is_mmio is this a range of ports or memory
+ * @parm start start of range
+ * @parm end end of range (inclusive).
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_map_io_range_to_ioreq_server(xc_interface *xch,
+                                        domid_t domid,
+                                        ioservid_t id,
+                                        int is_mmio,
+                                        uint64_t start,
+                                        uint64_t end);
+
+/**
+ * This function deregisters a range of memory or I/O ports for emulation.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm is_mmio is this a range of ports or memory
+ * @parm start start of range
+ * @parm end end of range (inclusive).
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_unmap_io_range_from_ioreq_server(xc_interface *xch,
+                                            domid_t domid,
+                                            ioservid_t id,
+                                            int is_mmio,
+                                            uint64_t start,
+                                            uint64_t end);
+
+/**
+ * This function registers a PCI device for config space emulation.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm segment the PCI segment of the device
+ * @parm bus the PCI bus of the device
+ * @parm device the 'slot' number of the device
+ * @parm function the function number of the device
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_map_pcidev_to_ioreq_server(xc_interface *xch,
+                                      domid_t domid,
+                                      ioservid_t id,
+                                      uint16_t segment,
+                                      uint8_t bus,
+                                      uint8_t device,
+                                      uint8_t function);
+
+/**
+ * This function deregisters a PCI device for config space emulation.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @parm segment the PCI segment of the device
+ * @parm bus the PCI bus of the device
+ * @parm device the 'slot' number of the device
+ * @parm function the function number of the device
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_unmap_pcidev_from_ioreq_server(xc_interface *xch,
+                                          domid_t domid,
+                                          ioservid_t id,
+                                          uint16_t segment,
+                                          uint8_t bus,
+                                          uint8_t device,
+                                          uint8_t function);
+
+/**
+ * This function destroys an IOREQ Server.
+ *
+ * @parm xch a handle to an open hypervisor interface.
+ * @parm domid the domain id to be serviced
+ * @parm id the IOREQ Server id.
+ * @return 0 on success, -1 on failure.
+ */
+int xc_hvm_destroy_ioreq_server(xc_interface *xch,
+                                domid_t domid,
+                                ioservid_t id);
 
 /* HVM guest pass-through */
 int xc_assign_device(xc_interface *xch,
@@ -2015,15 +2237,6 @@ void xc_tmem_save_done(xc_interface *xch, int dom);
 int xc_tmem_restore(xc_interface *xch, int dom, int fd);
 int xc_tmem_restore_extra(xc_interface *xch, int dom, int fd);
 
-/**
- * mem_event operations. Internal use only.
- */
-int xc_mem_event_control(xc_interface *xch, domid_t domain_id, unsigned int op,
-                         unsigned int mode, uint32_t *port);
-int xc_mem_event_memop(xc_interface *xch, domid_t domain_id, 
-                        unsigned int op, unsigned int mode,
-                        uint64_t gfn, void *buffer);
-
 /** 
  * Mem paging operations.
  * Paging is supported only on the x86 architecture in 64 bit mode, with
@@ -2043,7 +2256,13 @@ int xc_mem_paging_load(xc_interface *xch, domid_t domain_id,
  * Access tracking operations.
  * Supported only on Intel EPT 64 bit processors.
  */
-int xc_mem_access_enable(xc_interface *xch, domid_t domain_id, uint32_t *port);
+
+/*
+ * Enables mem_access and returns the mapped ring page.
+ * Will return NULL on error.
+ * Caller has to unmap this page when done.
+ */
+void *xc_mem_access_enable(xc_interface *xch, domid_t domain_id, uint32_t *port);
 int xc_mem_access_disable(xc_interface *xch, domid_t domain_id);
 int xc_mem_access_resume(xc_interface *xch, domid_t domain_id);
 
@@ -2425,3 +2644,13 @@ int xc_kexec_load(xc_interface *xch, uint8_t type, uint16_t arch,
 int xc_kexec_unload(xc_interface *xch, int type);
 
 #endif /* XENCTRL_H */
+
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

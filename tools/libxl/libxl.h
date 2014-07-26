@@ -67,6 +67,15 @@
  * the same $(XEN_VERSION) (e.g. throughout a major release).
  */
 
+/* LIBXL_HAVE_CPUPOOL_QUALIFIER_TO_CPUPOOLID
+ *
+ * If this is defined, libxl has a library function called
+ * libxl_cpupool_qualifier_to_cpupoolid, which takes in a CPU pool
+ * qualifier in the form of number or string, then returns the ID of
+ * that CPU pool.
+ */
+#define LIBXL_HAVE_CPUPOOL_QUALIFIER_TO_CPUPOOLID 1
+
 /*
  * LIBXL_HAVE_FIRMWARE_PASSTHROUGH indicates the feature for
  * passing in SMBIOS and ACPI firmware to HVM guests is present
@@ -93,6 +102,30 @@
  * The libxl_domain_build_info has the event_channels field.
  */
 #define LIBXL_HAVE_BUILDINFO_EVENT_CHANNELS 1
+
+/*
+ * libxl_domain_build_info has the u.hvm.ms_vm_genid field.
+ */
+#define LIBXL_HAVE_BUILDINFO_HVM_MS_VM_GENID 1
+
+/*
+ * LIBXL_HAVE_VCPUINFO_SOFT_AFFINITY indicates that a 'cpumap_soft'
+ * field (of libxl_bitmap type) is present in libxl_vcpuinfo,
+ * containing the soft affinity of a vcpu.
+ */
+#define LIBXL_HAVE_VCPUINFO_SOFT_AFFINITY 1
+
+/*
+ * LIBXL_HAVE_DEVICE_DISK_DIRECT_IO_SAFE indicates that a
+ * 'direct_io_safe' field (of boolean type) is present in
+ * libxl_device_disk.
+ */
+#define LIBXL_HAVE_DEVICE_DISK_DIRECT_IO_SAFE 1
+
+/*
+ * The libxl_device_disk has the discard_enable field.
+ */
+#define LIBXL_HAVE_LIBXL_DEVICE_DISK_DISCARD_ENABLE 1
 
 /*
  * libxl ABI compatibility
@@ -233,6 +266,16 @@
  * libxl_types.idl). The library provides a common set of methods for
  * initialising and freeing these types.
  *
+ * IDL-generated libxl types should be used as follows: the user must
+ * always call the "init" function before using a type, even if the
+ * variable is simply being passed by reference as an out parameter
+ * to a libxl function.  The user must always calls "dispose" exactly
+ * once afterwards, to clean up, regardless of whether operations on
+ * this object succeeded or failed.  See the xl code for examples.
+ *
+ * "init" is idempotent.  We intend that "dispose" will become
+ * idempotent, but this is not currently the case.
+ *
  * void libxl_<type>_init(<type> *p):
  *
  *    Initialises the members of "p" to all defaults. These may either
@@ -269,6 +312,25 @@
  *    Frees any dynamically allocated memory used by the members of
  *    "p" but not the storage used by "p" itself (this allows for the
  *    allocation of arrays of types and for the composition of types).
+ *
+ * char *libxl_<type>_to_json(instance *p)
+ *
+ *    Generates a JSON object from "p" in the form of a NULL terminated
+ *    string.
+ *
+ * <type *> libxl_<type>_from_json(const char *json)
+ * int      libxl_<type>_from_json(const char *json)
+ *
+ *    Parses "json" and returns:
+ *
+ *    an int value, if <type> is enumeration type. The value is the enum value
+ *    representing the respective string in "json".
+ *
+ *    an instance of <type>, if <type> is aggregate type. The returned
+ *    instance has its fields filled in by the parser according to "json".
+ *
+ *    If the parsing fails, caller cannot rely on the value / instance
+ *    returned.
  */
 #ifndef LIBXL_H
 #define LIBXL_H
@@ -283,16 +345,43 @@
 
 #include <xentoollog.h>
 
+typedef struct libxl__ctx libxl_ctx;
+
 #include <libxl_uuid.h>
 #include <_libxl_list.h>
 
 /* API compatibility. */
 #ifdef LIBXL_API_VERSION
 #if LIBXL_API_VERSION != 0x040200 && LIBXL_API_VERSION != 0x040300 && \
-    LIBXL_API_VERSION != 0x040400
+    LIBXL_API_VERSION != 0x040400 && LIBXL_API_VERSION != 0x040500
 #error Unknown LIBXL_API_VERSION
 #endif
 #endif
+
+/*
+ * LIBXL_HAVE_BUILDINFO_VCPU_AFFINITY_ARRAYS
+ *
+ * If this is defined, then the libxl_domain_build_info structure will
+ * contain two arrays of libxl_bitmap-s, with all the necessary information
+ * to set the hard affinity (vcpu_hard_affinity) and the soft affinity
+ * (vcpu_soft_affinity) of the VCPUs.
+ *
+ * Note that, if the vcpu_hard_affinity array is used, libxl will ignore
+ * the content of the cpumap field of libxl_domain_build_info. That is to
+ * say, if the array is allocated and used by the caller, it is it and
+ * only it that determines the hard affinity of the domain's VCPUs.
+ *
+ * The number of libxl_bitmap-s in the arrays should be equal to the
+ * maximum number of VCPUs of the domain. If there only are N elements in
+ * an array, with N smaller the the maximum number of VCPUs, the hard or
+ * soft affinity (depending on which array we are talking about) will be
+ * set only for the first N VCPUs. The other VCPUs will just have affinity,
+ * both hard and soft, with all the host PCPUs.
+ * Each bitmap should be big enough to accommodate the maximum number of
+ * PCPUs of the host.
+ */
+/* to be uncommented when soft array added */
+/* #define LIBXL_HAVE_BUILDINFO_VCPU_AFFINITY_ARRAYS 1 */
 
 /*
  * LIBXL_HAVE_BUILDINFO_USBDEVICE_LIST
@@ -462,19 +551,55 @@
 #define LIBXL_EXTERNAL_CALLERS_ONLY /* disappears for callers outside libxl */
 #endif
 
+/*
+ *  LIBXL_HAVE_UUID_COPY_CTX_PARAM
+ *
+ * If this is defined, libxl_uuid_copy has changed to take a libxl_ctx
+ * structure.
+ */
+#define LIBXL_HAVE_UUID_COPY_CTX_PARAM 1
+
+/*
+ * LIBXL_HAVE_SSID_LABEL
+ *
+ * If this is defined, then libxl IDL contains string of XSM security
+ * label in all XSM related structures.
+ *
+ * If set this string takes precedence over the numeric field.
+ */
+#define LIBXL_HAVE_SSID_LABEL 1
+
+/*
+ * LIBXL_HAVE_CPUPOOL_NAME
+ *
+ * If this is defined, then libxl IDL contains string of CPU pool
+ * name in all CPU pool related structures.
+ *
+ * If set this string takes precedence over the numeric field.
+ */
+#define LIBXL_HAVE_CPUPOOL_NAME 1
+
 typedef uint8_t libxl_mac[6];
 #define LIBXL_MAC_FMT "%02hhx:%02hhx:%02hhx:%02hhx:%02hhx:%02hhx"
 #define LIBXL_MAC_FMTLEN ((2*6)+5) /* 6 hex bytes plus 5 colons */
 #define LIBXL_MAC_BYTES(mac) mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+void libxl_mac_copy(libxl_ctx *ctx, libxl_mac *dst, libxl_mac *src);
 
 typedef char **libxl_string_list;
 void libxl_string_list_dispose(libxl_string_list *sl);
 int libxl_string_list_length(const libxl_string_list *sl);
+void libxl_string_list_copy(libxl_ctx *ctx, libxl_string_list *dst,
+                            libxl_string_list *src);
 
 typedef char **libxl_key_value_list;
 void libxl_key_value_list_dispose(libxl_key_value_list *kvl);
+int libxl_key_value_list_length(libxl_key_value_list *kvl);
+void libxl_key_value_list_copy(libxl_ctx *ctx,
+                               libxl_key_value_list *dst,
+                               libxl_key_value_list *src);
 
 typedef uint32_t libxl_hwcap[8];
+void libxl_hwcap_copy(libxl_ctx *ctx, libxl_hwcap *dst, libxl_hwcap *src);
 
 typedef uint64_t libxl_ev_user;
 
@@ -492,6 +617,10 @@ void libxl_bitmap_dispose(libxl_bitmap *map);
 typedef struct libxl__cpuid_policy libxl_cpuid_policy;
 typedef libxl_cpuid_policy * libxl_cpuid_policy_list;
 void libxl_cpuid_dispose(libxl_cpuid_policy_list *cpuid_list);
+int libxl_cpuid_policy_list_length(libxl_cpuid_policy_list *l);
+void libxl_cpuid_policy_list_copy(libxl_ctx *ctx,
+                                  libxl_cpuid_policy_list *dst,
+                                  libxl_cpuid_policy_list *src);
 
 #define LIBXL_PCI_FUNC_ALL (~0U)
 
@@ -536,10 +665,13 @@ bool libxl_defbool_val(libxl_defbool db);
 
 const char *libxl_defbool_to_string(libxl_defbool b);
 
-typedef struct libxl__ctx libxl_ctx;
-
 #define LIBXL_TIMER_MODE_DEFAULT -1
 #define LIBXL_MEMKB_DEFAULT ~0ULL
+
+#define LIBXL_MS_VM_GENID_LEN 16
+typedef struct {
+    uint8_t bytes[LIBXL_MS_VM_GENID_LEN];
+} libxl_ms_vm_genid;
 
 #include "_libxl_types.h"
 
@@ -1070,9 +1202,22 @@ int libxl_userdata_retrieve(libxl_ctx *ctx, uint32_t domid,
 
 int libxl_get_physinfo(libxl_ctx *ctx, libxl_physinfo *physinfo);
 int libxl_set_vcpuaffinity(libxl_ctx *ctx, uint32_t domid, uint32_t vcpuid,
-                           libxl_bitmap *cpumap);
+                           const libxl_bitmap *cpumap_hard,
+                           const libxl_bitmap *cpumap_soft);
 int libxl_set_vcpuaffinity_all(libxl_ctx *ctx, uint32_t domid,
-                               unsigned int max_vcpus, libxl_bitmap *cpumap);
+                               unsigned int max_vcpus,
+                               const libxl_bitmap *cpumap_hard,
+                               const libxl_bitmap *cpumap_soft);
+
+#if defined (LIBXL_API_VERSION) && LIBXL_API_VERSION < 0x040500
+
+#define libxl_set_vcpuaffinity(ctx, domid, vcpuid, map) \
+    libxl_set_vcpuaffinity((ctx), (domid), (vcpuid), (map), NULL)
+#define libxl_set_vcpuaffinity_all(ctx, domid, max_vcpus, map) \
+    libxl_set_vcpuaffinity_all((ctx), (domid), (max_vcpus), (map), NULL)
+
+#endif
+
 int libxl_domain_set_nodeaffinity(libxl_ctx *ctx, uint32_t domid,
                                   libxl_bitmap *nodemap);
 int libxl_domain_get_nodeaffinity(libxl_ctx *ctx, uint32_t domid,
@@ -1150,6 +1295,11 @@ int libxl_flask_sid_to_context(libxl_ctx *ctx, uint32_t ssidref, char **buf,
 int libxl_flask_getenforce(libxl_ctx *ctx);
 int libxl_flask_setenforce(libxl_ctx *ctx, int mode);
 int libxl_flask_loadpolicy(libxl_ctx *ctx, void *policy, uint32_t size);
+
+int libxl_ms_vm_genid_generate(libxl_ctx *ctx, libxl_ms_vm_genid *id);
+bool libxl_ms_vm_genid_is_zero(const libxl_ms_vm_genid *id);
+void libxl_ms_vm_genid_copy(libxl_ctx *ctx, libxl_ms_vm_genid *dst,
+                            libxl_ms_vm_genid *src);
 
 /* misc */
 

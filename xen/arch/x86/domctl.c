@@ -46,6 +46,8 @@ static int gdbsx_guest_mem_io(
     return (iop->remain ? -EFAULT : 0);
 }
 
+#define MAX_IOPORTS 0x10000
+
 long arch_do_domctl(
     struct xen_domctl *domctl, struct domain *d,
     XEN_GUEST_HANDLE_PARAM(xen_domctl_t) u_domctl)
@@ -72,13 +74,11 @@ long arch_do_domctl(
         unsigned int np = domctl->u.ioport_permission.nr_ports;
         int allow = domctl->u.ioport_permission.allow_access;
 
-        ret = -EINVAL;
-        if ( (fp + np) > 65536 )
-            break;
-
-        if ( np == 0 )
-            ret = 0;
-        else if ( xsm_ioport_permission(XSM_HOOK, d, fp, fp + np - 1, allow) )
+        if ( (fp + np) <= fp || (fp + np) > MAX_IOPORTS )
+            ret = -EINVAL;
+        else if ( !ioports_access_permitted(current->domain,
+                                            fp, fp + np - 1) ||
+                  xsm_ioport_permission(XSM_HOOK, d, fp, fp + np - 1, allow) )
             ret = -EPERM;
         else if ( allow )
             ret = ioports_permit_access(d, fp, fp + np - 1);
@@ -719,7 +719,6 @@ long arch_do_domctl(
 
     case XEN_DOMCTL_ioport_mapping:
     {
-#define MAX_IOPORTS    0x10000
         struct hvm_iommu *hd;
         unsigned int fgp = domctl->u.ioport_mapping.first_gport;
         unsigned int fmp = domctl->u.ioport_mapping.first_mport;
@@ -753,7 +752,7 @@ long arch_do_domctl(
                    "ioport_map:add: dom%d gport=%x mport=%x nr=%x\n",
                    d->domain_id, fgp, fmp, np);
 
-            list_for_each_entry(g2m_ioport, &hd->g2m_ioport_list, list)
+            list_for_each_entry(g2m_ioport, &hd->arch.g2m_ioport_list, list)
                 if (g2m_ioport->mport == fmp )
                 {
                     g2m_ioport->gport = fgp;
@@ -772,7 +771,7 @@ long arch_do_domctl(
                 g2m_ioport->gport = fgp;
                 g2m_ioport->mport = fmp;
                 g2m_ioport->np = np;
-                list_add_tail(&g2m_ioport->list, &hd->g2m_ioport_list);
+                list_add_tail(&g2m_ioport->list, &hd->arch.g2m_ioport_list);
             }
             if ( !ret )
                 ret = ioports_permit_access(d, fmp, fmp + np - 1);
@@ -787,7 +786,7 @@ long arch_do_domctl(
             printk(XENLOG_G_INFO
                    "ioport_map:remove: dom%d gport=%x mport=%x nr=%x\n",
                    d->domain_id, fgp, fmp, np);
-            list_for_each_entry(g2m_ioport, &hd->g2m_ioport_list, list)
+            list_for_each_entry(g2m_ioport, &hd->arch.g2m_ioport_list, list)
                 if ( g2m_ioport->mport == fmp )
                 {
                     list_del(&g2m_ioport->list);
@@ -819,7 +818,6 @@ long arch_do_domctl(
     {
         struct xen_domctl_ext_vcpucontext *evc;
         struct vcpu *v;
-        struct xen_domctl_ext_vcpu_msr msr;
 
         evc = &domctl->u.ext_vcpucontext;
 
@@ -865,42 +863,7 @@ long arch_do_domctl(
             evc->vmce.mci_ctl2_bank0 = v->arch.vmce.bank[0].mci_ctl2;
             evc->vmce.mci_ctl2_bank1 = v->arch.vmce.bank[1].mci_ctl2;
 
-            i = ret = 0;
-            if ( boot_cpu_has(X86_FEATURE_DBEXT) )
-            {
-                unsigned int j;
-
-                if ( v->arch.pv_vcpu.dr_mask[0] )
-                {
-                    if ( i < evc->msr_count && !ret )
-                    {
-                        msr.index = MSR_AMD64_DR0_ADDRESS_MASK;
-                        msr.reserved = 0;
-                        msr.value = v->arch.pv_vcpu.dr_mask[0];
-                        if ( copy_to_guest_offset(evc->msrs, i, &msr, 1) )
-                            ret = -EFAULT;
-                    }
-                    ++i;
-                }
-                for ( j = 0; j < 3; ++j )
-                {
-                    if ( !v->arch.pv_vcpu.dr_mask[1 + j] )
-                        continue;
-                    if ( i < evc->msr_count && !ret )
-                    {
-                        msr.index = MSR_AMD64_DR1_ADDRESS_MASK + j;
-                        msr.reserved = 0;
-                        msr.value = v->arch.pv_vcpu.dr_mask[1 + j];
-                        if ( copy_to_guest_offset(evc->msrs, i, &msr, 1) )
-                            ret = -EFAULT;
-                    }
-                    ++i;
-                }
-            }
-            if ( i > evc->msr_count && !ret )
-                ret = -ENOBUFS;
-            evc->msr_count = i;
-
+            ret = 0;
             vcpu_unpause(v);
             copyback = 1;
         }
@@ -955,48 +918,8 @@ long arch_do_domctl(
 
                 ret = vmce_restore_vcpu(v, &vmce);
             }
-            else if ( evc->size > offsetof(typeof(*evc), vmce) )
-                ret = -EINVAL;
             else
                 ret = 0;
-
-            if ( ret || evc->size <= offsetof(typeof(*evc), msrs) )
-                /* nothing */;
-            else if ( evc->size < offsetof(typeof(*evc), msrs) +
-                                  sizeof(evc->msrs) )
-                ret = -EINVAL;
-            else
-            {
-                for ( i = 0; i < evc->msr_count; ++i )
-                {
-                    ret = -EFAULT;
-                    if ( copy_from_guest_offset(&msr, evc->msrs, i, 1) )
-                        break;
-                    ret = -EINVAL;
-                    if ( msr.reserved )
-                        break;
-                    switch ( msr.index )
-                    {
-                    case MSR_AMD64_DR0_ADDRESS_MASK:
-                        if ( !boot_cpu_has(X86_FEATURE_DBEXT) ||
-                             (msr.value >> 32) )
-                            break;
-                        v->arch.pv_vcpu.dr_mask[0] = msr.value;
-                        continue;
-                    case MSR_AMD64_DR1_ADDRESS_MASK ...
-                         MSR_AMD64_DR3_ADDRESS_MASK:
-                        if ( !boot_cpu_has(X86_FEATURE_DBEXT) ||
-                             (msr.value >> 32) )
-                            break;
-                        msr.index -= MSR_AMD64_DR1_ADDRESS_MASK - 1;
-                        v->arch.pv_vcpu.dr_mask[msr.index] = msr.value;
-                        continue;
-                    }
-                    break;
-                }
-                if ( i == evc->msr_count )
-                    ret = 0;
-            }
 
             domain_unpause(d);
         }
@@ -1006,14 +929,18 @@ long arch_do_domctl(
     case XEN_DOMCTL_set_cpuid:
     {
         xen_domctl_cpuid_t *ctl = &domctl->u.cpuid;
-        cpuid_input_t *cpuid = NULL; 
+        cpuid_input_t *cpuid, *unused = NULL;
 
         for ( i = 0; i < MAX_CPUID_INPUT; i++ )
         {
             cpuid = &d->arch.cpuids[i];
 
             if ( cpuid->input[0] == XEN_CPUID_INPUT_UNUSED )
-                break;
+            {
+                if ( !unused )
+                    unused = cpuid;
+                continue;
+            }
 
             if ( (cpuid->input[0] == ctl->input[0]) &&
                  ((cpuid->input[1] == XEN_CPUID_INPUT_UNUSED) ||
@@ -1021,15 +948,12 @@ long arch_do_domctl(
                 break;
         }
         
-        if ( i == MAX_CPUID_INPUT )
-        {
-            ret = -ENOENT;
-        }
+        if ( i < MAX_CPUID_INPUT )
+            *cpuid = *ctl;
+        else if ( unused )
+            *unused = *ctl;
         else
-        {
-            memcpy(cpuid, ctl, sizeof(cpuid_input_t));
-            ret = 0;
-        }
+            ret = -ENOENT;
     }
     break;
 
@@ -1103,7 +1027,7 @@ long arch_do_domctl(
         struct vcpu *v;
 
         ret = -EBUSY;
-        if ( !d->is_paused_by_controller )
+        if ( d->controller_pause_count > 0 )
             break;
         ret = -EINVAL;
         if ( domctl->u.gdbsx_pauseunp_vcpu.vcpu >= MAX_VIRT_CPUS ||
@@ -1119,7 +1043,7 @@ long arch_do_domctl(
         struct vcpu *v;
 
         ret = -EBUSY;
-        if ( !d->is_paused_by_controller )
+        if ( d->controller_pause_count > 0 )
             break;
         ret = -EINVAL;
         if ( domctl->u.gdbsx_pauseunp_vcpu.vcpu >= MAX_VIRT_CPUS ||
@@ -1137,7 +1061,7 @@ long arch_do_domctl(
         struct vcpu *v;
 
         domctl->u.gdbsx_domstatus.vcpu_id = -1;
-        domctl->u.gdbsx_domstatus.paused = d->is_paused_by_controller;
+        domctl->u.gdbsx_domstatus.paused = d->controller_pause_count > 0;
         if ( domctl->u.gdbsx_domstatus.paused )
         {
             for_each_vcpu ( d, v )
@@ -1173,45 +1097,48 @@ long arch_do_domctl(
              ((v = d->vcpu[evc->vcpu]) == NULL) )
             goto vcpuextstate_out;
 
+        ret = -EINVAL;
+        if ( v == current ) /* no vcpu_pause() */
+            goto vcpuextstate_out;
+
         if ( domctl->cmd == XEN_DOMCTL_getvcpuextstate )
         {
-            unsigned int size = PV_XSAVE_SIZE(v->arch.xcr0_accum);
+            unsigned int size;
 
-            if ( !evc->size && !evc->xfeature_mask )
+            ret = 0;
+            vcpu_pause(v);
+
+            size = PV_XSAVE_SIZE(v->arch.xcr0_accum);
+            if ( (!evc->size && !evc->xfeature_mask) ||
+                 guest_handle_is_null(evc->buffer) )
             {
                 evc->xfeature_mask = xfeature_mask;
                 evc->size = size;
-                ret = 0;
+                vcpu_unpause(v);
                 goto vcpuextstate_out;
             }
+
             if ( evc->size != size || evc->xfeature_mask != xfeature_mask )
-            {
                 ret = -EINVAL;
-                goto vcpuextstate_out;
-            }
-            if ( copy_to_guest_offset(domctl->u.vcpuextstate.buffer,
-                                      offset, (void *)&v->arch.xcr0,
-                                      sizeof(v->arch.xcr0)) )
-            {
+
+            if ( !ret && copy_to_guest_offset(evc->buffer, offset,
+                                              (void *)&v->arch.xcr0,
+                                              sizeof(v->arch.xcr0)) )
                 ret = -EFAULT;
-                goto vcpuextstate_out;
-            }
+
             offset += sizeof(v->arch.xcr0);
-            if ( copy_to_guest_offset(domctl->u.vcpuextstate.buffer,
-                                      offset, (void *)&v->arch.xcr0_accum,
-                                      sizeof(v->arch.xcr0_accum)) )
-            {
+            if ( !ret && copy_to_guest_offset(evc->buffer, offset,
+                                              (void *)&v->arch.xcr0_accum,
+                                              sizeof(v->arch.xcr0_accum)) )
                 ret = -EFAULT;
-                goto vcpuextstate_out;
-            }
+
             offset += sizeof(v->arch.xcr0_accum);
-            if ( copy_to_guest_offset(domctl->u.vcpuextstate.buffer,
-                                      offset, (void *)v->arch.xsave_area,
-                                      size - 2 * sizeof(uint64_t)) )
-            {
+            if ( !ret && copy_to_guest_offset(evc->buffer, offset,
+                                              (void *)v->arch.xsave_area,
+                                              size - 2 * sizeof(uint64_t)) )
                 ret = -EFAULT;
-                goto vcpuextstate_out;
-            }
+
+            vcpu_unpause(v);
         }
         else
         {
@@ -1247,8 +1174,7 @@ long arch_do_domctl(
             {
                 if ( evc->size >= 2 * sizeof(uint64_t) + XSTATE_AREA_MIN_SIZE )
                     ret = validate_xstate(_xcr0, _xcr0_accum,
-                                          _xsave_area->xsave_hdr.xstate_bv,
-                                          evc->xfeature_mask);
+                                          _xsave_area->xsave_hdr.xstate_bv);
             }
             else if ( !_xcr0 )
                 ret = 0;
@@ -1260,20 +1186,20 @@ long arch_do_domctl(
 
             if ( evc->size <= PV_XSAVE_SIZE(_xcr0_accum) )
             {
+                vcpu_pause(v);
                 v->arch.xcr0 = _xcr0;
                 v->arch.xcr0_accum = _xcr0_accum;
                 if ( _xcr0_accum & XSTATE_NONLAZY )
                     v->arch.nonlazy_xstate_used = 1;
                 memcpy(v->arch.xsave_area, _xsave_area,
                        evc->size - 2 * sizeof(uint64_t));
+                vcpu_unpause(v);
             }
             else
                 ret = -EINVAL;
 
             xfree(receive_buf);
         }
-
-        ret = 0;
 
     vcpuextstate_out:
         if ( domctl->cmd == XEN_DOMCTL_getvcpuextstate )
@@ -1333,11 +1259,139 @@ long arch_do_domctl(
         unsigned long pfn = domctl->u.set_broken_page_p2m.pfn;
         mfn_t mfn = get_gfn_query(d, pfn, &pt);
 
-        if ( unlikely(!mfn_valid(mfn_x(mfn)) || !p2m_is_ram(pt) ||
-                     (p2m_change_type(d, pfn, pt, p2m_ram_broken) != pt)) )
+        if ( unlikely(!mfn_valid(mfn_x(mfn))) || unlikely(!p2m_is_ram(pt)) )
             ret = -EINVAL;
+        else
+            ret = p2m_change_type_one(d, pfn, pt, p2m_ram_broken);
 
         put_gfn(d, pfn);
+    }
+    break;
+
+    case XEN_DOMCTL_get_vcpu_msrs:
+    case XEN_DOMCTL_set_vcpu_msrs:
+    {
+        struct xen_domctl_vcpu_msrs *vmsrs = &domctl->u.vcpu_msrs;
+        struct xen_domctl_vcpu_msr msr;
+        struct vcpu *v;
+        uint32_t nr_msrs = 0;
+
+        ret = -ESRCH;
+        if ( (vmsrs->vcpu >= d->max_vcpus) ||
+             ((v = d->vcpu[vmsrs->vcpu]) == NULL) )
+            break;
+
+        ret = -EINVAL;
+        if ( (v == current) || /* no vcpu_pause() */
+             !is_pv_domain(d) )
+            break;
+
+        /* Count maximum number of optional msrs. */
+        if ( boot_cpu_has(X86_FEATURE_DBEXT) )
+            nr_msrs += 4;
+
+        if ( domctl->cmd == XEN_DOMCTL_get_vcpu_msrs )
+        {
+            ret = 0; copyback = 1;
+
+            /* NULL guest handle is a request for max size. */
+            if ( guest_handle_is_null(vmsrs->msrs) )
+                vmsrs->msr_count = nr_msrs;
+            else
+            {
+                i = 0;
+
+                vcpu_pause(v);
+
+                if ( boot_cpu_has(X86_FEATURE_DBEXT) )
+                {
+                    unsigned int j;
+
+                    if ( v->arch.pv_vcpu.dr_mask[0] )
+                    {
+                        if ( i < vmsrs->msr_count && !ret )
+                        {
+                            msr.index = MSR_AMD64_DR0_ADDRESS_MASK;
+                            msr.reserved = 0;
+                            msr.value = v->arch.pv_vcpu.dr_mask[0];
+                            if ( copy_to_guest_offset(vmsrs->msrs, i, &msr, 1) )
+                                ret = -EFAULT;
+                        }
+                        ++i;
+                    }
+
+                    for ( j = 0; j < 3; ++j )
+                    {
+                        if ( !v->arch.pv_vcpu.dr_mask[1 + j] )
+                            continue;
+                        if ( i < vmsrs->msr_count && !ret )
+                        {
+                            msr.index = MSR_AMD64_DR1_ADDRESS_MASK + j;
+                            msr.reserved = 0;
+                            msr.value = v->arch.pv_vcpu.dr_mask[1 + j];
+                            if ( copy_to_guest_offset(vmsrs->msrs, i, &msr, 1) )
+                                ret = -EFAULT;
+                        }
+                        ++i;
+                    }
+                }
+
+                vcpu_unpause(v);
+
+                if ( i > vmsrs->msr_count && !ret )
+                    ret = -ENOBUFS;
+                vmsrs->msr_count = i;
+            }
+        }
+        else
+        {
+            ret = -EINVAL;
+            if ( vmsrs->msr_count > nr_msrs )
+                break;
+
+            vcpu_pause(v);
+
+            for ( i = 0; i < vmsrs->msr_count; ++i )
+            {
+                ret = -EFAULT;
+                if ( copy_from_guest_offset(&msr, vmsrs->msrs, i, 1) )
+                    break;
+
+                ret = -EINVAL;
+                if ( msr.reserved )
+                    break;
+
+                switch ( msr.index )
+                {
+                case MSR_AMD64_DR0_ADDRESS_MASK:
+                    if ( !boot_cpu_has(X86_FEATURE_DBEXT) ||
+                         (msr.value >> 32) )
+                        break;
+                    v->arch.pv_vcpu.dr_mask[0] = msr.value;
+                    continue;
+
+                case MSR_AMD64_DR1_ADDRESS_MASK ...
+                    MSR_AMD64_DR3_ADDRESS_MASK:
+                    if ( !boot_cpu_has(X86_FEATURE_DBEXT) ||
+                         (msr.value >> 32) )
+                        break;
+                    msr.index -= MSR_AMD64_DR1_ADDRESS_MASK - 1;
+                    v->arch.pv_vcpu.dr_mask[msr.index] = msr.value;
+                    continue;
+                }
+                break;
+            }
+
+            vcpu_unpause(v);
+
+            if ( i == vmsrs->msr_count )
+                ret = 0;
+            else
+            {
+                vmsrs->msr_count = i;
+                copyback = 1;
+            }
+        }
     }
     break;
 

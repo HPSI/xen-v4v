@@ -16,11 +16,8 @@ SUBDIRS-y += console
 SUBDIRS-y += xenmon
 SUBDIRS-y += xenstat
 SUBDIRS-$(CONFIG_Linux) += memshr 
-ifeq ($(CONFIG_X86)$(CONFIG_Linux),yy)
 SUBDIRS-$(CONFIG_BLKTAP1) += blktap
-endif
-SUBDIRS-$(CONFIG_Linux) += blktap2
-SUBDIRS-$(CONFIG_NetBSD) += blktap2
+SUBDIRS-$(CONFIG_BLKTAP2) += blktap2
 SUBDIRS-$(CONFIG_NetBSD) += xenbackendd
 SUBDIRS-y += libfsimage
 SUBDIRS-$(CONFIG_Linux) += libvchan
@@ -33,7 +30,6 @@ endif
 
 SUBDIRS-y += xenpmd
 SUBDIRS-y += libxl
-SUBDIRS-y += remus
 SUBDIRS-$(CONFIG_X86) += xenpaging
 SUBDIRS-$(CONFIG_X86) += debugger/gdbsx
 SUBDIRS-$(CONFIG_X86) += debugger/kdd
@@ -45,6 +41,10 @@ ifeq ($(XEN_COMPILE_ARCH),$(XEN_TARGET_ARCH))
 SUBDIRS-y += python
 SUBDIRS-y += pygrub
 SUBDIRS-$(OCAML_TOOLS) += ocaml
+endif
+
+ifeq ($(CONFIG_RUMP),y)
+SUBDIRS-y := include libxc xenstore
 endif
 
 # For the sake of linking, set the sys-root
@@ -111,35 +111,35 @@ IOEMU_CONFIGURE_CROSS ?= --cpu=$(XEN_TARGET_ARCH) \
 			 --interp-prefix=$(CROSS_SYS_ROOT)
 endif
 
-QEMU_ROOT := $(shell if [ -d "$(CONFIG_QEMU)" ]; then echo "$(CONFIG_QEMU)"; else echo .; fi)
+QEMU_ROOT := $(shell if [ -d "$(QEMU_TRADITIONAL_LOC)" ]; then echo "$(QEMU_TRADITIONAL_LOC)"; else echo .; fi)
 ifneq ($(QEMU_ROOT),.)
 export QEMU_ROOT
 endif
 
 qemu-xen-traditional-dir-find:
 	set -ex; \
-	if test -d $(CONFIG_QEMU); then \
+	if test -d $(QEMU_TRADITIONAL_LOC); then \
 		mkdir -p qemu-xen-traditional-dir; \
 	else \
 		export GIT=$(GIT); \
-		$(XEN_ROOT)/scripts/git-checkout.sh $(CONFIG_QEMU) $(QEMU_TAG) qemu-xen-traditional-dir; \
+		$(XEN_ROOT)/scripts/git-checkout.sh $(QEMU_TRADITIONAL_LOC) $(QEMU_TRADITIONAL_REVISION) qemu-xen-traditional-dir; \
 	fi
 
 qemu-xen-dir-find:
-	if test -d $(QEMU_UPSTREAM_URL) ; then \
+	if test -d $(QEMU_UPSTREAM_LOC) ; then \
 		mkdir -p qemu-xen-dir; \
 	else \
 		export GIT=$(GIT); \
-		$(XEN_ROOT)/scripts/git-checkout.sh $(QEMU_UPSTREAM_URL) $(QEMU_UPSTREAM_REVISION) qemu-xen-dir ; \
+		$(XEN_ROOT)/scripts/git-checkout.sh $(QEMU_UPSTREAM_LOC) $(QEMU_UPSTREAM_REVISION) qemu-xen-dir ; \
 	fi
 
 .PHONY: qemu-xen-traditional-dir-force-update
-qemu-xen-traditional-dir-force-update:
+qemu-xen-traditional-dir-force-update: qemu-xen-traditional-dir-find
 	set -ex; \
-	if [ "$(QEMU_TAG)" ]; then \
+	if [ "$(QEMU_TRADITIONAL_REVISION)" ]; then \
 		cd qemu-xen-traditional-dir-remote; \
 		$(GIT) fetch origin; \
-		$(GIT) reset --hard $(QEMU_TAG); \
+		$(GIT) reset --hard $(QEMU_TRADITIONAL_REVISION); \
 	fi
 
 subdir-all-qemu-xen-traditional-dir: qemu-xen-traditional-dir-find
@@ -164,7 +164,7 @@ subdir-clean-qemu-xen-traditional-dir:
 	fi
 
 .PHONY: qemu-xen-dir-force-update
-qemu-xen-dir-force-update:
+qemu-xen-dir-force-update: qemu-xen-dir-find
 	set -ex; \
 	if [ "$(QEMU_UPSTREAM_REVISION)" ]; then \
 		cd qemu-xen-dir-remote; \
@@ -179,15 +179,17 @@ QEMU_XEN_ENABLE_DEBUG :=
 endif
 
 subdir-all-qemu-xen-dir: qemu-xen-dir-find
-	if test -d $(QEMU_UPSTREAM_URL) ; then \
-		source=$(QEMU_UPSTREAM_URL); \
+	if test -d $(QEMU_UPSTREAM_LOC) ; then \
+		source=$(QEMU_UPSTREAM_LOC); \
 	else \
 		source=.; \
 	fi; \
 	cd qemu-xen-dir; \
 	$$source/configure --enable-xen --target-list=i386-softmmu \
 		$(QEMU_XEN_ENABLE_DEBUG) \
-		--prefix=$(PREFIX) \
+		--prefix=$(PREFIX)/lib/xen \
+		--libdir=$(PREFIX)/lib/xen/lib \
+		--includedir=$(PREFIX)/lib/xen/include \
 		--source-path=$$source \
 		--extra-cflags="-I$(XEN_ROOT)/tools/include \
 		-I$(XEN_ROOT)/tools/libxc \
@@ -195,7 +197,8 @@ subdir-all-qemu-xen-dir: qemu-xen-dir-find
 		-I$(XEN_ROOT)/tools/xenstore/compat \
 		$(EXTRA_CFLAGS_QEMU_XEN)" \
 		--extra-ldflags="-L$(XEN_ROOT)/tools/libxc \
-		-L$(XEN_ROOT)/tools/xenstore" \
+		-L$(XEN_ROOT)/tools/xenstore \
+		-Wl,-rpath=$(PREFIX)/lib/xen/lib" \
 		--bindir=$(LIBEXEC) \
 		--datadir=$(SHAREDIR)/qemu-xen \
 		--localstatedir=/var \
@@ -203,6 +206,7 @@ subdir-all-qemu-xen-dir: qemu-xen-dir-find
 		--disable-docs \
 		--disable-guest-agent \
 		--python=$(PYTHON) \
+		$(CONFIG_QEMUU_EXTRA_ARGS) \
 		$(IOEMU_CONFIGURE_CROSS); \
 	$(MAKE) all
 

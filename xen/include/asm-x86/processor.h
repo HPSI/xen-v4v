@@ -113,6 +113,7 @@
 #define TRAP_alignment_check  17
 #define TRAP_machine_check    18
 #define TRAP_simd_error       19
+#define TRAP_virtualisation   20
 #define TRAP_last_reserved    31
 
 /* Set for entry via SYSCALL. Informs return code to use SYSRETQ not IRETQ. */
@@ -140,6 +141,12 @@
 #define PFEC_insn_fetch     (1U<<4)
 #define PFEC_page_paged     (1U<<5)
 #define PFEC_page_shared    (1U<<6)
+
+#define XEN_MINIMAL_CR4 (X86_CR4_PSE | X86_CR4_PGE | X86_CR4_PAE)
+
+#define XEN_SYSCALL_MASK (X86_EFLAGS_AC|X86_EFLAGS_VM|X86_EFLAGS_RF|    \
+                          X86_EFLAGS_NT|X86_EFLAGS_DF|X86_EFLAGS_IF|    \
+                          X86_EFLAGS_TF)
 
 #ifndef __ASSEMBLY__
 
@@ -204,14 +211,12 @@ extern void dodgy_tsc(void);
 
 extern void detect_extended_topology(struct cpuinfo_x86 *c);
 
-#ifdef CONFIG_X86_HT
 extern void detect_ht(struct cpuinfo_x86 *c);
-#else
-static always_inline void detect_ht(struct cpuinfo_x86 *c) {}
-#endif
 
 #define cpu_to_core(_cpu)   (cpu_data[_cpu].cpu_core_id)
 #define cpu_to_socket(_cpu) (cpu_data[_cpu].phys_proc_id)
+
+unsigned int apicid_to_socket(unsigned int);
 
 /*
  * Generic CPUID function
@@ -470,48 +475,56 @@ static always_inline void rep_nop(void)
 
 #define cpu_relax() rep_nop()
 
-void show_stack(struct cpu_user_regs *regs);
+void show_stack(const struct cpu_user_regs *regs);
 void show_stack_overflow(unsigned int cpu, const struct cpu_user_regs *regs);
-void show_registers(struct cpu_user_regs *regs);
-void show_execution_state(struct cpu_user_regs *regs);
+void show_registers(const struct cpu_user_regs *regs);
+void show_execution_state(const struct cpu_user_regs *regs);
 #define dump_execution_state() run_in_exception_handler(show_execution_state)
 void show_page_walk(unsigned long addr);
-void noreturn fatal_trap(int trapnr, struct cpu_user_regs *regs);
+void noreturn fatal_trap(int trapnr, const struct cpu_user_regs *regs);
 
-void compat_show_guest_stack(struct vcpu *, struct cpu_user_regs *, int lines);
+void compat_show_guest_stack(struct vcpu *v,
+                             const struct cpu_user_regs *regs, int lines);
 
 extern void mtrr_ap_init(void);
 extern void mtrr_bp_init(void);
 
 void mcheck_init(struct cpuinfo_x86 *c, bool_t bsp);
 
-#define DECLARE_TRAP_HANDLER(_name)                     \
-void _name(void);                            \
-void do_ ## _name(struct cpu_user_regs *regs)
+#define DECLARE_TRAP_HANDLER(_name)                    \
+    void _name(void);                                  \
+    void do_ ## _name(struct cpu_user_regs *regs)
+#define DECLARE_TRAP_HANDLER_CONST(_name)              \
+    void _name(void);                                  \
+    void do_ ## _name(const struct cpu_user_regs *regs)
+
 DECLARE_TRAP_HANDLER(divide_error);
 DECLARE_TRAP_HANDLER(debug);
-DECLARE_TRAP_HANDLER(nmi);
+DECLARE_TRAP_HANDLER_CONST(nmi);
 DECLARE_TRAP_HANDLER(int3);
 DECLARE_TRAP_HANDLER(overflow);
 DECLARE_TRAP_HANDLER(bounds);
 DECLARE_TRAP_HANDLER(invalid_op);
 DECLARE_TRAP_HANDLER(device_not_available);
-DECLARE_TRAP_HANDLER(coprocessor_segment_overrun);
+DECLARE_TRAP_HANDLER(double_fault);
 DECLARE_TRAP_HANDLER(invalid_TSS);
 DECLARE_TRAP_HANDLER(segment_not_present);
 DECLARE_TRAP_HANDLER(stack_segment);
 DECLARE_TRAP_HANDLER(general_protection);
 DECLARE_TRAP_HANDLER(page_fault);
+DECLARE_TRAP_HANDLER(early_page_fault);
 DECLARE_TRAP_HANDLER(coprocessor_error);
 DECLARE_TRAP_HANDLER(simd_coprocessor_error);
-DECLARE_TRAP_HANDLER(machine_check);
+DECLARE_TRAP_HANDLER_CONST(machine_check);
 DECLARE_TRAP_HANDLER(alignment_check);
-DECLARE_TRAP_HANDLER(spurious_interrupt_bug);
+
+#undef DECLARE_TRAP_HANDLER_CONST
 #undef DECLARE_TRAP_HANDLER
 
 void trap_nop(void);
 void enable_nmis(void);
 void noreturn do_nmi_crash(struct cpu_user_regs *regs);
+void do_reserved_trap(struct cpu_user_regs *regs);
 
 void syscall_enter(void);
 void sysenter_entry(void);

@@ -14,6 +14,9 @@ struct irqaction {
     const char *name;
     void *dev_id;
     bool_t free_on_release;
+#ifdef CONFIG_IRQ_HAS_MULTIPLE_ACTION
+    struct irqaction *next;
+#endif
 };
 
 /*
@@ -27,6 +30,7 @@ struct irqaction {
 #define IRQ_MOVE_PENDING  (1u<<5) /* IRQ is migrating to another CPUs */
 #define IRQ_PER_CPU       (1u<<6) /* IRQ is per CPU */
 #define IRQ_GUEST_EOI_PENDING (1u<<7) /* IRQ was disabled, pending a guest EOI */
+#define IRQF_SHARED       (1<<8)  /* IRQ is shared */
 
 /* Special IRQ numbers. */
 #define AUTO_ASSIGN_IRQ         (-1)
@@ -89,9 +93,10 @@ int arch_init_one_irq_desc(struct irq_desc *);
 
 #define irq_desc_initialized(desc) ((desc)->handler != NULL)
 
-extern int setup_irq(unsigned int irq, struct irqaction *);
-extern void release_irq(unsigned int irq);
-extern int request_irq(unsigned int irq,
+extern int setup_irq(unsigned int irq, unsigned int irqflags,
+                     struct irqaction *);
+extern void release_irq(unsigned int irq, const void *dev_id);
+extern int request_irq(unsigned int irq, unsigned int irqflags,
                void (*handler)(int, void *, struct cpu_user_regs *),
                const char * devname, void *dev_id);
 

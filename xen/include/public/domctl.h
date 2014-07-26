@@ -300,8 +300,33 @@ DEFINE_XEN_GUEST_HANDLE(xen_domctl_nodeaffinity_t);
 /* XEN_DOMCTL_setvcpuaffinity */
 /* XEN_DOMCTL_getvcpuaffinity */
 struct xen_domctl_vcpuaffinity {
-    uint32_t  vcpu;              /* IN */
-    struct xenctl_bitmap cpumap; /* IN/OUT */
+    /* IN variables. */
+    uint32_t  vcpu;
+ /* Set/get the hard affinity for vcpu */
+#define _XEN_VCPUAFFINITY_HARD  0
+#define XEN_VCPUAFFINITY_HARD   (1U<<_XEN_VCPUAFFINITY_HARD)
+ /* Set/get the soft affinity for vcpu */
+#define _XEN_VCPUAFFINITY_SOFT  1
+#define XEN_VCPUAFFINITY_SOFT   (1U<<_XEN_VCPUAFFINITY_SOFT)
+    uint32_t flags;
+    /*
+     * IN/OUT variables.
+     *
+     * Both are IN/OUT for XEN_DOMCTL_setvcpuaffinity, in which case they
+     * contain effective hard or/and soft affinity. That is, upon successful
+     * return, cpumap_soft, contains the intersection of the soft affinity,
+     * hard affinity and the cpupool's online CPUs for the domain (if
+     * XEN_VCPUAFFINITY_SOFT was set in flags). cpumap_hard contains the
+     * intersection between hard affinity and the cpupool's online CPUs (if
+     * XEN_VCPUAFFINITY_HARD was set in flags).
+     *
+     * Both are OUT-only for XEN_DOMCTL_getvcpuaffinity, in which case they
+     * contain the plain hard and/or soft affinity masks that were set during
+     * previous successful calls to XEN_DOMCTL_setvcpuaffinity (or the
+     * default values), without intersecting or altering them in any way.
+     */
+    struct xenctl_bitmap cpumap_hard;
+    struct xenctl_bitmap cpumap_soft;
 };
 typedef struct xen_domctl_vcpuaffinity xen_domctl_vcpuaffinity_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_vcpuaffinity_t);
@@ -401,19 +426,6 @@ typedef struct xen_domctl_hypercall_init xen_domctl_hypercall_init_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_hypercall_init_t);
 
 
-/* XEN_DOMCTL_arch_setup */
-#define _XEN_DOMAINSETUP_hvm_guest 0
-#define XEN_DOMAINSETUP_hvm_guest  (1UL<<_XEN_DOMAINSETUP_hvm_guest)
-#define _XEN_DOMAINSETUP_query 1 /* Get parameters (for save)  */
-#define XEN_DOMAINSETUP_query  (1UL<<_XEN_DOMAINSETUP_query)
-#define _XEN_DOMAINSETUP_sioemu_guest 2
-#define XEN_DOMAINSETUP_sioemu_guest  (1UL<<_XEN_DOMAINSETUP_sioemu_guest)
-typedef struct xen_domctl_arch_setup {
-    uint64_aligned_t flags;  /* XEN_DOMAINSETUP_* */
-} xen_domctl_arch_setup_t;
-DEFINE_XEN_GUEST_HANDLE(xen_domctl_arch_setup_t);
-
-
 /* XEN_DOMCTL_settimeoffset */
 struct xen_domctl_settimeoffset {
     int32_t  time_offset_seconds; /* applied to domain wallclock time */
@@ -438,14 +450,6 @@ typedef struct xen_domctl_address_size {
     uint32_t size;
 } xen_domctl_address_size_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_address_size_t);
-
-
-/* XEN_DOMCTL_real_mode_area */
-struct xen_domctl_real_mode_area {
-    uint32_t log; /* log2 of Real Mode Area size */
-};
-typedef struct xen_domctl_real_mode_area xen_domctl_real_mode_area_t;
-DEFINE_XEN_GUEST_HANDLE(xen_domctl_real_mode_area_t);
 
 
 /* XEN_DOMCTL_sendtrigger */
@@ -564,16 +568,6 @@ typedef struct xen_domctl_pin_mem_cacheattr xen_domctl_pin_mem_cacheattr_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_pin_mem_cacheattr_t);
 
 
-#if defined(__i386__) || defined(__x86_64__)
-struct xen_domctl_ext_vcpu_msr {
-    uint32_t         index;
-    uint32_t         reserved;
-    uint64_aligned_t value;
-};
-typedef struct xen_domctl_ext_vcpu_msr xen_domctl_ext_vcpu_msr_t;
-DEFINE_XEN_GUEST_HANDLE(xen_domctl_ext_vcpu_msr_t);
-#endif
-
 /* XEN_DOMCTL_set_ext_vcpucontext */
 /* XEN_DOMCTL_get_ext_vcpucontext */
 struct xen_domctl_ext_vcpucontext {
@@ -593,14 +587,6 @@ struct xen_domctl_ext_vcpucontext {
     uint16_t         sysenter_callback_cs;
     uint8_t          syscall32_disables_events;
     uint8_t          sysenter_disables_events;
-    /*
-     * When, for the "get" version, msr_count is too small to cover all MSRs
-     * the hypervisor needs to be saved, the call will return -ENOBUFS and
-     * set msr_count to the required (minimum) value. Furthermore, for both
-     * "get" and "set", that field as well as the msrs one only get looked at
-     * if the size field above covers the structure up to the entire msrs one.
-     */
-    uint16_t         msr_count;
 #if defined(__GNUC__)
     union {
         uint64_aligned_t mcg_cap;
@@ -609,7 +595,6 @@ struct xen_domctl_ext_vcpucontext {
 #else
     struct hvm_vmce_vcpu vmce;
 #endif
-    XEN_GUEST_HANDLE_64(xen_domctl_ext_vcpu_msr_t) msrs;
 #endif
 };
 typedef struct xen_domctl_ext_vcpucontext xen_domctl_ext_vcpucontext_t;
@@ -860,7 +845,7 @@ struct xen_domctl_vcpuextstate {
     /* IN: VCPU that this call applies to. */
     uint32_t         vcpu;
     /*
-     * SET: xfeature support mask of struct (IN)
+     * SET: Ignored.
      * GET: xfeature support mask of struct (IN/OUT)
      * xfeature mask is served as identifications of the saving format
      * so that compatible CPUs can have a check on format to decide
@@ -916,6 +901,41 @@ struct xen_domctl_cacheflush {
 typedef struct xen_domctl_cacheflush xen_domctl_cacheflush_t;
 DEFINE_XEN_GUEST_HANDLE(xen_domctl_cacheflush_t);
 
+#if defined(__i386__) || defined(__x86_64__)
+struct xen_domctl_vcpu_msr {
+    uint32_t         index;
+    uint32_t         reserved;
+    uint64_aligned_t value;
+};
+typedef struct xen_domctl_vcpu_msr xen_domctl_vcpu_msr_t;
+DEFINE_XEN_GUEST_HANDLE(xen_domctl_vcpu_msr_t);
+
+/*
+ * XEN_DOMCTL_set_vcpu_msrs / XEN_DOMCTL_get_vcpu_msrs.
+ *
+ * Input:
+ * - A NULL 'msrs' guest handle is a request for the maximum 'msr_count'.
+ * - Otherwise, 'msr_count' is the number of entries in 'msrs'.
+ *
+ * Output for get:
+ * - If 'msr_count' is less than the number Xen needs to write, -ENOBUFS shall
+ *   be returned and 'msr_count' updated to reflect the intended number.
+ * - On success, 'msr_count' shall indicate the number of MSRs written, which
+ *   may be less than the maximum if some are not currently used by the vcpu.
+ *
+ * Output for set:
+ * - If Xen encounters an error with a specific MSR, -EINVAL shall be returned
+ *   and 'msr_count' shall be set to the offending index, to aid debugging.
+ */
+struct xen_domctl_vcpu_msrs {
+    uint32_t vcpu;                                   /* IN     */
+    uint32_t msr_count;                              /* IN/OUT */
+    XEN_GUEST_HANDLE_64(xen_domctl_vcpu_msr_t) msrs; /* IN/OUT */
+};
+typedef struct xen_domctl_vcpu_msrs xen_domctl_vcpu_msrs_t;
+DEFINE_XEN_GUEST_HANDLE(xen_domctl_vcpu_msrs_t);
+#endif
+
 struct xen_domctl {
     uint32_t cmd;
 #define XEN_DOMCTL_createdomain                   1
@@ -940,10 +960,10 @@ struct xen_domctl {
 #define XEN_DOMCTL_iomem_permission              20
 #define XEN_DOMCTL_ioport_permission             21
 #define XEN_DOMCTL_hypercall_init                22
-#define XEN_DOMCTL_arch_setup                    23
+#define XEN_DOMCTL_arch_setup                    23 /* Obsolete IA64 only */
 #define XEN_DOMCTL_settimeoffset                 24
 #define XEN_DOMCTL_getvcpuaffinity               25
-#define XEN_DOMCTL_real_mode_area                26
+#define XEN_DOMCTL_real_mode_area                26 /* Obsolete PPC only */
 #define XEN_DOMCTL_resumedomain                  27
 #define XEN_DOMCTL_sendtrigger                   28
 #define XEN_DOMCTL_subscribe                     29
@@ -986,6 +1006,8 @@ struct xen_domctl {
 #define XEN_DOMCTL_getnodeaffinity               69
 #define XEN_DOMCTL_set_max_evtchn                70
 #define XEN_DOMCTL_cacheflush                    71
+#define XEN_DOMCTL_get_vcpu_msrs                 72
+#define XEN_DOMCTL_set_vcpu_msrs                 73
 #define XEN_DOMCTL_gdbsx_guestmemio            1000
 #define XEN_DOMCTL_gdbsx_pausevcpu             1001
 #define XEN_DOMCTL_gdbsx_unpausevcpu           1002
@@ -1013,11 +1035,9 @@ struct xen_domctl {
         struct xen_domctl_iomem_permission  iomem_permission;
         struct xen_domctl_ioport_permission ioport_permission;
         struct xen_domctl_hypercall_init    hypercall_init;
-        struct xen_domctl_arch_setup        arch_setup;
         struct xen_domctl_settimeoffset     settimeoffset;
         struct xen_domctl_disable_migrate   disable_migrate;
         struct xen_domctl_tsc_info          tsc_info;
-        struct xen_domctl_real_mode_area    real_mode_area;
         struct xen_domctl_hvmcontext        hvmcontext;
         struct xen_domctl_hvmcontext_partial hvmcontext_partial;
         struct xen_domctl_address_size      address_size;
@@ -1037,6 +1057,7 @@ struct xen_domctl {
 #if defined(__i386__) || defined(__x86_64__)
         struct xen_domctl_cpuid             cpuid;
         struct xen_domctl_vcpuextstate      vcpuextstate;
+        struct xen_domctl_vcpu_msrs         vcpu_msrs;
 #endif
         struct xen_domctl_set_access_required access_required;
         struct xen_domctl_audit_p2m         audit_p2m;

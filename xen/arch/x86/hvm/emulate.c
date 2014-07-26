@@ -53,28 +53,21 @@ static int hvmemul_do_io(
     int is_mmio, paddr_t addr, unsigned long *reps, int size,
     paddr_t ram_gpa, int dir, int df, void *p_data)
 {
-    paddr_t value = ram_gpa;
-    int value_is_ptr = (p_data == NULL);
     struct vcpu *curr = current;
     struct hvm_vcpu_io *vio;
-    ioreq_t *p = get_ioreq(curr);
-    ioreq_t _ioreq;
+    ioreq_t p = {
+        .type = is_mmio ? IOREQ_TYPE_COPY : IOREQ_TYPE_PIO,
+        .addr = addr,
+        .size = size,
+        .dir = dir,
+        .df = df,
+        .data = ram_gpa,
+        .data_is_ptr = (p_data == NULL),
+    };
     unsigned long ram_gfn = paddr_to_pfn(ram_gpa);
     p2m_type_t p2mt;
     struct page_info *ram_page;
     int rc;
-    bool_t has_dm = 1;
-
-    /*
-     * Domains without a backing DM, don't have an ioreq page.  Just
-     * point to a struct on the stack, initialising the state as needed.
-     */
-    if ( !p )
-    {
-        has_dm = 0;
-        p = &_ioreq;
-        p->state = STATE_IOREQ_NONE;
-    }
 
     /* Check for paged out page */
     ram_page = get_page_from_gfn(curr->domain, ram_gfn, &p2mt, P2M_UNSHARE);
@@ -107,15 +100,15 @@ static int hvmemul_do_io(
         return X86EMUL_UNHANDLEABLE;
     }
 
-    if ( (p_data != NULL) && (dir == IOREQ_WRITE) )
+    if ( !p.data_is_ptr && (dir == IOREQ_WRITE) )
     {
-        memcpy(&value, p_data, size);
+        memcpy(&p.data, p_data, size);
         p_data = NULL;
     }
 
     vio = &curr->arch.hvm_vcpu.hvm_io;
 
-    if ( is_mmio && !value_is_ptr )
+    if ( is_mmio && !p.data_is_ptr )
     {
         /* Part of a multi-cycle read or write? */
         if ( dir == IOREQ_WRITE )
@@ -159,7 +152,7 @@ static int hvmemul_do_io(
         goto finish_access;
     case HVMIO_dispatched:
         /* May have to wait for previous cycle of a multi-write to complete. */
-        if ( is_mmio && !value_is_ptr && (dir == IOREQ_WRITE) &&
+        if ( is_mmio && !p.data_is_ptr && (dir == IOREQ_WRITE) &&
              (addr == (vio->mmio_large_write_pa +
                        vio->mmio_large_write_bytes)) )
         {
@@ -173,10 +166,9 @@ static int hvmemul_do_io(
         return X86EMUL_UNHANDLEABLE;
     }
 
-    if ( p->state != STATE_IOREQ_NONE )
+    if ( hvm_io_pending(curr) )
     {
-        gdprintk(XENLOG_WARNING, "WARNING: io already pending (%d)?\n",
-                 p->state);
+        gdprintk(XENLOG_WARNING, "WARNING: io already pending?\n");
         if ( ram_page )
             put_page(ram_page);
         return X86EMUL_UNHANDLEABLE;
@@ -193,38 +185,31 @@ static int hvmemul_do_io(
     if ( vio->mmio_retrying )
         *reps = 1;
 
-    p->dir = dir;
-    p->data_is_ptr = value_is_ptr;
-    p->type = is_mmio ? IOREQ_TYPE_COPY : IOREQ_TYPE_PIO;
-    p->size = size;
-    p->addr = addr;
-    p->count = *reps;
-    p->df = df;
-    p->data = value;
+    p.count = *reps;
 
     if ( dir == IOREQ_WRITE )
-        hvmtrace_io_assist(is_mmio, p);
+        hvmtrace_io_assist(is_mmio, &p);
 
     if ( is_mmio )
     {
-        rc = hvm_mmio_intercept(p);
+        rc = hvm_mmio_intercept(&p);
         if ( rc == X86EMUL_UNHANDLEABLE )
-            rc = hvm_buffered_io_intercept(p);
+            rc = hvm_buffered_io_intercept(&p);
     }
     else
     {
-        rc = hvm_portio_intercept(p);
+        rc = hvm_portio_intercept(&p);
     }
 
     switch ( rc )
     {
     case X86EMUL_OKAY:
     case X86EMUL_RETRY:
-        *reps = p->count;
-        p->state = STATE_IORESP_READY;
+        *reps = p.count;
+        p.state = STATE_IORESP_READY;
         if ( !vio->mmio_retry )
         {
-            hvm_io_assist(p);
+            hvm_io_assist(&p);
             vio->io_state = HVMIO_none;
         }
         else
@@ -233,7 +218,7 @@ static int hvmemul_do_io(
         break;
     case X86EMUL_UNHANDLEABLE:
         /* If there is no backing DM, just ignore accesses */
-        if ( !has_dm )
+        if ( !hvm_has_dm(curr->domain) )
         {
             rc = X86EMUL_OKAY;
             vio->io_state = HVMIO_none;
@@ -241,7 +226,7 @@ static int hvmemul_do_io(
         else
         {
             rc = X86EMUL_RETRY;
-            if ( !hvm_send_assist_req(curr) )
+            if ( !hvm_send_assist_req(&p) )
                 vio->io_state = HVMIO_none;
             else if ( p_data == NULL )
                 rc = X86EMUL_OKAY;
@@ -260,12 +245,12 @@ static int hvmemul_do_io(
 
  finish_access:
     if ( dir == IOREQ_READ )
-        hvmtrace_io_assist(is_mmio, p);
+        hvmtrace_io_assist(is_mmio, &p);
 
     if ( p_data != NULL )
         memcpy(p_data, &vio->io_data, size);
 
-    if ( is_mmio && !value_is_ptr )
+    if ( is_mmio && !p.data_is_ptr )
     {
         /* Part of a multi-cycle read or write? */
         if ( dir == IOREQ_WRITE )
@@ -1292,3 +1277,13 @@ struct segment_register *hvmemul_get_seg_reg(
         hvm_get_segment_register(current, seg, &hvmemul_ctxt->seg_reg[seg]);
     return &hvmemul_ctxt->seg_reg[seg];
 }
+
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

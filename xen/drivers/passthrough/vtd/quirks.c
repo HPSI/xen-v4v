@@ -117,7 +117,7 @@ static void __init snb_errata_init(void)
  */
 static void __init map_igd_reg(void)
 {
-    u64 igd_mmio, igd_reg;
+    u64 igd_mmio;
 
     if ( !is_cantiga_b3 && !is_snb_gfx )
         return;
@@ -125,16 +125,10 @@ static void __init map_igd_reg(void)
     if ( igd_reg_va )
         return;
 
-    /* get IGD mmio address in PCI BAR */
-    igd_mmio = ((u64)pci_conf_read32(0, 0, IGD_DEV, 0, 0x14) << 32) +
-                     pci_conf_read32(0, 0, IGD_DEV, 0, 0x10);
-
-    /* offset of IGD regster we want to access is in 0x2000 range */
-    igd_reg = (igd_mmio & IGD_BAR_MASK) + 0x2000;
-
-    /* ioremap this physical page */
-    set_fixmap_nocache(FIX_IGD_MMIO, igd_reg);
-    igd_reg_va = (u8 *)fix_to_virt(FIX_IGD_MMIO);
+    igd_mmio   = pci_conf_read32(0, 0, IGD_DEV, 0, PCI_BASE_ADDRESS_1);
+    igd_mmio <<= 32;
+    igd_mmio  += pci_conf_read32(0, 0, IGD_DEV, 0, PCI_BASE_ADDRESS_0);
+    igd_reg_va = ioremap(igd_mmio & IGD_BAR_MASK, 0x3000);
 }
 
 /*
@@ -152,12 +146,10 @@ static int cantiga_vtd_ops_preamble(struct iommu* iommu)
         return 0;
 
     /*
-     * read IGD register at IGD MMIO + 0x20A4 to force IGD
-     * to exit low power state.  Since map_igd_reg()
-     * already mapped page starting 0x2000, we just need to
-     * add page offset 0x0A4 to virtual address base.
+     * Read IGD register at IGD MMIO + 0x20A4 to force IGD
+     * to exit low power state.
      */
-    return ( *((volatile int *)(igd_reg_va + 0x0A4)) );
+    return *(volatile int *)(igd_reg_va + 0x20A4);
 }
 
 /*
@@ -179,11 +171,11 @@ static void snb_vtd_ops_preamble(struct iommu* iommu)
     if ( !igd_reg_va )
         return;
 
-    *((volatile u32 *)(igd_reg_va + 0x54)) = 0x000FFFFF;
-    *((volatile u32 *)(igd_reg_va + 0x700)) = 0;
+    *(volatile u32 *)(igd_reg_va + 0x2054) = 0x000FFFFF;
+    *(volatile u32 *)(igd_reg_va + 0x2700) = 0;
 
     start_time = NOW();
-    while ( (*((volatile u32 *)(igd_reg_va + 0x2AC)) & 0xF) != 0 )
+    while ( (*(volatile u32 *)(igd_reg_va + 0x22AC) & 0xF) != 0 )
     {
         if ( NOW() > start_time + DMAR_OPERATION_TIMEOUT )
         {
@@ -194,7 +186,7 @@ static void snb_vtd_ops_preamble(struct iommu* iommu)
         cpu_relax();
     }
 
-    *((volatile u32*)(igd_reg_va + 0x50)) = 0x10001;
+    *(volatile u32 *)(igd_reg_va + 0x2050) = 0x10001;
 }
 
 static void snb_vtd_ops_postamble(struct iommu* iommu)
@@ -208,8 +200,8 @@ static void snb_vtd_ops_postamble(struct iommu* iommu)
     if ( !igd_reg_va )
         return;
 
-    *((volatile u32 *)(igd_reg_va + 0x54)) = 0xA;
-    *((volatile u32 *)(igd_reg_va + 0x50)) = 0x10000;
+    *(volatile u32 *)(igd_reg_va + 0x2054) = 0xA;
+    *(volatile u32 *)(igd_reg_va + 0x2050) = 0x10000;
 }
 
 /*
@@ -379,22 +371,18 @@ void me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map)
     }
 }
 
-/*
- * Mask reporting Intel VT-d faults to IOH core logic:
- *   - Some platform escalates VT-d faults to platform errors 
- *   - This can cause system failure upon non-fatal VT-d faults
- *   - Potential security issue if malicious guest trigger VT-d faults
- */
-void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
+void pci_vtd_quirk(const struct pci_dev *pdev)
 {
     int seg = pdev->seg;
     int bus = pdev->bus;
     int dev = PCI_SLOT(pdev->devfn);
     int func = PCI_FUNC(pdev->devfn);
     int pos;
-    u32 val;
+    bool_t ff;
+    u32 val, val2;
     u64 bar;
     paddr_t pa;
+    const char *action;
 
     if ( pci_conf_read16(seg, bus, dev, func, PCI_VENDOR_ID) !=
          PCI_VENDOR_ID_INTEL )
@@ -402,10 +390,20 @@ void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
 
     switch ( pci_conf_read16(seg, bus, dev, func, PCI_DEVICE_ID) )
     {
+    /*
+     * Mask reporting Intel VT-d faults to IOH core logic:
+     *   - Some platform escalates VT-d faults to platform errors.
+     *   - This can cause system failure upon non-fatal VT-d faults.
+     *   - Potential security issue if malicious guest trigger VT-d faults.
+     */
+    case 0x0e28: /* Xeon-E5v2 (IvyBridge) */
     case 0x342e: /* Tylersburg chipset (Nehalem / Westmere systems) */
+    case 0x3728: /* Xeon C5500/C3500 (JasperForest) */
     case 0x3c28: /* Sandybridge */
         val = pci_conf_read32(seg, bus, dev, func, 0x1AC);
         pci_conf_write32(seg, bus, dev, func, 0x1AC, val | (1 << 31));
+        printk(XENLOG_INFO "Masked VT-d error signaling on %04x:%02x:%02x.%u\n",
+               seg, bus, dev, func);
         break;
 
     /* Tylersburg (EP)/Boxboro (MP) chipsets (NHM-EP/EX, WSM-EP/EX) */
@@ -434,7 +432,10 @@ void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
                 pos = pci_find_next_ext_capability(seg, bus, pdev->devfn, pos,
                                                    PCI_EXT_CAP_ID_VNDR);
             }
+            ff = 0;
         }
+        else
+            ff = pcie_aer_get_firmware_first(pdev);
         if ( !pos )
         {
             printk(XENLOG_WARNING "%04x:%02x:%02x.%u without AER capability?\n",
@@ -443,18 +444,26 @@ void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
         }
 
         val = pci_conf_read32(seg, bus, dev, func, pos + PCI_ERR_UNCOR_MASK);
-        pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_UNCOR_MASK,
-                         val | PCI_ERR_UNC_UNSUP);
-        val = pci_conf_read32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK);
-        pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK,
-                         val | PCI_ERR_COR_ADV_NFAT);
+        val2 = pci_conf_read32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK);
+        if ( (val & PCI_ERR_UNC_UNSUP) && (val2 & PCI_ERR_COR_ADV_NFAT) )
+            action = "Found masked";
+        else if ( !ff )
+        {
+            pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_UNCOR_MASK,
+                             val | PCI_ERR_UNC_UNSUP);
+            pci_conf_write32(seg, bus, dev, func, pos + PCI_ERR_COR_MASK,
+                             val2 | PCI_ERR_COR_ADV_NFAT);
+            action = "Masked";
+        }
+        else
+            action = "Must not mask";
 
         /* XPUNCERRMSK Send Completion with Unsupported Request */
         val = pci_conf_read32(seg, bus, dev, func, 0x20c);
         pci_conf_write32(seg, bus, dev, func, 0x20c, val | (1 << 4));
 
-        printk(XENLOG_INFO "Masked UR signaling on %04x:%02x:%02x.%u\n",
-               seg, bus, dev, func);
+        printk(XENLOG_INFO "%s UR signaling on %04x:%02x:%02x.%u\n",
+               action, seg, bus, dev, func);
         break;
 
     case 0x100: case 0x104: case 0x108: /* Sandybridge */
@@ -463,7 +472,7 @@ void __hwdom_init pci_vtd_quirk(struct pci_dev *pdev)
     case 0xc00: case 0xc04: case 0xc08: /* Haswell */
         bar = pci_conf_read32(seg, bus, dev, func, 0x6c);
         bar = (bar << 32) | pci_conf_read32(seg, bus, dev, func, 0x68);
-        pa = bar & 0x7fffff000; /* bits 12...38 */
+        pa = bar & 0x7ffffff000UL; /* bits 12...38 */
         if ( (bar & 1) && pa &&
              page_is_ram_type(paddr_to_pfn(pa), RAM_TYPE_RESERVED) )
         {

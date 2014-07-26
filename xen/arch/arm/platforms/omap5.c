@@ -102,21 +102,20 @@ static int omap5_init_time(void)
 static int omap5_specific_mapping(struct domain *d)
 {
     /* Map the PRM module */
-    map_mmio_regions(d, OMAP5_PRM_BASE, OMAP5_PRM_BASE + (PAGE_SIZE * 2) - 1,
-                     OMAP5_PRM_BASE);
+    map_mmio_regions(d, paddr_to_pfn(OMAP5_PRM_BASE), 2,
+                     paddr_to_pfn(OMAP5_PRM_BASE));
 
     /* Map the PRM_MPU */
-    map_mmio_regions(d, OMAP5_PRCM_MPU_BASE,
-                     OMAP5_PRCM_MPU_BASE + PAGE_SIZE - 1,
-                     OMAP5_PRCM_MPU_BASE);
+    map_mmio_regions(d, paddr_to_pfn(OMAP5_PRCM_MPU_BASE), 1,
+                     paddr_to_pfn(OMAP5_PRCM_MPU_BASE));
 
     /* Map the Wakeup Gen */
-    map_mmio_regions(d, OMAP5_WKUPGEN_BASE, OMAP5_WKUPGEN_BASE + PAGE_SIZE - 1,
-                     OMAP5_WKUPGEN_BASE);
+    map_mmio_regions(d, paddr_to_pfn(OMAP5_WKUPGEN_BASE), 1,
+                     paddr_to_pfn(OMAP5_WKUPGEN_BASE));
 
     /* Map the on-chip SRAM */
-    map_mmio_regions(d, OMAP5_SRAM_PA, OMAP5_SRAM_PA + (PAGE_SIZE * 32) - 1,
-                     OMAP5_SRAM_PA);
+    map_mmio_regions(d, paddr_to_pfn(OMAP5_SRAM_PA), 32,
+                     paddr_to_pfn(OMAP5_SRAM_PA));
 
     return 0;
 }
@@ -144,10 +143,27 @@ static int __init omap5_smp_init(void)
     return 0;
 }
 
-static const char const *omap5_dt_compat[] __initconst =
+static const char * const omap5_dt_compat[] __initconst =
 {
     "ti,omap5",
     NULL
+};
+
+static const char * const dra7_dt_compat[] __initconst =
+{
+    "ti,dra7",
+    NULL
+};
+
+static const struct dt_device_match dra7_blacklist_dev[] __initconst =
+{
+    /* OMAP Linux kernel handles devices with status "disabled" in a
+     * weird manner - tries to reset them. While their memory ranges
+     * are not mapped, this leads to data aborts, so skip these devices
+     * from DT for dom0.
+     */
+    DT_MATCH_NOT_AVAILABLE(),
+    { /* sentinel */ },
 };
 
 PLATFORM_START(omap5, "TI OMAP5")
@@ -159,6 +175,17 @@ PLATFORM_START(omap5, "TI OMAP5")
 
     .dom0_gnttab_start = 0x4b000000,
     .dom0_gnttab_size = 0x20000,
+PLATFORM_END
+
+PLATFORM_START(dra7, "TI DRA7")
+    .compatible = dra7_dt_compat,
+    .init_time = omap5_init_time,
+    .cpu_up = cpu_up_send_sgi,
+    .smp_init = omap5_smp_init,
+
+    .dom0_gnttab_start = 0x4b000000,
+    .dom0_gnttab_size = 0x20000,
+    .blacklist_dev = dra7_blacklist_dev,
 PLATFORM_END
 
 /*

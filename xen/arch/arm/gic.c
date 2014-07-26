@@ -24,360 +24,121 @@
 #include <xen/irq.h>
 #include <xen/sched.h>
 #include <xen/errno.h>
-#include <xen/serial.h>
 #include <xen/softirq.h>
 #include <xen/list.h>
 #include <xen/device_tree.h>
 #include <asm/p2m.h>
 #include <asm/domain.h>
 #include <asm/platform.h>
-
+#include <asm/device.h>
+#include <asm/io.h>
 #include <asm/gic.h>
 
-/* Access to the GIC Distributor registers through the fixmap */
-#define GICD ((volatile uint32_t *) FIXMAP_ADDR(FIXMAP_GICD))
-#define GICC ((volatile uint32_t *) FIXMAP_ADDR(FIXMAP_GICC1))
-#define GICH ((volatile uint32_t *) FIXMAP_ADDR(FIXMAP_GICH))
 static void gic_restore_pending_irqs(struct vcpu *v);
 
-/* Global state */
-static struct {
-    paddr_t dbase;       /* Address of distributor registers */
-    paddr_t cbase;       /* Address of CPU interface registers */
-    paddr_t hbase;       /* Address of virtual interface registers */
-    paddr_t vbase;       /* Address of virtual cpu interface registers */
-    unsigned int lines;  /* Number of interrupts (SPIs + PPIs + SGIs) */
-    struct dt_irq maintenance; /* IRQ maintenance */
-    unsigned int cpus;
-    spinlock_t lock;
-} gic;
-
-static irq_desc_t irq_desc[NR_IRQS];
-static DEFINE_PER_CPU(irq_desc_t[NR_LOCAL_IRQS], local_irq_desc);
 static DEFINE_PER_CPU(uint64_t, lr_mask);
 
-static unsigned nr_lrs;
+#define lr_all_full() (this_cpu(lr_mask) == ((1 << gic_hw_ops->info->nr_lrs) - 1))
 
-/* The GIC mapping of CPU interfaces does not necessarily match the
- * logical CPU numbering. Let's use mapping as returned by the GIC
- * itself
- */
-static DEFINE_PER_CPU(u8, gic_cpu_id);
+#undef GIC_DEBUG
 
-/* Maximum cpu interface per GIC */
-#define NR_GIC_CPU_IF 8
+static void gic_update_one_lr(struct vcpu *v, int i);
 
-static unsigned int gic_cpu_mask(const cpumask_t *cpumask)
+static const struct gic_hw_operations *gic_hw_ops;
+
+void register_gic_ops(const struct gic_hw_operations *ops)
 {
-    unsigned int cpu;
-    unsigned int mask = 0;
-    cpumask_t possible_mask;
+    gic_hw_ops = ops;
+}
 
-    cpumask_and(&possible_mask, cpumask, &cpu_possible_map);
-    for_each_cpu(cpu, &possible_mask)
-    {
-        ASSERT(cpu < NR_GIC_CPU_IF);
-        mask |= per_cpu(gic_cpu_id, cpu);
-    }
+static void clear_cpu_lr_mask(void)
+{
+    this_cpu(lr_mask) = 0ULL;
+}
 
-    return mask;
+enum gic_version gic_hw_version(void)
+{
+   return gic_hw_ops->info->hw_version;
 }
 
 unsigned int gic_number_lines(void)
 {
-    return gic.lines;
-}
-
-irq_desc_t *__irq_to_desc(int irq)
-{
-    if (irq < NR_LOCAL_IRQS) return &this_cpu(local_irq_desc)[irq];
-    return &irq_desc[irq-NR_LOCAL_IRQS];
+    return gic_hw_ops->info->nr_lines;
 }
 
 void gic_save_state(struct vcpu *v)
 {
-    int i;
     ASSERT(!local_irq_is_enabled());
+    ASSERT(!is_idle_vcpu(v));
 
     /* No need for spinlocks here because interrupts are disabled around
      * this call and it only accesses struct vcpu fields that cannot be
      * accessed simultaneously by another pCPU.
      */
-    for ( i=0; i<nr_lrs; i++)
-        v->arch.gic_lr[i] = GICH[GICH_LR + i];
     v->arch.lr_mask = this_cpu(lr_mask);
-    v->arch.gic_apr = GICH[GICH_APR];
-    v->arch.gic_vmcr = GICH[GICH_VMCR];
-    /* Disable until next VCPU scheduled */
-    GICH[GICH_HCR] = 0;
+    gic_hw_ops->save_state(v);
     isb();
 }
 
 void gic_restore_state(struct vcpu *v)
 {
-    int i;
-
-    if ( is_idle_vcpu(v) )
-        return;
+    ASSERT(!local_irq_is_enabled());
+    ASSERT(!is_idle_vcpu(v));
 
     this_cpu(lr_mask) = v->arch.lr_mask;
-    for ( i=0; i<nr_lrs; i++)
-        GICH[GICH_LR + i] = v->arch.gic_lr[i];
-    GICH[GICH_APR] = v->arch.gic_apr;
-    GICH[GICH_VMCR] = v->arch.gic_vmcr;
-    GICH[GICH_HCR] = GICH_HCR_EN;
+    gic_hw_ops->restore_state(v);
+
     isb();
 
     gic_restore_pending_irqs(v);
 }
 
-static void gic_irq_enable(struct irq_desc *desc)
-{
-    int irq = desc->irq;
-    unsigned long flags;
-
-    spin_lock_irqsave(&desc->lock, flags);
-    spin_lock(&gic.lock);
-    desc->status &= ~IRQ_DISABLED;
-    dsb(sy);
-    /* Enable routing */
-    GICD[GICD_ISENABLER + irq / 32] = (1u << (irq % 32));
-    spin_unlock(&gic.lock);
-    spin_unlock_irqrestore(&desc->lock, flags);
-}
-
-static void gic_irq_disable(struct irq_desc *desc)
-{
-    int irq = desc->irq;
-    unsigned long flags;
-
-    spin_lock_irqsave(&desc->lock, flags);
-    spin_lock(&gic.lock);
-    /* Disable routing */
-    GICD[GICD_ICENABLER + irq / 32] = (1u << (irq % 32));
-    desc->status |= IRQ_DISABLED;
-    spin_unlock(&gic.lock);
-    spin_unlock_irqrestore(&desc->lock, flags);
-}
-
-static unsigned int gic_irq_startup(struct irq_desc *desc)
-{
-    gic_irq_enable(desc);
-    return 0;
-}
-
-static void gic_irq_shutdown(struct irq_desc *desc)
-{
-    gic_irq_disable(desc);
-}
-
-static void gic_irq_ack(struct irq_desc *desc)
-{
-    /* No ACK -- reading IAR has done this for us */
-}
-
-static void gic_host_irq_end(struct irq_desc *desc)
-{
-    int irq = desc->irq;
-    /* Lower the priority */
-    GICC[GICC_EOIR] = irq;
-    /* Deactivate */
-    GICC[GICC_DIR] = irq;
-}
-
-static void gic_guest_irq_end(struct irq_desc *desc)
-{
-    int irq = desc->irq;
-    /* Lower the priority of the IRQ */
-    GICC[GICC_EOIR] = irq;
-    /* Deactivation happens in maintenance interrupt / via GICV */
-}
-
-static void gic_irq_set_affinity(struct irq_desc *desc, const cpumask_t *mask)
-{
-    BUG();
-}
-
-/* XXX different for level vs edge */
-static hw_irq_controller gic_host_irq_type = {
-    .typename = "gic",
-    .startup = gic_irq_startup,
-    .shutdown = gic_irq_shutdown,
-    .enable = gic_irq_enable,
-    .disable = gic_irq_disable,
-    .ack = gic_irq_ack,
-    .end = gic_host_irq_end,
-    .set_affinity = gic_irq_set_affinity,
-};
-static hw_irq_controller gic_guest_irq_type = {
-    .typename = "gic",
-    .startup = gic_irq_startup,
-    .shutdown = gic_irq_shutdown,
-    .enable = gic_irq_enable,
-    .disable = gic_irq_disable,
-    .ack = gic_irq_ack,
-    .end = gic_guest_irq_end,
-    .set_affinity = gic_irq_set_affinity,
-};
-
 /*
- * - needs to be called with gic.lock held
- * - needs to be called with a valid cpu_mask, ie each cpu in the mask has
+ * needs to be called with a valid cpu_mask, ie each cpu in the mask has
  * already called gic_cpu_init
+ * - desc.lock must be held
+ * - arch.type must be valid (i.e != DT_IRQ_TYPE_INVALID)
  */
-static void gic_set_irq_properties(unsigned int irq, bool_t level,
+static void gic_set_irq_properties(struct irq_desc *desc,
                                    const cpumask_t *cpu_mask,
                                    unsigned int priority)
 {
-    volatile unsigned char *bytereg;
-    uint32_t cfg, edgebit;
-    unsigned int mask = gic_cpu_mask(cpu_mask);
-
-    /* Set edge / level */
-    cfg = GICD[GICD_ICFGR + irq / 16];
-    edgebit = 2u << (2 * (irq % 16));
-    if ( level )
-        cfg &= ~edgebit;
-    else
-        cfg |= edgebit;
-    GICD[GICD_ICFGR + irq / 16] = cfg;
-
-    /* Set target CPU mask (RAZ/WI on uniprocessor) */
-    bytereg = (unsigned char *) (GICD + GICD_ITARGETSR);
-    bytereg[irq] = mask;
-
-    /* Set priority */
-    bytereg = (unsigned char *) (GICD + GICD_IPRIORITYR);
-    bytereg[irq] = priority;
-
+   gic_hw_ops->set_irq_properties(desc, cpu_mask, priority);
 }
 
-/* Program the GIC to route an interrupt */
-static int gic_route_irq(unsigned int irq, bool_t level,
-                         const cpumask_t *cpu_mask, unsigned int priority)
+/* Program the GIC to route an interrupt to the host (i.e. Xen)
+ * - needs to be called with desc.lock held
+ */
+void gic_route_irq_to_xen(struct irq_desc *desc, const cpumask_t *cpu_mask,
+                          unsigned int priority)
 {
-    struct irq_desc *desc = irq_to_desc(irq);
-    unsigned long flags;
-
     ASSERT(priority <= 0xff);     /* Only 8 bits of priority */
-    ASSERT(irq < gic.lines);      /* Can't route interrupts that don't exist */
+    ASSERT(desc->irq < gic_number_lines());/* Can't route interrupts that don't exist */
+    ASSERT(desc->status & IRQ_DISABLED);
+    ASSERT(spin_is_locked(&desc->lock));
 
-    if ( desc->action != NULL )
-        return -EBUSY;
+    desc->handler = gic_hw_ops->gic_host_irq_type;
 
-    /* Disable interrupt */
-    desc->handler->shutdown(desc);
-
-    spin_lock_irqsave(&desc->lock, flags);
-
-    desc->handler = &gic_host_irq_type;
-
-    spin_lock(&gic.lock);
-    gic_set_irq_properties(irq, level, cpu_mask, priority);
-    spin_unlock(&gic.lock);
-
-    spin_unlock_irqrestore(&desc->lock, flags);
-    return 0;
+    gic_set_irq_properties(desc, cpu_mask, priority);
 }
 
-/* Program the GIC to route an interrupt with a dt_irq */
-void gic_route_dt_irq(const struct dt_irq *irq, const cpumask_t *cpu_mask,
-                      unsigned int priority)
+/* Program the GIC to route an interrupt to a guest
+ *   - desc.lock must be held
+ */
+void gic_route_irq_to_guest(struct domain *d, struct irq_desc *desc,
+                            const cpumask_t *cpu_mask, unsigned int priority)
 {
-    bool_t level;
+    struct pending_irq *p;
+    ASSERT(spin_is_locked(&desc->lock));
 
-    level = dt_irq_is_level_triggered(irq);
+    desc->handler = gic_hw_ops->gic_guest_irq_type;
+    desc->status |= IRQ_GUEST;
 
-    gic_route_irq(irq->irq, level, cpu_mask, priority);
-}
+    gic_set_irq_properties(desc, cpumask_of(smp_processor_id()), GIC_PRI_IRQ);
 
-static void __init gic_dist_init(void)
-{
-    uint32_t type;
-    uint32_t cpumask;
-    int i;
-
-    cpumask = GICD[GICD_ITARGETSR] & 0xff;
-    cpumask |= cpumask << 8;
-    cpumask |= cpumask << 16;
-
-    /* Disable the distributor */
-    GICD[GICD_CTLR] = 0;
-
-    type = GICD[GICD_TYPER];
-    gic.lines = 32 * ((type & GICD_TYPE_LINES) + 1);
-    gic.cpus = 1 + ((type & GICD_TYPE_CPUS) >> 5);
-    printk("GIC: %d lines, %d cpu%s%s (IID %8.8x).\n",
-           gic.lines, gic.cpus, (gic.cpus == 1) ? "" : "s",
-           (type & GICD_TYPE_SEC) ? ", secure" : "",
-           GICD[GICD_IIDR]);
-
-    /* Default all global IRQs to level, active low */
-    for ( i = 32; i < gic.lines; i += 16 )
-        GICD[GICD_ICFGR + i / 16] = 0x0;
-
-    /* Route all global IRQs to this CPU */
-    for ( i = 32; i < gic.lines; i += 4 )
-        GICD[GICD_ITARGETSR + i / 4] = cpumask;
-
-    /* Default priority for global interrupts */
-    for ( i = 32; i < gic.lines; i += 4 )
-        GICD[GICD_IPRIORITYR + i / 4] =
-            GIC_PRI_IRQ<<24 | GIC_PRI_IRQ<<16 | GIC_PRI_IRQ<<8 | GIC_PRI_IRQ;
-
-    /* Disable all global interrupts */
-    for ( i = 32; i < gic.lines; i += 32 )
-        GICD[GICD_ICENABLER + i / 32] = (uint32_t)~0ul;
-
-    /* Turn on the distributor */
-    GICD[GICD_CTLR] = GICD_CTL_ENABLE;
-}
-
-static void __cpuinit gic_cpu_init(void)
-{
-    int i;
-
-    this_cpu(gic_cpu_id) = GICD[GICD_ITARGETSR] & 0xff;
-
-    /* The first 32 interrupts (PPI and SGI) are banked per-cpu, so
-     * even though they are controlled with GICD registers, they must
-     * be set up here with the other per-cpu state. */
-    GICD[GICD_ICENABLER] = 0xffff0000; /* Disable all PPI */
-    GICD[GICD_ISENABLER] = 0x0000ffff; /* Enable all SGI */
-    /* Set SGI priorities */
-    for (i = 0; i < 16; i += 4)
-        GICD[GICD_IPRIORITYR + i / 4] =
-            GIC_PRI_IPI<<24 | GIC_PRI_IPI<<16 | GIC_PRI_IPI<<8 | GIC_PRI_IPI;
-    /* Set PPI priorities */
-    for (i = 16; i < 32; i += 4)
-        GICD[GICD_IPRIORITYR + i / 4] =
-            GIC_PRI_IRQ<<24 | GIC_PRI_IRQ<<16 | GIC_PRI_IRQ<<8 | GIC_PRI_IRQ;
-
-    /* Local settings: interface controller */
-    GICC[GICC_PMR] = 0xff;                /* Don't mask by priority */
-    GICC[GICC_BPR] = 0;                   /* Finest granularity of priority */
-    GICC[GICC_CTLR] = GICC_CTL_ENABLE|GICC_CTL_EOI;    /* Turn on delivery */
-}
-
-static void gic_cpu_disable(void)
-{
-    GICC[GICC_CTLR] = 0;
-}
-
-static void __cpuinit gic_hyp_init(void)
-{
-    uint32_t vtr;
-
-    vtr = GICH[GICH_VTR];
-    nr_lrs  = (vtr & GICH_VTR_NRLRGS) + 1;
-
-    GICH[GICH_MISR] = GICH_MISR_EOI;
-    this_cpu(lr_mask) = 0ULL;
-}
-
-static void __cpuinit gic_hyp_disable(void)
-{
-    GICH[GICH_HCR] = 0;
+    /* TODO: do not assume delivery to vcpu0 */
+    p = irq_to_pending(d->vcpu[0], desc->irq);
+    p->desc = desc;
 }
 
 int gic_irq_xlate(const u32 *intspec, unsigned int intsize,
@@ -403,99 +164,43 @@ int gic_irq_xlate(const u32 *intspec, unsigned int intsize,
 /* Set up the GIC */
 void __init gic_init(void)
 {
-    static const struct dt_device_match gic_ids[] __initconst =
-    {
-        DT_MATCH_GIC,
-        { /* sentinel */ },
-    };
+    int rc;
     struct dt_device_node *node;
-    int res;
+    uint8_t num_gics = 0;
 
-    node = dt_find_interrupt_controller(gic_ids);
-    if ( !node )
+    dt_for_each_device_node( dt_host, node )
+    {
+        if ( !dt_get_property(node, "interrupt-controller", NULL) )
+            continue;
+
+        if ( !dt_get_parent(node) )
+            continue;
+
+        rc = device_init(node, DEVICE_GIC, NULL);
+        if ( !rc )
+        {
+            /* NOTE: Only one GIC is supported */
+            num_gics = 1;
+            break;
+        }
+    }
+    if ( !num_gics )
         panic("Unable to find compatible GIC in the device tree");
 
-    dt_device_set_used_by(node, DOMID_XEN);
-
-    res = dt_device_get_address(node, 0, &gic.dbase, NULL);
-    if ( res || !gic.dbase || (gic.dbase & ~PAGE_MASK) )
-        panic("GIC: Cannot find a valid address for the distributor");
-
-    res = dt_device_get_address(node, 1, &gic.cbase, NULL);
-    if ( res || !gic.cbase || (gic.cbase & ~PAGE_MASK) )
-        panic("GIC: Cannot find a valid address for the CPU");
-
-    res = dt_device_get_address(node, 2, &gic.hbase, NULL);
-    if ( res || !gic.hbase || (gic.hbase & ~PAGE_MASK) )
-        panic("GIC: Cannot find a valid address for the hypervisor");
-
-    res = dt_device_get_address(node, 3, &gic.vbase, NULL);
-    if ( res || !gic.vbase || (gic.vbase & ~PAGE_MASK) )
-        panic("GIC: Cannot find a valid address for the virtual CPU");
-
-    res = dt_device_get_irq(node, 0, &gic.maintenance);
-    if ( res )
-        panic("GIC: Cannot find the maintenance IRQ");
-
-    /* Set the GIC as the primary interrupt controller */
-    dt_interrupt_controller = node;
-
-    /* TODO: Add check on distributor, cpu size */
-
-    printk("GIC initialization:\n"
-              "        gic_dist_addr=%"PRIpaddr"\n"
-              "        gic_cpu_addr=%"PRIpaddr"\n"
-              "        gic_hyp_addr=%"PRIpaddr"\n"
-              "        gic_vcpu_addr=%"PRIpaddr"\n"
-              "        gic_maintenance_irq=%u\n",
-              gic.dbase, gic.cbase, gic.hbase, gic.vbase,
-              gic.maintenance.irq);
-
-    if ( (gic.dbase & ~PAGE_MASK) || (gic.cbase & ~PAGE_MASK) ||
-         (gic.hbase & ~PAGE_MASK) || (gic.vbase & ~PAGE_MASK) )
-        panic("GIC interfaces not page aligned");
-
-    set_fixmap(FIXMAP_GICD, gic.dbase >> PAGE_SHIFT, DEV_SHARED);
-    BUILD_BUG_ON(FIXMAP_ADDR(FIXMAP_GICC1) !=
-                 FIXMAP_ADDR(FIXMAP_GICC2)-PAGE_SIZE);
-    set_fixmap(FIXMAP_GICC1, gic.cbase >> PAGE_SHIFT, DEV_SHARED);
-    if ( platform_has_quirk(PLATFORM_QUIRK_GIC_64K_STRIDE) )
-        set_fixmap(FIXMAP_GICC2, (gic.cbase >> PAGE_SHIFT) + 0x10, DEV_SHARED);
-    else
-        set_fixmap(FIXMAP_GICC2, (gic.cbase >> PAGE_SHIFT) + 0x1, DEV_SHARED);
-    set_fixmap(FIXMAP_GICH, gic.hbase >> PAGE_SHIFT, DEV_SHARED);
-
-    /* Global settings: interrupt distributor */
-    spin_lock_init(&gic.lock);
-    spin_lock(&gic.lock);
-
-    gic_dist_init();
-    gic_cpu_init();
-    gic_hyp_init();
-
-    spin_unlock(&gic.lock);
+    /* Clear LR mask for cpu0 */
+    clear_cpu_lr_mask();
 }
 
 void send_SGI_mask(const cpumask_t *cpumask, enum gic_sgi sgi)
 {
-    unsigned int mask = 0;
-    cpumask_t online_mask;
-
     ASSERT(sgi < 16); /* There are only 16 SGIs */
 
-    cpumask_and(&online_mask, cpumask, &cpu_online_map);
-    mask = gic_cpu_mask(&online_mask);
-
     dsb(sy);
-
-    GICD[GICD_SGIR] = GICD_SGI_TARGET_LIST
-        | (mask<<GICD_SGI_TARGET_SHIFT)
-        | sgi;
+    gic_hw_ops->send_SGI(sgi, SGI_TARGET_LIST, cpumask);
 }
 
 void send_SGI_one(unsigned int cpu, enum gic_sgi sgi)
 {
-    ASSERT(cpu < NR_GIC_CPU_IF);  /* Targets bitmap only supports 8 CPUs */
     send_SGI_mask(cpumask_of(cpu), sgi);
 }
 
@@ -504,9 +209,7 @@ void send_SGI_self(enum gic_sgi sgi)
     ASSERT(sgi < 16); /* There are only 16 SGIs */
 
     dsb(sy);
-
-    GICD[GICD_SGIR] = GICD_SGI_TARGET_SELF
-        | sgi;
+    gic_hw_ops->send_SGI(sgi, SGI_TARGET_SELF, NULL);
 }
 
 void send_SGI_allbutself(enum gic_sgi sgi)
@@ -514,9 +217,7 @@ void send_SGI_allbutself(enum gic_sgi sgi)
    ASSERT(sgi < 16); /* There are only 16 SGIs */
 
    dsb(sy);
-
-   GICD[GICD_SGIR] = GICD_SGI_TARGET_OTHERS
-       | sgi;
+   gic_hw_ops->send_SGI(sgi, SGI_TARGET_OTHERS, NULL);
 }
 
 void smp_send_state_dump(unsigned int cpu)
@@ -527,10 +228,9 @@ void smp_send_state_dump(unsigned int cpu)
 /* Set up the per-CPU parts of the GIC for a secondary CPU */
 void __cpuinit gic_init_secondary_cpu(void)
 {
-    spin_lock(&gic.lock);
-    gic_cpu_init();
-    gic_hyp_init();
-    spin_unlock(&gic.lock);
+    gic_hw_ops->secondary_init();
+    /* Clear LR mask for secondary cpus */
+    clear_cpu_lr_mask();
 }
 
 /* Shut down the per-CPU GIC interface */
@@ -538,111 +238,26 @@ void gic_disable_cpu(void)
 {
     ASSERT(!local_irq_is_enabled());
 
-    spin_lock(&gic.lock);
-    gic_cpu_disable();
-    gic_hyp_disable();
-    spin_unlock(&gic.lock);
-}
-
-void gic_route_ppis(void)
-{
-    /* GIC maintenance */
-    gic_route_dt_irq(&gic.maintenance, cpumask_of(smp_processor_id()),
-                     GIC_PRI_IRQ);
-    /* Route timer interrupt */
-    route_timer_interrupt();
-}
-
-void gic_route_spis(void)
-{
-    int seridx;
-    const struct dt_irq *irq;
-
-    for ( seridx = 0; seridx <= SERHND_IDX; seridx++ )
-    {
-        if ( (irq = serial_dt_irq(seridx)) == NULL )
-            continue;
-
-        gic_route_dt_irq(irq, cpumask_of(smp_processor_id()),
-                         GIC_PRI_IRQ);
-    }
-}
-
-void __init release_irq(unsigned int irq)
-{
-    struct irq_desc *desc;
-    unsigned long flags;
-   struct irqaction *action;
-
-    desc = irq_to_desc(irq);
-
-    desc->handler->shutdown(desc);
-
-    spin_lock_irqsave(&desc->lock,flags);
-    action = desc->action;
-    desc->action  = NULL;
-    desc->status &= ~IRQ_GUEST;
-
-    spin_unlock_irqrestore(&desc->lock,flags);
-
-    /* Wait to make sure it's not being used on another CPU */
-    do { smp_mb(); } while ( desc->status & IRQ_INPROGRESS );
-
-    if (action && action->free_on_release)
-        xfree(action);
-}
-
-static int __setup_irq(struct irq_desc *desc, unsigned int irq,
-                       struct irqaction *new)
-{
-    if ( desc->action != NULL )
-        return -EBUSY;
-
-    desc->action  = new;
-    dsb(sy);
-
-    return 0;
-}
-
-int __init setup_dt_irq(const struct dt_irq *irq, struct irqaction *new)
-{
-    int rc;
-    unsigned long flags;
-    struct irq_desc *desc;
-
-    desc = irq_to_desc(irq->irq);
-
-    spin_lock_irqsave(&desc->lock, flags);
-    rc = __setup_irq(desc, irq->irq, new);
-    spin_unlock_irqrestore(&desc->lock, flags);
-
-    if ( !rc )
-        desc->handler->startup(desc);
-
-    return rc;
+    gic_hw_ops->disable_interface();
 }
 
 static inline void gic_set_lr(int lr, struct pending_irq *p,
-        unsigned int state)
+                              unsigned int state)
 {
-    int maintenance_int = GICH_LR_MAINTENANCE_IRQ;
+    ASSERT(!local_irq_is_enabled());
 
-    BUG_ON(lr >= nr_lrs);
-    BUG_ON(lr < 0);
-    BUG_ON(state & ~(GICH_LR_STATE_MASK<<GICH_LR_STATE_SHIFT));
-
-    GICH[GICH_LR + lr] = state |
-        maintenance_int |
-        ((p->priority >> 3) << GICH_LR_PRIORITY_SHIFT) |
-        ((p->irq & GICH_LR_VIRTUAL_MASK) << GICH_LR_VIRTUAL_SHIFT);
+    gic_hw_ops->update_lr(lr, p, state);
 
     set_bit(GIC_IRQ_GUEST_VISIBLE, &p->status);
-    clear_bit(GIC_IRQ_GUEST_PENDING, &p->status);
+    clear_bit(GIC_IRQ_GUEST_QUEUED, &p->status);
+    p->lr = lr;
 }
 
 static inline void gic_add_to_lr_pending(struct vcpu *v, struct pending_irq *n)
 {
     struct pending_irq *iter;
+
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
 
     if ( !list_empty(&n->lr_queue) )
         return;
@@ -663,152 +278,257 @@ void gic_remove_from_queues(struct vcpu *v, unsigned int virtual_irq)
     struct pending_irq *p = irq_to_pending(v, virtual_irq);
     unsigned long flags;
 
-    spin_lock_irqsave(&gic.lock, flags);
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
     if ( !list_empty(&p->lr_queue) )
         list_del_init(&p->lr_queue);
-    spin_unlock_irqrestore(&gic.lock, flags);
+    spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
 }
 
-void gic_set_guest_irq(struct vcpu *v, unsigned int virtual_irq,
-        unsigned int state, unsigned int priority)
+void gic_raise_inflight_irq(struct vcpu *v, unsigned int virtual_irq)
+{
+    struct pending_irq *n = irq_to_pending(v, virtual_irq);
+
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
+
+    if ( list_empty(&n->lr_queue) )
+    {
+        if ( v == current )
+            gic_update_one_lr(v, n->lr);
+    }
+#ifdef GIC_DEBUG
+    else
+        gdprintk(XENLOG_DEBUG, "trying to inject irq=%u into d%dv%d, when it is still lr_pending\n",
+                 virtual_irq, v->domain->domain_id, v->vcpu_id);
+#endif
+}
+
+void gic_raise_guest_irq(struct vcpu *v, unsigned int virtual_irq,
+        unsigned int priority)
 {
     int i;
-    unsigned long flags;
+    unsigned int nr_lrs = gic_hw_ops->info->nr_lrs;
 
-    spin_lock_irqsave(&gic.lock, flags);
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
 
     if ( v == current && list_empty(&v->arch.vgic.lr_pending) )
     {
         i = find_first_zero_bit(&this_cpu(lr_mask), nr_lrs);
         if (i < nr_lrs) {
             set_bit(i, &this_cpu(lr_mask));
-            gic_set_lr(i, irq_to_pending(v, virtual_irq), state);
-            goto out;
+            gic_set_lr(i, irq_to_pending(v, virtual_irq), GICH_LR_PENDING);
+            return;
         }
     }
 
     gic_add_to_lr_pending(v, irq_to_pending(v, virtual_irq));
+}
 
-out:
-    spin_unlock_irqrestore(&gic.lock, flags);
-    return;
+static void gic_update_one_lr(struct vcpu *v, int i)
+{
+    struct pending_irq *p;
+    int irq;
+    struct gic_lr lr_val;
+
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
+    ASSERT(!local_irq_is_enabled());
+
+    gic_hw_ops->read_lr(i, &lr_val);
+    irq = lr_val.virq;
+    p = irq_to_pending(v, irq);
+    if ( lr_val.state & GICH_LR_ACTIVE )
+    {
+        set_bit(GIC_IRQ_GUEST_ACTIVE, &p->status);
+        if ( test_bit(GIC_IRQ_GUEST_ENABLED, &p->status) &&
+             test_and_clear_bit(GIC_IRQ_GUEST_QUEUED, &p->status) )
+        {
+            if ( p->desc == NULL )
+            {
+                 lr_val.state |= GICH_LR_PENDING;
+                 gic_hw_ops->write_lr(i, &lr_val);
+            }
+            else
+                gdprintk(XENLOG_WARNING, "unable to inject hw irq=%d into d%dv%d: already active in LR%d\n",
+                         irq, v->domain->domain_id, v->vcpu_id, i);
+        }
+    }
+    else if ( lr_val.state & GICH_LR_PENDING )
+    {
+        int q __attribute__ ((unused)) = test_and_clear_bit(GIC_IRQ_GUEST_QUEUED, &p->status);
+#ifdef GIC_DEBUG
+        if ( q )
+            gdprintk(XENLOG_DEBUG, "trying to inject irq=%d into d%dv%d, when it is already pending in LR%d\n",
+                    irq, v->domain->domain_id, v->vcpu_id, i);
+#endif
+    }
+    else
+    {
+        gic_hw_ops->clear_lr(i);
+        clear_bit(i, &this_cpu(lr_mask));
+
+        if ( p->desc != NULL )
+        {
+            p->desc->status &= ~IRQ_INPROGRESS;
+            if ( platform_has_quirk(PLATFORM_QUIRK_GUEST_PIRQ_NEED_EOI) )
+                gic_hw_ops->deactivate_irq(p->desc);
+        }
+        clear_bit(GIC_IRQ_GUEST_VISIBLE, &p->status);
+        clear_bit(GIC_IRQ_GUEST_ACTIVE, &p->status);
+        p->lr = GIC_INVALID_LR;
+        if ( test_bit(GIC_IRQ_GUEST_ENABLED, &p->status) &&
+             test_bit(GIC_IRQ_GUEST_QUEUED, &p->status) )
+            gic_raise_guest_irq(v, irq, p->priority);
+        else
+            list_del_init(&p->inflight);
+    }
+}
+
+void gic_clear_lrs(struct vcpu *v)
+{
+    int i = 0;
+    unsigned long flags;
+    unsigned int nr_lrs = gic_hw_ops->info->nr_lrs;
+
+    /* The idle domain has no LRs to be cleared. Since gic_restore_state
+     * doesn't write any LR registers for the idle domain they could be
+     * non-zero. */
+    if ( is_idle_vcpu(v) )
+        return;
+
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
+
+    while ((i = find_next_bit((const unsigned long *) &this_cpu(lr_mask),
+                              nr_lrs, i)) < nr_lrs ) {
+        gic_update_one_lr(v, i);
+        i++;
+    }
+
+    spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
 }
 
 static void gic_restore_pending_irqs(struct vcpu *v)
 {
-    int i;
-    struct pending_irq *p, *t;
+    int lr = 0;
+    struct pending_irq *p, *t, *p_r;
+    struct list_head *inflight_r;
     unsigned long flags;
+    unsigned int nr_lrs = gic_hw_ops->info->nr_lrs;
+    int lrs = nr_lrs;
 
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
+
+    if ( list_empty(&v->arch.vgic.lr_pending) )
+        goto out;
+
+    inflight_r = &v->arch.vgic.inflight_irqs;
     list_for_each_entry_safe ( p, t, &v->arch.vgic.lr_pending, lr_queue )
     {
-        i = find_first_zero_bit(&this_cpu(lr_mask), nr_lrs);
-        if ( i >= nr_lrs ) return;
+        lr = find_next_zero_bit(&this_cpu(lr_mask), nr_lrs, lr);
+        if ( lr >= nr_lrs )
+        {
+            /* No more free LRs: find a lower priority irq to evict */
+            list_for_each_entry_reverse( p_r, inflight_r, inflight )
+            {
+                if ( p_r->priority == p->priority )
+                    goto out;
+                if ( test_bit(GIC_IRQ_GUEST_VISIBLE, &p_r->status) &&
+                     !test_bit(GIC_IRQ_GUEST_ACTIVE, &p_r->status) )
+                    goto found;
+            }
+            /* We didn't find a victim this time, and we won't next
+             * time, so quit */
+            goto out;
 
-        spin_lock_irqsave(&gic.lock, flags);
-        gic_set_lr(i, p, GICH_LR_PENDING);
+found:
+            lr = p_r->lr;
+            p_r->lr = GIC_INVALID_LR;
+            set_bit(GIC_IRQ_GUEST_QUEUED, &p_r->status);
+            clear_bit(GIC_IRQ_GUEST_VISIBLE, &p_r->status);
+            gic_add_to_lr_pending(v, p_r);
+            inflight_r = &p_r->inflight;
+        }
+
+        gic_set_lr(lr, p, GICH_LR_PENDING);
         list_del_init(&p->lr_queue);
-        set_bit(i, &this_cpu(lr_mask));
-        spin_unlock_irqrestore(&gic.lock, flags);
+        set_bit(lr, &this_cpu(lr_mask));
+
+        /* We can only evict nr_lrs entries */
+        lrs--;
+        if ( lrs == 0 )
+            break;
     }
 
+out:
+    spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
 }
 
 void gic_clear_pending_irqs(struct vcpu *v)
 {
     struct pending_irq *p, *t;
-    unsigned long flags;
 
-    spin_lock_irqsave(&gic.lock, flags);
+    ASSERT(spin_is_locked(&v->arch.vgic.lock));
+
     v->arch.lr_mask = 0;
     list_for_each_entry_safe ( p, t, &v->arch.vgic.lr_pending, lr_queue )
         list_del_init(&p->lr_queue);
-    spin_unlock_irqrestore(&gic.lock, flags);
-}
-
-static void gic_inject_irq_start(void)
-{
-    register_t hcr = READ_SYSREG(HCR_EL2);
-    WRITE_SYSREG(hcr | HCR_VI, HCR_EL2);
-    isb();
-}
-
-static void gic_inject_irq_stop(void)
-{
-    register_t hcr = READ_SYSREG(HCR_EL2);
-    if (hcr & HCR_VI) {
-        WRITE_SYSREG(hcr & ~HCR_VI, HCR_EL2);
-        isb();
-    }
 }
 
 int gic_events_need_delivery(void)
 {
-    return (!list_empty(&current->arch.vgic.lr_pending) ||
-            this_cpu(lr_mask));
+    struct vcpu *v = current;
+    struct pending_irq *p;
+    unsigned long flags;
+    const unsigned long apr = gic_hw_ops->read_apr(0);
+    int mask_priority;
+    int active_priority;
+    int rc = 0;
+
+    mask_priority = gic_hw_ops->read_vmcr_priority();
+    active_priority = find_next_bit(&apr, 32, 0);
+
+    spin_lock_irqsave(&v->arch.vgic.lock, flags);
+
+    /* TODO: We order the guest irqs by priority, but we don't change
+     * the priority of host irqs. */
+
+    /* find the first enabled non-active irq, the queue is already
+     * ordered by priority */
+    list_for_each_entry( p, &v->arch.vgic.inflight_irqs, inflight )
+    {
+        if ( GIC_PRI_TO_GUEST(p->priority) >= mask_priority )
+            goto out;
+        if ( GIC_PRI_TO_GUEST(p->priority) >= active_priority )
+            goto out;
+        if ( test_bit(GIC_IRQ_GUEST_ENABLED, &p->status) )
+        {
+            rc = 1;
+            goto out;
+        }
+    }
+
+out:
+    spin_unlock_irqrestore(&v->arch.vgic.lock, flags);
+    return rc;
 }
 
 void gic_inject(void)
 {
-    if ( vcpu_info(current, evtchn_upcall_pending) )
-        vgic_vcpu_inject_irq(current, current->domain->arch.evtchn_irq, 1);
+    ASSERT(!local_irq_is_enabled());
 
     gic_restore_pending_irqs(current);
-    if (!gic_events_need_delivery())
-        gic_inject_irq_stop();
+
+    if ( !list_empty(&current->arch.vgic.lr_pending) && lr_all_full() )
+        gic_hw_ops->update_hcr_status(GICH_HCR_UIE, 1);
     else
-        gic_inject_irq_start();
+        gic_hw_ops->update_hcr_status(GICH_HCR_UIE, 0);
 }
 
-int gic_route_irq_to_guest(struct domain *d, const struct dt_irq *irq,
-                           const char * devname)
-{
-    struct irqaction *action;
-    struct irq_desc *desc = irq_to_desc(irq->irq);
-    unsigned long flags;
-    int retval;
-    bool_t level;
-    struct pending_irq *p;
-
-    action = xmalloc(struct irqaction);
-    if (!action)
-        return -ENOMEM;
-
-    action->dev_id = d;
-    action->name = devname;
-    action->free_on_release = 1;
-
-    spin_lock_irqsave(&desc->lock, flags);
-    spin_lock(&gic.lock);
-
-    desc->handler = &gic_guest_irq_type;
-    desc->status |= IRQ_GUEST;
-
-    level = dt_irq_is_level_triggered(irq);
-
-    gic_set_irq_properties(irq->irq, level, cpumask_of(smp_processor_id()),
-                           GIC_PRI_IRQ);
-
-    retval = __setup_irq(desc, irq->irq, action);
-    if (retval) {
-        xfree(action);
-        goto out;
-    }
-
-    /* TODO: do not assume delivery to vcpu0 */
-    p = irq_to_pending(d->vcpu[0], irq->irq);
-    p->desc = desc;
-
-out:
-    spin_unlock(&gic.lock);
-    spin_unlock_irqrestore(&desc->lock, flags);
-    return retval;
-}
-
-static void do_sgi(struct cpu_user_regs *regs, int othercpu, enum gic_sgi sgi)
+static void do_sgi(struct cpu_user_regs *regs, enum gic_sgi sgi)
 {
     /* Lower the priority */
-    GICC[GICC_EOIR] = sgi;
+    struct irq_desc *desc = irq_to_desc(sgi);
+
+    /* Lower the priority */
+    gic_hw_ops->eoi_irq(desc);
 
     switch (sgi)
     {
@@ -827,19 +547,17 @@ static void do_sgi(struct cpu_user_regs *regs, int othercpu, enum gic_sgi sgi)
     }
 
     /* Deactivate */
-    GICC[GICC_DIR] = sgi;
+    gic_hw_ops->deactivate_irq(desc);
 }
 
 /* Accept an interrupt from the GIC and dispatch its handler */
 void gic_interrupt(struct cpu_user_regs *regs, int is_fiq)
 {
-    uint32_t intack;
     unsigned int irq;
 
-
     do  {
-        intack = GICC[GICC_IAR];
-        irq = intack & GICC_IA_IRQ;
+        /* Reading IRQ will ACK it */
+        irq = gic_hw_ops->read_irq();
 
         if ( likely(irq >= 16 && irq < 1021) )
         {
@@ -849,8 +567,7 @@ void gic_interrupt(struct cpu_user_regs *regs, int is_fiq)
         }
         else if (unlikely(irq < 16))
         {
-            unsigned int cpu = (intack & GICC_IA_CPU_MASK) >> GICC_IA_CPU_SHIFT;
-            do_sgi(regs, cpu, irq);
+            do_sgi(regs, irq);
         }
         else
         {
@@ -862,155 +579,41 @@ void gic_interrupt(struct cpu_user_regs *regs, int is_fiq)
 
 int gicv_setup(struct domain *d)
 {
-    int ret;
-
-    /*
-     * The hardware domain gets the hardware address.
-     * Guests get the virtual platform layout.
-     */
-    if ( is_hardware_domain(d) )
-    {
-        d->arch.vgic.dbase = gic.dbase;
-        d->arch.vgic.cbase = gic.cbase;
-    }
-    else
-    {
-        d->arch.vgic.dbase = GUEST_GICD_BASE;
-        d->arch.vgic.cbase = GUEST_GICC_BASE;
-    }
-
-    d->arch.vgic.nr_lines = 0;
-
-    /*
-     * Map the gic virtual cpu interface in the gic cpu interface
-     * region of the guest.
-     *
-     * The second page is always mapped at +4K irrespective of the
-     * GIC_64K_STRIDE quirk. The DTB passed to the guest reflects this.
-     */
-    ret = map_mmio_regions(d, d->arch.vgic.cbase,
-                           d->arch.vgic.cbase + PAGE_SIZE - 1,
-                           gic.vbase);
-    if (ret)
-        return ret;
-
-    if ( !platform_has_quirk(PLATFORM_QUIRK_GIC_64K_STRIDE) )
-        ret = map_mmio_regions(d, d->arch.vgic.cbase + PAGE_SIZE,
-                               d->arch.vgic.cbase + (2 * PAGE_SIZE) - 1,
-                               gic.vbase + PAGE_SIZE);
-    else
-        ret = map_mmio_regions(d, d->arch.vgic.cbase + PAGE_SIZE,
-                               d->arch.vgic.cbase + (2 * PAGE_SIZE) - 1,
-                               gic.vbase + 16*PAGE_SIZE);
-
-    return ret;
-
-}
-
-static void gic_irq_eoi(void *info)
-{
-    int virq = (uintptr_t) info;
-    GICC[GICC_DIR] = virq;
+    return gic_hw_ops->gicv_setup(d);
 }
 
 static void maintenance_interrupt(int irq, void *dev_id, struct cpu_user_regs *regs)
 {
-    int i = 0, virq, pirq = -1;
-    uint32_t lr;
-    struct vcpu *v = current;
-    uint64_t eisr = GICH[GICH_EISR0] | (((uint64_t) GICH[GICH_EISR1]) << 32);
-
-    while ((i = find_next_bit((const long unsigned int *) &eisr,
-                              64, i)) < 64) {
-        struct pending_irq *p, *p2;
-        int cpu;
-        bool_t inflight;
-
-        cpu = -1;
-        inflight = 0;
-
-        spin_lock_irq(&gic.lock);
-        lr = GICH[GICH_LR + i];
-        virq = lr & GICH_LR_VIRTUAL_MASK;
-        GICH[GICH_LR + i] = 0;
-        clear_bit(i, &this_cpu(lr_mask));
-
-        p = irq_to_pending(v, virq);
-        if ( p->desc != NULL ) {
-            p->desc->status &= ~IRQ_INPROGRESS;
-            /* Assume only one pcpu needs to EOI the irq */
-            cpu = p->desc->arch.eoi_cpu;
-            pirq = p->desc->irq;
-        }
-        if ( test_bit(GIC_IRQ_GUEST_PENDING, &p->status) &&
-             test_bit(GIC_IRQ_GUEST_ENABLED, &p->status))
-        {
-            inflight = 1;
-            gic_add_to_lr_pending(v, p);
-        }
-
-        clear_bit(GIC_IRQ_GUEST_VISIBLE, &p->status);
-
-        if ( !list_empty(&v->arch.vgic.lr_pending) ) {
-            p2 = list_entry(v->arch.vgic.lr_pending.next, typeof(*p2), lr_queue);
-            gic_set_lr(i, p2, GICH_LR_PENDING);
-            list_del_init(&p2->lr_queue);
-            set_bit(i, &this_cpu(lr_mask));
-        }
-        spin_unlock_irq(&gic.lock);
-
-        if ( !inflight )
-        {
-            spin_lock_irq(&v->arch.vgic.lock);
-            list_del_init(&p->inflight);
-            spin_unlock_irq(&v->arch.vgic.lock);
-        }
-
-        if ( p->desc != NULL ) {
-            /* this is not racy because we can't receive another irq of the
-             * same type until we EOI it.  */
-            if ( cpu == smp_processor_id() )
-                gic_irq_eoi((void*)(uintptr_t)pirq);
-            else
-                on_selected_cpus(cpumask_of(cpu),
-                                 gic_irq_eoi, (void*)(uintptr_t)pirq, 0);
-        }
-
-        i++;
-    }
+    /*
+     * This is a dummy interrupt handler.
+     * Receiving the interrupt is going to cause gic_inject to be called
+     * on return to guest that is going to clear the old LRs and inject
+     * new interrupts.
+     */
 }
 
 void gic_dump_info(struct vcpu *v)
 {
-    int i;
     struct pending_irq *p;
 
     printk("GICH_LRs (vcpu %d) mask=%"PRIx64"\n", v->vcpu_id, v->arch.lr_mask);
-    if ( v == current )
-    {
-        for ( i = 0; i < nr_lrs; i++ )
-            printk("   HW_LR[%d]=%x\n", i, GICH[GICH_LR + i]);
-    } else {
-        for ( i = 0; i < nr_lrs; i++ )
-            printk("   VCPU_LR[%d]=%x\n", i, v->arch.gic_lr[i]);
-    }
+    gic_hw_ops->dump_state(v);
 
     list_for_each_entry ( p, &v->arch.vgic.inflight_irqs, inflight )
     {
-        printk("Inflight irq=%d\n", p->irq);
+        printk("Inflight irq=%d lr=%u\n", p->irq, p->lr);
     }
 
     list_for_each_entry( p, &v->arch.vgic.lr_pending, lr_queue )
     {
         printk("Pending irq=%d\n", p->irq);
     }
-
 }
 
 void __cpuinit init_maintenance_interrupt(void)
 {
-    request_dt_irq(&gic.maintenance, maintenance_interrupt,
-                   "irq-maintenance", NULL);
+    request_irq(gic_hw_ops->info->maintenance_irq, 0, maintenance_interrupt,
+                "irq-maintenance", NULL);
 }
 
 /*

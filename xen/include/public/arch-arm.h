@@ -364,15 +364,34 @@ typedef uint64_t xen_callback_t;
  */
 
 /* Physical Address Space */
-#define GUEST_GICD_BASE   0x2c001000ULL
-#define GUEST_GICD_SIZE   0x1000ULL
-#define GUEST_GICC_BASE   0x2c002000ULL
-#define GUEST_GICC_SIZE   0x100ULL
+#define GUEST_GICD_BASE   0x03001000ULL
+#define GUEST_GICD_SIZE   0x00001000ULL
+#define GUEST_GICC_BASE   0x03002000ULL
+#define GUEST_GICC_SIZE   0x00000100ULL
 
-#define GUEST_RAM_BASE    0x80000000ULL
+/* 16MB == 4096 pages reserved for guest to use as a region to map its
+ * grant table in.
+ */
+#define GUEST_GNTTAB_BASE 0x38000000ULL
+#define GUEST_GNTTAB_SIZE 0x01000000ULL
 
-#define GUEST_GNTTAB_BASE 0xb0000000ULL
-#define GUEST_GNTTAB_SIZE 0x00020000ULL
+#define GUEST_MAGIC_BASE  0x39000000ULL
+#define GUEST_MAGIC_SIZE  0x01000000ULL
+
+#define GUEST_RAM_BANKS   2
+
+#define GUEST_RAM0_BASE   0x40000000ULL /* 3GB of low RAM @ 1GB */
+#define GUEST_RAM0_SIZE   0xc0000000ULL
+
+#define GUEST_RAM1_BASE   0x0200000000ULL /* 1016GB of RAM @ 8GB */
+#define GUEST_RAM1_SIZE   0xfe00000000ULL
+
+#define GUEST_RAM_BASE    GUEST_RAM0_BASE /* Lowest RAM address */
+/* Largest amount of actual RAM, not including holes */
+#define GUEST_RAM_MAX     (GUEST_RAM0_SIZE + GUEST_RAM1_SIZE)
+/* Suitable for e.g. const uint64_t ramfoo[] = GUEST_RAM_BANK_FOOS; */
+#define GUEST_RAM_BANK_BASES   { GUEST_RAM0_BASE, GUEST_RAM1_BASE }
+#define GUEST_RAM_BANK_SIZES   { GUEST_RAM0_SIZE, GUEST_RAM1_SIZE }
 
 /* Interrupts */
 #define GUEST_TIMER_VIRT_PPI    27

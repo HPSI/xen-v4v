@@ -57,6 +57,7 @@
 #include <asm/apic.h>
 #include <asm/hvm/nestedhvm.h>
 #include <asm/event.h>
+#include <public/arch-x86/cpuid.h>
 
 static bool_t __initdata opt_force_ept;
 boolean_param("force-ept", opt_force_ept);
@@ -670,6 +671,14 @@ static void vmx_fpu_leave(struct vcpu *v)
 
 static void vmx_ctxt_switch_from(struct vcpu *v)
 {
+    /*
+     * Return early if trying to do a context switch without VMX enabled,
+     * this can happen when the hypervisor shuts down with HVM guests
+     * still running.
+     */
+    if ( unlikely(!this_cpu(vmxon)) )
+        return;
+
     vmx_fpu_leave(v);
     vmx_save_guest_msrs(v);
     vmx_restore_host_msrs();
@@ -1319,12 +1328,12 @@ static void vmx_update_guest_cr(struct vcpu *v, unsigned int cr)
         if ( !hvm_paging_enabled(v) )
         {
             /*
-             * SMEP is disabled if CPU is in non-paging mode in hardware.
+             * SMEP/SMAP is disabled if CPU is in non-paging mode in hardware.
              * However Xen always uses paging mode to emulate guest non-paging
-             * mode. To emulate this behavior, SMEP needs to be manually
+             * mode. To emulate this behavior, SMEP/SMAP needs to be manually
              * disabled when guest VCPU is in non-paging mode.
              */
-            v->arch.hvm_vcpu.hw_cr[4] &= ~X86_CR4_SMEP;
+            v->arch.hvm_vcpu.hw_cr[4] &= ~(X86_CR4_SMEP | X86_CR4_SMAP);
         }
         __vmwrite(GUEST_CR4, v->arch.hvm_vcpu.hw_cr[4]);
         break;
@@ -1655,6 +1664,24 @@ static void vmx_handle_eoi(u8 vector)
     __vmwrite(GUEST_INTR_STATUS, status);
 }
 
+void vmx_hypervisor_cpuid_leaf(uint32_t sub_idx,
+                               uint32_t *eax, uint32_t *ebx,
+                               uint32_t *ecx, uint32_t *edx)
+{
+    if ( sub_idx != 0 )
+        return;
+    if ( cpu_has_vmx_apic_reg_virt )
+        *eax |= XEN_HVM_CPUID_APIC_ACCESS_VIRT;
+    /*
+     * We want to claim that x2APIC is virtualized if APIC MSR accesses are
+     * not intercepted. When all three of these are true both rdmsr and wrmsr
+     * in the guest will run without VMEXITs (see vmx_vlapic_msr_changed()).
+     */
+    if ( cpu_has_vmx_virtualize_x2apic_mode && cpu_has_vmx_apic_reg_virt &&
+         cpu_has_vmx_virtual_intr_delivery )
+        *eax |= XEN_HVM_CPUID_X2APIC_VIRT;
+}
+
 static struct hvm_function_table __initdata vmx_function_table = {
     .name                 = "VMX",
     .cpu_up_prepare       = vmx_cpu_up_prepare,
@@ -1712,6 +1739,7 @@ static struct hvm_function_table __initdata vmx_function_table = {
     .sync_pir_to_irr      = vmx_sync_pir_to_irr,
     .handle_eoi           = vmx_handle_eoi,
     .nhvm_hap_walk_L1_p2m = nvmx_hap_walk_L1_p2m,
+    .hypervisor_cpuid_leaf = vmx_hypervisor_cpuid_leaf,
 };
 
 const struct hvm_function_table * __init start_vmx(void)
@@ -2269,7 +2297,7 @@ static int vmx_msr_write_intercept(unsigned int msr, uint64_t msr_content)
                      !is_last_branch_msr(msr) )
                     switch ( wrmsr_hypervisor_regs(msr, msr_content) )
                     {
-                    case -EAGAIN:
+                    case -ERESTART:
                         return X86EMUL_RETRY;
                     case 0:
                     case 1:

@@ -966,6 +966,14 @@ static void svm_ctxt_switch_from(struct vcpu *v)
 {
     int cpu = smp_processor_id();
 
+    /*
+     * Return early if trying to do a context switch without SVM enabled,
+     * this can happen when the hypervisor shuts down with HVM guests
+     * still running.
+     */
+    if ( unlikely((read_efer() & EFER_SVME) == 0) )
+        return;
+
     svm_fpu_leave(v);
 
     svm_save_dr(v);
@@ -1827,7 +1835,7 @@ static int svm_msr_write_intercept(unsigned int msr, uint64_t msr_content)
 
         switch ( wrmsr_hypervisor_regs(msr, msr_content) )
         {
-        case -EAGAIN:
+        case -ERESTART:
             result = X86EMUL_RETRY;
             break;
         case 0:
@@ -2557,7 +2565,17 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
         perfc_incra(svmexits, VMEXIT_NPF_PERFC);
         if ( cpu_has_svm_decode )
             v->arch.hvm_svm.cached_insn_len = vmcb->guest_ins_len & 0xf;
-        svm_do_nested_pgfault(v, regs, vmcb->exitinfo1, vmcb->exitinfo2);
+        rc = vmcb->exitinfo1 & PFEC_page_present
+             ? p2m_pt_handle_deferred_changes(vmcb->exitinfo2) : 0;
+        if ( rc >= 0 )
+            svm_do_nested_pgfault(v, regs, vmcb->exitinfo1, vmcb->exitinfo2);
+        else
+        {
+            printk(XENLOG_G_ERR
+                   "%pv: Error %d handling NPF (gpa=%08lx ec=%04lx)\n",
+                   v, rc, vmcb->exitinfo2, vmcb->exitinfo1);
+            domain_crash(v->domain);
+        }
         v->arch.hvm_svm.cached_insn_len = 0;
         break;
 

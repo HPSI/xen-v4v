@@ -6,6 +6,23 @@
 #include <libfdt.h>
 #include <assert.h>
 
+/**
+ * IRQ line type.
+ * DT_IRQ_TYPE_NONE            - default, unspecified type
+ * DT_IRQ_TYPE_EDGE_RISING     - rising edge triggered
+ * DT_IRQ_TYPE_EDGE_FALLING    - falling edge triggered
+ * DT_IRQ_TYPE_EDGE_BOTH       - rising and falling edge triggered
+ * DT_IRQ_TYPE_LEVEL_HIGH      - high level triggered
+ * DT_IRQ_TYPE_LEVEL_LOW       - low level triggered
+ */
+#define DT_IRQ_TYPE_NONE           0x00000000
+#define DT_IRQ_TYPE_EDGE_RISING    0x00000001
+#define DT_IRQ_TYPE_EDGE_FALLING   0x00000002
+#define DT_IRQ_TYPE_EDGE_BOTH                           \
+    (DT_IRQ_TYPE_EDGE_FALLING | DT_IRQ_TYPE_EDGE_RISING)
+#define DT_IRQ_TYPE_LEVEL_HIGH     0x00000004
+#define DT_IRQ_TYPE_LEVEL_LOW      0x00000008
+
 int libxl__arch_domain_create(libxl__gc *gc, libxl_domain_config *d_config,
                               uint32_t domid)
 {
@@ -47,14 +64,20 @@ static void set_cell(be32 **cellp, int size, uint64_t val)
     (*cellp) += cells;
 }
 
-static void set_interrupt_ppi(gic_interrupt interrupt, unsigned int irq,
-                              unsigned int cpumask, unsigned int level)
+static void set_interrupt(gic_interrupt interrupt, unsigned int irq,
+                          unsigned int cpumask, unsigned int level)
 {
     be32 *cells = interrupt;
+    int is_ppi = (irq < 32);
+
+    /* SGIs are not describe in the device tree */
+    assert(irq >= 16);
+
+    irq -= (is_ppi) ? 16: 32; /* PPIs start at 16, SPIs at 32 */
 
     /* See linux Documentation/devictree/bindings/arm/gic.txt */
-    set_cell(&cells, 1, 1); /* is a PPI */
-    set_cell(&cells, 1, irq - 16); /* PPIs start at 16 */
+    set_cell(&cells, 1, is_ppi); /* is a PPI? */
+    set_cell(&cells, 1, irq);
     set_cell(&cells, 1, (cpumask << 8) | level);
 }
 
@@ -255,37 +278,41 @@ static int make_psci_node(libxl__gc *gc, void *fdt)
     return 0;
 }
 
-static int make_memory_node(libxl__gc *gc, void *fdt,
-                            unsigned long long base,
-                            unsigned long long size)
+static int make_memory_nodes(libxl__gc *gc, void *fdt,
+                             const struct xc_dom_image *dom)
 {
-    int res;
-    const char *name = GCSPRINTF("memory@%08llx", base);
+    int res, i;
+    const char *name;
+    const uint64_t bankbase[] = GUEST_RAM_BANK_BASES;
 
-    res = fdt_begin_node(fdt, name);
-    if (res) return res;
+    for (i = 0; i < GUEST_RAM_BANKS; i++) {
+        name = GCSPRINTF("memory@%"PRIx64, bankbase[i]);
 
-    res = fdt_property_string(fdt, "device_type", "memory");
-    if (res) return res;
+        LOG(DEBUG, "Creating placeholder node /%s", name);
 
-    res = fdt_property_regs(gc, fdt, ROOT_ADDRESS_CELLS, ROOT_SIZE_CELLS,
-                            1, (uint64_t)base, (uint64_t)size);
-    if (res) return res;
+        res = fdt_begin_node(fdt, name);
+        if (res) return res;
 
-    res = fdt_end_node(fdt);
-    if (res) return res;
+        res = fdt_property_string(fdt, "device_type", "memory");
+        if (res) return res;
+
+        res = fdt_property_regs(gc, fdt, ROOT_ADDRESS_CELLS, ROOT_SIZE_CELLS,
+                                1, 0, 0);
+        if (res) return res;
+
+        res = fdt_end_node(fdt);
+        if (res) return res;
+    }
 
     return 0;
 }
 
 static int make_intc_node(libxl__gc *gc, void *fdt,
-                          unsigned long long gicd_base,
-                          unsigned long long gicd_size,
-                          unsigned long long gicc_base,
-                          unsigned long long gicc_size)
+                          uint64_t gicd_base, uint64_t gicd_size,
+                          uint64_t gicc_base, uint64_t gicc_size)
 {
     int res;
-    const char *name = GCSPRINTF("interrupt-controller@%08llx", gicd_base);
+    const char *name = GCSPRINTF("interrupt-controller@%"PRIx64, gicd_base);
 
     res = fdt_begin_node(fdt, name);
     if (res) return res;
@@ -307,8 +334,8 @@ static int make_intc_node(libxl__gc *gc, void *fdt,
 
     res = fdt_property_regs(gc, fdt, ROOT_ADDRESS_CELLS, ROOT_SIZE_CELLS,
                             2,
-                            (uint64_t)gicd_base, (uint64_t)gicd_size,
-                            (uint64_t)gicc_base, (uint64_t)gicc_size);
+                            gicd_base, gicd_size,
+                            gicc_base, gicc_size);
     if (res) return res;
 
     res = fdt_property_cell(fdt, "linux,phandle", PHANDLE_GIC);
@@ -334,9 +361,9 @@ static int make_timer_node(libxl__gc *gc, void *fdt, const struct arch_info *ain
     res = fdt_property_compat(gc, fdt, 1, ainfo->timer_compat);
     if (res) return res;
 
-    set_interrupt_ppi(ints[0], GUEST_TIMER_PHYS_S_PPI, 0xf, 0x8);
-    set_interrupt_ppi(ints[1], GUEST_TIMER_PHYS_NS_PPI, 0xf, 0x8);
-    set_interrupt_ppi(ints[2], GUEST_TIMER_VIRT_PPI, 0xf, 0x8);
+    set_interrupt(ints[0], GUEST_TIMER_PHYS_S_PPI, 0xf, DT_IRQ_TYPE_LEVEL_LOW);
+    set_interrupt(ints[1], GUEST_TIMER_PHYS_NS_PPI, 0xf, DT_IRQ_TYPE_LEVEL_LOW);
+    set_interrupt(ints[2], GUEST_TIMER_VIRT_PPI, 0xf, DT_IRQ_TYPE_LEVEL_LOW);
 
     res = fdt_property_interrupts(gc, fdt, ints, 3);
     if (res) return res;
@@ -374,7 +401,7 @@ static int make_hypervisor_node(libxl__gc *gc, void *fdt,
      *  - Active-low level-sensitive
      *  - All cpus
      */
-    set_interrupt_ppi(intr, GUEST_EVTCHN_PPI, 0xf, 0x8);
+    set_interrupt(intr, GUEST_EVTCHN_PPI, 0xf, DT_IRQ_TYPE_LEVEL_LOW);
 
     res = fdt_property_interrupts(gc, fdt, &intr, 1);
     if (res) return res;
@@ -492,9 +519,7 @@ next_resize:
         FDT( make_cpus_node(gc, fdt, info->max_vcpus, ainfo) );
         FDT( make_psci_node(gc, fdt) );
 
-        FDT( make_memory_node(gc, fdt,
-                              dom->rambase_pfn << XC_PAGE_SHIFT,
-                              info->target_memkb * 1024) );
+        FDT( make_memory_nodes(gc, fdt, dom) );
         FDT( make_intc_node(gc, fdt,
                             GUEST_GICD_BASE, GUEST_GICD_SIZE,
                             GUEST_GICC_BASE, GUEST_GICD_SIZE) );
@@ -524,11 +549,38 @@ out:
     return rc;
 }
 
+static void finalise_one_memory_node(libxl__gc *gc, void *fdt,
+                                     uint64_t base, uint64_t size)
+{
+    int node, res;
+    const char *name = GCSPRINTF("/memory@%"PRIx64, base);
+
+    node = fdt_path_offset(fdt, name);
+    assert(node > 0);
+
+    if (size == 0) {
+        LOG(DEBUG, "Nopping out placeholder node %s", name);
+        fdt_nop_node(fdt, node);
+    } else {
+        uint32_t regs[ROOT_ADDRESS_CELLS+ROOT_SIZE_CELLS];
+        be32 *cells = &regs[0];
+
+        LOG(DEBUG, "Populating placeholder node %s", name);
+
+        set_range(&cells, ROOT_ADDRESS_CELLS, ROOT_SIZE_CELLS, base, size);
+
+        res = fdt_setprop_inplace(fdt, node, "reg", regs, sizeof(regs));
+        assert(!res);
+    }
+}
+
 int libxl__arch_domain_finalise_hw_description(libxl__gc *gc,
                                                libxl_domain_build_info *info,
                                                struct xc_dom_image *dom)
 {
     void *fdt = dom->devicetree_blob;
+    int i;
+    const uint64_t bankbase[] = GUEST_RAM_BANK_BASES;
 
     const struct xc_dom_seg *ramdisk = dom->ramdisk_blob ?
         &dom->ramdisk_seg : NULL;
@@ -555,9 +607,16 @@ int libxl__arch_domain_finalise_hw_description(libxl__gc *gc,
         assert(!res);
 
         val = cpu_to_fdt64(ramdisk->vend);
-        res = fdt_setprop_inplace(fdt, chosen,PROP_INITRD_END,
+        res = fdt_setprop_inplace(fdt, chosen, PROP_INITRD_END,
                                   &val, sizeof(val));
         assert(!res);
+
+    }
+
+    for (i = 0; i < GUEST_RAM_BANKS; i++) {
+        const uint64_t size = (uint64_t)dom->rambank_size[i] << XC_PAGE_SHIFT;
+
+        finalise_one_memory_node(gc, fdt, bankbase[i], size);
     }
 
     debug_dump_fdt(gc, fdt);

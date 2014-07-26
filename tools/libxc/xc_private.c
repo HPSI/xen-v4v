@@ -33,6 +33,10 @@
 
 #define XENCTRL_OSDEP "XENCTRL_OSDEP"
 
+#if !defined (__MINIOS__) && !defined(__RUMPUSER_XEN__)
+#define DO_DYNAMIC_OSDEP
+#endif
+
 /*
  * Returns a (shallow) copy of the xc_osdep_info_t for the
  * active OS interface.
@@ -50,7 +54,7 @@
 static int xc_osdep_get_info(xc_interface *xch, xc_osdep_info_t *info)
 {
     int rc = -1;
-#ifndef __MINIOS__
+#ifdef DO_DYNAMIC_OSDEP
     const char *lib = getenv(XENCTRL_OSDEP);
     xc_osdep_info_t *pinfo;
     void *dl_handle = NULL;
@@ -86,7 +90,7 @@ static int xc_osdep_get_info(xc_interface *xch, xc_osdep_info_t *info)
         info->dl_handle = dl_handle;
     }
     else
-#endif
+#endif /*DO_DYNAMIC_OSDEP*/
     {
         *info = xc_osdep_info;
         info->dl_handle = NULL;
@@ -94,21 +98,21 @@ static int xc_osdep_get_info(xc_interface *xch, xc_osdep_info_t *info)
 
     rc = 0;
 
-#ifndef __MINIOS__
+#ifdef DO_DYNAMIC_OSDEP
 out:
     if ( dl_handle && rc == -1 )
         dlclose(dl_handle);
-#endif
+#endif /*DO_DYNAMIC_OSDEP*/
 
     return rc;
 }
 
 static void xc_osdep_put(xc_osdep_info_t *info)
 {
-#ifndef __MINIOS__
+#ifdef DO_DYNAMIC_OSDEP
     if ( info->dl_handle )
         dlclose(info->dl_handle);
-#endif
+#endif /*DO_DYNAMIC_OSDEP*/
 }
 
 static const char *xc_osdep_type_name(enum xc_osdep_type type)
@@ -201,13 +205,13 @@ static int xc_interface_close_common(xc_interface *xch)
     if (!xch)
 	return 0;
 
+    rc = xch->ops->close(xch, xch->ops_handle);
+    if (rc) PERROR("Could not close hypervisor interface");
+
     xc__hypercall_buffer_cache_release(xch);
 
     xtl_logger_destroy(xch->dombuild_logger_tofree);
     xtl_logger_destroy(xch->error_handler_tofree);
-
-    rc = xch->ops->close(xch, xch->ops_handle);
-    if (rc) PERROR("Could not close hypervisor interface");
 
     free(xch);
     return rc;
@@ -628,17 +632,19 @@ int xc_copy_to_domain_page(xc_interface *xch,
     return 0;
 }
 
-int xc_clear_domain_page(xc_interface *xch,
-                         uint32_t domid,
-                         unsigned long dst_pfn)
+int xc_clear_domain_pages(xc_interface *xch,
+                          uint32_t domid,
+                          unsigned long dst_pfn,
+                          int num)
 {
+    size_t size = num * PAGE_SIZE;
     void *vaddr = xc_map_foreign_range(
-        xch, domid, PAGE_SIZE, PROT_WRITE, dst_pfn);
+        xch, domid, size, PROT_WRITE, dst_pfn);
     if ( vaddr == NULL )
         return -1;
-    memset(vaddr, 0, PAGE_SIZE);
-    munmap(vaddr, PAGE_SIZE);
-    xc_domain_cacheflush(xch, domid, dst_pfn, 1);
+    memset(vaddr, 0, size);
+    munmap(vaddr, size);
+    xc_domain_cacheflush(xch, domid, dst_pfn, num);
     return 0;
 }
 

@@ -913,7 +913,7 @@ int mem_sharing_nominate_page(struct domain *d,
     }
 
     /* Change the p2m type, should never fail with p2m locked. */
-    BUG_ON(p2m_change_type(d, gfn, p2mt, p2m_ram_shared) != p2mt);
+    BUG_ON(p2m_change_type_one(d, gfn, p2mt, p2m_ram_shared));
 
     /* Account for this page. */
     atomic_inc(&nr_shared_mfns);
@@ -1236,8 +1236,7 @@ int __mem_sharing_unshare_page(struct domain *d,
     put_page_and_type(old_page);
 
 private_page_found:    
-    if ( p2m_change_type(d, gfn, p2m_ram_shared, p2m_ram_rw) != 
-                                                p2m_ram_shared ) 
+    if ( p2m_change_type_one(d, gfn, p2m_ram_shared, p2m_ram_rw) )
     {
         gdprintk(XENLOG_ERR, "Could not change p2m type d %hu gfn %lx.\n", 
                                 d->domain_id, gfn);
@@ -1298,7 +1297,7 @@ int relinquish_shared_pages(struct domain *d)
             if ( hypercall_preempt_check() )
             {
                 p2m->next_shared_gfn_to_relinquish = gfn + 1;
-                rc = -EAGAIN;
+                rc = -ERESTART;
                 break;
             }
             count = 0;
@@ -1359,7 +1358,7 @@ int mem_sharing_memop(struct domain *d, xen_mem_sharing_op_t *mec)
             if ( rc )
                 return rc;
 
-            rc = xsm_mem_sharing_op(XSM_TARGET, d, cd, mec->op);
+            rc = xsm_mem_sharing_op(XSM_DM_PRIV, d, cd, mec->op);
             if ( rc )
             {
                 rcu_unlock_domain(cd);
@@ -1423,7 +1422,7 @@ int mem_sharing_memop(struct domain *d, xen_mem_sharing_op_t *mec)
             if ( rc )
                 return rc;
 
-            rc = xsm_mem_sharing_op(XSM_TARGET, d, cd, mec->op);
+            rc = xsm_mem_sharing_op(XSM_DM_PRIV, d, cd, mec->op);
             if ( rc )
             {
                 rcu_unlock_domain(cd);

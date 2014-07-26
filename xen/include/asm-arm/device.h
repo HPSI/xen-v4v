@@ -6,7 +6,11 @@
 
 enum device_type
 {
-    DEVICE_SERIAL
+    DEVICE_SERIAL,
+    DEVICE_IOMMU,
+    DEVICE_GIC,
+    /* Use for error */
+    DEVICE_UNKNOWN,
 };
 
 struct device_desc {
@@ -30,6 +34,14 @@ struct device_desc {
  */
 int __init device_init(struct dt_device_node *dev, enum device_type type,
                        const void *data);
+
+/**
+ * device_get_type - Get the type of the device
+ * @dev: device to match
+ *
+ * Return the device type on success or DEVICE_ANY on failure
+ */
+enum device_type device_get_type(const struct dt_device_node *dev);
 
 #define DT_DEVICE_START(_name, _namestr, _type)                     \
 static const struct device_desc __dev_desc_##_name __used           \

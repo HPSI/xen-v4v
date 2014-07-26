@@ -358,7 +358,6 @@ static int ioapic_rte_to_remap_entry(struct iommu *iommu,
     memcpy(iremap_entry, &new_ire, sizeof(struct iremap_entry));
     iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
     iommu_flush_iec_index(iommu, 0, index);
-    invalidate_sync(iommu);
 
     unmap_vtd_domain_page(iremap_entries);
     spin_unlock_irqrestore(&ir_ctrl->iremap_lock, flags);
@@ -535,7 +534,7 @@ static int remap_entry_to_msi_msg(
         msg->dest32 = iremap_entry->lo.dst;
     else
         msg->dest32 = (iremap_entry->lo.dst >> 8) & 0xff;
-    msg->address_lo |= (msg->dest32 & 0xff) << MSI_ADDR_DEST_ID_SHIFT;
+    msg->address_lo |= MSI_ADDR_DEST_ID(msg->dest32);
 
     msg->data =
         MSI_DATA_TRIGGER_EDGE |
@@ -643,7 +642,6 @@ static int msi_msg_to_remap_entry(
     memcpy(iremap_entry, &new_ire, sizeof(struct iremap_entry));
     iommu_flush_cache_entry(iremap_entry, sizeof(struct iremap_entry));
     iommu_flush_iec_index(iommu, 0, index);
-    invalidate_sync(iommu);
 
     unmap_vtd_domain_page(iremap_entries);
     spin_unlock_irqrestore(&ir_ctrl->iremap_lock, flags);

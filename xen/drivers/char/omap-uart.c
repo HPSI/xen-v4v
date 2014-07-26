@@ -30,7 +30,7 @@
 
 static struct omap_uart {
     u32 baud, clock_hz, data_bits, parity, stop_bits, fifo_size;
-    struct dt_irq irq;
+    unsigned int irq;
     char __iomem *regs;
     struct irqaction irqaction;
     struct vuart_info vuart;
@@ -205,10 +205,10 @@ static void __init omap_uart_init_postirq(struct serial_port *port)
     uart->irqaction.name = "omap_uart";
     uart->irqaction.dev_id = port;
 
-    if ( setup_dt_irq(&uart->irq, &uart->irqaction) != 0 )
+    if ( setup_irq(uart->irq, 0, &uart->irqaction) != 0 )
     {
         dprintk(XENLOG_ERR, "Failed to allocated omap_uart IRQ %d\n",
-                uart->irq.irq);
+                uart->irq);
         return;
     }
 
@@ -259,14 +259,7 @@ static int __init omap_uart_irq(struct serial_port *port)
 {
     struct omap_uart *uart = port->uart;
 
-    return ((uart->irq.irq > 0) ? uart->irq.irq : -1);
-}
-
-static const struct dt_irq __init *omap_uart_dt_irq(struct serial_port *port)
-{
-    struct omap_uart *uart = port->uart;
-
-    return &uart->irq;
+    return ((uart->irq > 0) ? uart->irq : -1);
 }
 
 static const struct vuart_info *omap_vuart_info(struct serial_port *port)
@@ -286,7 +279,6 @@ static struct uart_driver __read_mostly omap_uart_driver = {
     .putc = omap_uart_putc,
     .getc = omap_uart_getc,
     .irq = omap_uart_irq,
-    .dt_irq_get = omap_uart_dt_irq,
     .vuart_info = omap_vuart_info,
 };
 
@@ -325,12 +317,13 @@ static int __init omap_uart_init(struct dt_device_node *dev,
         return res;
     }
 
-    res = dt_device_get_irq(dev, 0, &uart->irq);
-    if ( res )
+    res = platform_get_irq(dev, 0);
+    if ( res < 0 )
     {
         printk("omap-uart: Unable to retrieve the IRQ\n");
-        return res;
+        return -EINVAL;
     }
+    uart->irq = res;
 
     uart->regs = ioremap_nocache(addr, size);
     if ( !uart->regs )

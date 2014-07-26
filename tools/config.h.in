@@ -1,5 +1,8 @@
 /* config.h.in.  Generated from configure.ac by autoheader.  */
 
+/* Blktap2 enabled */
+#undef HAVE_BLKTAP2
+
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
@@ -24,6 +27,9 @@
 /* Qemu traditional enabled */
 #undef HAVE_QEMU_TRADITIONAL
 
+/* ROMBIOS enabled */
+#undef HAVE_ROMBIOS
+
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
 
@@ -47,6 +53,12 @@
 
 /* Define to 1 if you have the <unistd.h> header file. */
 #undef HAVE_UNISTD_H
+
+/* Define to 1 if you have the <utmp.h> header file. */
+#undef HAVE_UTMP_H
+
+/* Define to 1 if you have the <valgrind/memcheck.h> header file. */
+#undef HAVE_VALGRIND_MEMCHECK_H
 
 /* Define to 1 if you have the <yajl/yajl_version.h> header file. */
 #undef HAVE_YAJL_YAJL_VERSION_H

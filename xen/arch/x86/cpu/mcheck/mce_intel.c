@@ -49,11 +49,15 @@ static int __read_mostly nr_intel_ext_msrs;
 #define INTEL_SRAR_INSTR_FETCH	0x150
 
 #ifdef CONFIG_X86_MCE_THERMAL
+#define MCE_RING                0x1
+static DEFINE_PER_CPU(int, last_state);
+
 static void intel_thermal_interrupt(struct cpu_user_regs *regs)
 {
     uint64_t msr_content;
     unsigned int cpu = smp_processor_id();
     static DEFINE_PER_CPU(s_time_t, next);
+    int *this_last_state;
 
     ack_APIC_irq();
 
@@ -62,13 +66,17 @@ static void intel_thermal_interrupt(struct cpu_user_regs *regs)
 
     per_cpu(next, cpu) = NOW() + MILLISECS(5000);
     rdmsrl(MSR_IA32_THERM_STATUS, msr_content);
-    if (msr_content & 0x1) {
-        printk(KERN_EMERG "CPU%d: Temperature above threshold\n", cpu);
-        printk(KERN_EMERG "CPU%d: Running in modulated clock mode\n",
-                cpu);
+    this_last_state = &per_cpu(last_state, cpu);
+    if ( *this_last_state == (msr_content & MCE_RING) )
+        return;
+    *this_last_state = msr_content & MCE_RING;
+    if ( msr_content & MCE_RING )
+    {
+        printk(KERN_EMERG "CPU%u: Temperature above threshold\n", cpu);
+        printk(KERN_EMERG "CPU%u: Running in modulated clock mode\n", cpu);
         add_taint(TAINT_MACHINE_CHECK);
     } else {
-        printk(KERN_INFO "CPU%d: Temperature/speed normal\n", cpu);
+        printk(KERN_INFO "CPU%u: Temperature/speed normal\n", cpu);
     }
 }
 
@@ -258,7 +266,7 @@ static enum intel_mce_type intel_check_mce_type(uint64_t status)
 static void intel_memerr_dhandler(
              struct mca_binfo *binfo,
              enum mce_result *result,
-             struct cpu_user_regs *regs)
+             const struct cpu_user_regs *regs)
 {
     mce_printk(MCE_VERBOSE, "MCE: Enter UCR recovery action\n");
     mc_memerr_dhandler(binfo, result, regs);
@@ -285,7 +293,7 @@ static int intel_checkaddr(uint64_t status, uint64_t misc, int addrtype)
 static void intel_srar_dhandler(
              struct mca_binfo *binfo,
              enum mce_result *result,
-             struct cpu_user_regs *regs)
+             const struct cpu_user_regs *regs)
 {
     uint64_t status = binfo->mib->mc_status;
 
@@ -311,7 +319,7 @@ static int intel_srao_check(uint64_t status)
 static void intel_srao_dhandler(
              struct mca_binfo *binfo,
              enum mce_result *result,
-             struct cpu_user_regs *regs)
+             const struct cpu_user_regs *regs)
 {
     uint64_t status = binfo->mib->mc_status;
 
@@ -340,7 +348,7 @@ static int intel_default_check(uint64_t status)
 static void intel_default_mce_dhandler(
              struct mca_binfo *binfo,
              enum mce_result *result,
-             struct cpu_user_regs * regs)
+             const struct cpu_user_regs * regs)
 {
     uint64_t status = binfo->mib->mc_status;
     enum intel_mce_type type;
@@ -362,7 +370,7 @@ static const struct mca_error_handler intel_mce_dhandlers[] = {
 static void intel_default_mce_uhandler(
              struct mca_binfo *binfo,
              enum mce_result *result,
-             struct cpu_user_regs *regs)
+             const struct cpu_user_regs *regs)
 {
     uint64_t status = binfo->mib->mc_status;
     enum intel_mce_type type;
@@ -383,12 +391,6 @@ static void intel_default_mce_uhandler(
 static const struct mca_error_handler intel_mce_uhandlers[] = {
     {intel_default_check, intel_default_mce_uhandler}
 };
-
-static void intel_machine_check(struct cpu_user_regs * regs, long error_code)
-{
-    mcheck_cmn_handler(regs, error_code, mca_allbanks,
-        __get_cpu_var(mce_clear_banks));
-}
 
 /* According to MCA OS writer guide, CMCI handler need to clear bank when
  * 1) CE (UC = 0)
@@ -772,7 +774,7 @@ static void intel_init_mce(void)
     if (firstbank) /* if cmci enabled, firstbank = 0 */
         wrmsrl(MSR_IA32_MC0_STATUS, 0x0ULL);
 
-    x86_mce_vector_register(intel_machine_check);
+    x86_mce_vector_register(mcheck_cmn_handler);
     mce_recoverable_register(intel_recoverable_scan);
     mce_need_clearbank_register(intel_need_clearbank_scan);
     mce_register_addrcheck(intel_checkaddr);
@@ -802,6 +804,7 @@ static int cpu_mcabank_alloc(unsigned int cpu)
 
     per_cpu(no_cmci_banks, cpu) = cmci;
     per_cpu(mce_banks_owned, cpu) = owned;
+    per_cpu(last_state, cpu) = -1;
 
     return 0;
 out:

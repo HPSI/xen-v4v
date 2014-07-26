@@ -505,12 +505,13 @@ static char ** libxl__build_device_model_args_new(libxl__gc *gc,
 
         switch (b_info->u.hvm.vga.kind) {
         case LIBXL_VGA_INTERFACE_TYPE_STD:
-            flexarray_append_pair(dm_args, "-device", "VGA");
+            flexarray_append_pair(dm_args, "-device",
+                GCSPRINTF("VGA,vgamem_mb=%d",
+                libxl__sizekb_to_mb(b_info->video_memkb)));
             break;
         case LIBXL_VGA_INTERFACE_TYPE_CIRRUS:
-            flexarray_append_pair(dm_args, "-device", "cirrus-vga");
-            flexarray_append_pair(dm_args, "-global",
-                GCSPRINTF("vga.vram_size_mb=%d",
+            flexarray_append_pair(dm_args, "-device",
+                GCSPRINTF("cirrus-vga,vgamem_mb=%d",
                 libxl__sizekb_to_mb(b_info->video_memkb)));
             break;
         case LIBXL_VGA_INTERFACE_TYPE_NONE:
@@ -909,7 +910,11 @@ void libxl__spawn_stub_dm(libxl__egc *egc, libxl__stub_dm_spawn_state *sdss)
     dm_config->c_info.type = LIBXL_DOMAIN_TYPE_PV;
     dm_config->c_info.name = libxl__stub_dm_name(gc,
                                     libxl__domid_to_name(gc, guest_domid));
+    /* When we are here to launch stubdom, ssidref is a valid value
+     * already, no need to parse it again.
+     */
     dm_config->c_info.ssidref = guest_config->b_info.device_model_ssidref;
+    dm_config->c_info.ssid_label = NULL;
 
     libxl_uuid_generate(&dm_config->c_info.uuid);
 

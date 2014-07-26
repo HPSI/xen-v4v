@@ -22,8 +22,8 @@
 #  include <yajl/yajl_version.h>
 #endif
 
+yajl_gen_status libxl__uint64_gen_json(yajl_gen hand, uint64_t val);
 yajl_gen_status libxl_defbool_gen_json(yajl_gen hand, libxl_defbool *p);
-yajl_gen_status libxl_domid_gen_json(yajl_gen hand, libxl_domid *p);
 yajl_gen_status libxl_uuid_gen_json(yajl_gen hand, libxl_uuid *p);
 yajl_gen_status libxl_mac_gen_json(yajl_gen hand, libxl_mac *p);
 yajl_gen_status libxl_bitmap_gen_json(yajl_gen hand, libxl_bitmap *p);
@@ -33,6 +33,7 @@ yajl_gen_status libxl_string_list_gen_json(yajl_gen hand, libxl_string_list *p);
 yajl_gen_status libxl_key_value_list_gen_json(yajl_gen hand,
                                               libxl_key_value_list *p);
 yajl_gen_status libxl_hwcap_gen_json(yajl_gen hand, libxl_hwcap *p);
+yajl_gen_status libxl_ms_vm_genid_gen_json(yajl_gen hand, libxl_ms_vm_genid *p);
 
 #include <_libxl_types_json.h>
 

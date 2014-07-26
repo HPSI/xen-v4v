@@ -42,13 +42,6 @@ void iommu_flush_cache_page(void *addr, unsigned long npages);
 int iommu_alloc(struct acpi_drhd_unit *drhd);
 void iommu_free(struct acpi_drhd_unit *drhd);
 
-int queue_invalidate_context(struct iommu *iommu,
-    u16 did, u16 source_id, u8 function_mask, u8 granu);
-int queue_invalidate_iotlb(struct iommu *iommu,
-    u8 granu, u8 dr, u8 dw, u16 did, u8 am, u8 ih, u64 addr);
-int queue_invalidate_iec(struct iommu *iommu,
-    u8 granu, u8 im, u16 iidx);
-int invalidate_sync(struct iommu *iommu);
 int iommu_flush_iec_global(struct iommu *iommu);
 int iommu_flush_iec_index(struct iommu *iommu, u8 im, u16 iidx);
 void clear_fault_bits(struct iommu *iommu);
@@ -99,8 +92,10 @@ void platform_quirks_init(void);
 void vtd_ops_preamble_quirk(struct iommu* iommu);
 void vtd_ops_postamble_quirk(struct iommu* iommu);
 void me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map);
-void pci_vtd_quirk(struct pci_dev *pdev);
+void pci_vtd_quirk(const struct pci_dev *);
 int platform_supports_intremap(void);
 int platform_supports_x2apic(void);
+
+void vtd_set_hwdom_mapping(struct domain *d);
 
 #endif // _VTD_EXTERN_H_

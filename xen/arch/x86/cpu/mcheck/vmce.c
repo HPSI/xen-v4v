@@ -356,6 +356,10 @@ int inject_vmce(struct domain *d, int vcpu)
         if ( vcpu != VMCE_INJECT_BROADCAST && vcpu != v->vcpu_id )
             continue;
 
+        /* Don't inject to uninitialized VCPU. */
+        if ( !v->is_initialised )
+            continue;
+
         if ( (has_hvm_container_domain(d) ||
               guest_has_trap_callback(d, v->vcpu_id, TRAP_machine_check)) &&
              !test_and_set_bool(v->mce_pending) )
@@ -444,8 +448,7 @@ int unmmap_broken_page(struct domain *d, mfn_t mfn, unsigned long gfn)
     if ( p2m_to_mask(pt) & P2M_UNMAP_TYPES)
     {
         ASSERT(mfn_x(r_mfn) == mfn_x(mfn));
-        p2m_change_type(d, gfn, pt, p2m_ram_broken);
-        rc = 0;
+        rc = p2m_change_type_one(d, gfn, pt, p2m_ram_broken);
     }
     put_gfn(d, gfn);
 

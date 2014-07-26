@@ -683,14 +683,16 @@ APPEND_LIB
 APPEND_INCLUDES
 PREPEND_LIB
 PREPEND_INCLUDES
+EXTRA_QEMUU_CONFIGURE_ARGS
 ovmf_path
 seabios_path
 qemu_xen
+rombios
 qemu_traditional
+blktap2
 blktap1
 debug
 seabios
-rombios
 ovmf
 xsmpolicy
 ocamltools
@@ -704,6 +706,7 @@ CPPFLAGS
 LDFLAGS
 CFLAGS
 CC
+CONFIG_RUMP
 host_os
 host_vendor
 host_cpu
@@ -759,14 +762,16 @@ enable_monitors
 enable_ocamltools
 enable_xsmpolicy
 enable_ovmf
-enable_rombios
 enable_seabios
 enable_debug
 enable_blktap1
+enable_blktap2
 enable_qemu_traditional
+enable_rombios
 with_system_qemu
 with_system_seabios
 with_system_ovmf
+with_extra_qemuu_configure_args
 '
       ac_precious_vars='build_alias
 host_alias
@@ -1419,13 +1424,16 @@ Optional Features:
   --disable-ocamltools    Disable Ocaml tools (default is ENABLED)
   --disable-xsmpolicy     Disable XSM policy compilation (default is ENABLED)
   --enable-ovmf           Enable OVMF (default is DISABLED)
-  --disable-rombios       Disable ROM BIOS (default is ENABLED)
   --disable-seabios       Disable SeaBIOS (default is ENABLED)
   --disable-debug         Disable debug build of tools (default is ENABLED)
   --enable-blktap1        Enable blktap1 tools (default is DISABLED)
+  --enable-blktap2        Enable blktap2, (DEFAULT is on for Linux, otherwise
+                          off)
   --enable-qemu-traditional
                           Enable qemu traditional device model, (DEFAULT is on
-                          for x86, otherwise off)
+                          for Linux or NetBSD x86, otherwise off)
+  --enable-rombios        Enable ROMBIOS, (DEFAULT is on if qemu-traditional
+                          is enabled, otherwise off)
 
 Optional Packages:
   --with-PACKAGE[=ARG]    use PACKAGE [ARG=yes]
@@ -1440,6 +1448,9 @@ Optional Packages:
   --with-system-ovmf[=PATH]
                           Use system supplied OVMF PATH instead of building
                           and installing our own version
+  --with-extra-qemuu-configure-args[="--ARG1 ..."]
+                          List of additional configure options for upstream
+                          qemu
 
 Some influential environment variables:
   CC          C compiler command
@@ -2311,6 +2322,12 @@ host_os=$*
 IFS=$ac_save_IFS
 case $host_os in *\ *) host_os=`echo "$host_os" | sed 's/ /-/g'`;; esac
 
+
+
+case $host_vendor in
+rumpxen) CONFIG_RUMP=y; rump=true ;;
+*)       CONFIG_RUMP=n; rump=false ;;
+esac
 
 
 ac_ext=c
@@ -3422,6 +3439,44 @@ esac
 # PKG_CHECK_MODULES
 
 
+# PKG_CHECK_MODULES_STATIC(VARIABLE-PREFIX, MODULES, [ACTION-IF-FOUND],
+# [ACTION-IF-NOT-FOUND])
+# ---------------------------------------------------------------------
+# Checks for existence of MODULES and gathers its build flags with
+# static libraries enabled. Sets VARIABLE-PREFIX_CFLAGS from --cflags
+# and VARIABLE-PREFIX_LIBS from --libs.
+#
+# Note that if there is a possibility the first call to
+# PKG_CHECK_MODULES_STATIC might not happen, you should be sure to include
+# an explicit call to PKG_PROG_PKG_CONFIG in your configure.ac.
+
+
+
+# PKG_INSTALLDIR(DIRECTORY)
+# -------------------------
+# Substitutes the variable pkgconfigdir as the location where a module
+# should install pkg-config .pc files. By default the directory is
+# $libdir/pkgconfig, but the default can be changed by passing
+# DIRECTORY. The user can override through the --with-pkgconfigdir
+# parameter.
+
+
+# PKG_NOARCH_INSTALLDIR(DIRECTORY)
+# -------------------------
+# Substitutes the variable noarch_pkgconfigdir as the location where a
+# module should install arch-independent pkg-config .pc files. By
+# default the directory is $datadir/pkgconfig, but the default can be
+# changed by passing DIRECTORY. The user can override through the
+# --with-noarch-pkgconfigdir parameter.
+
+
+# PKG_CHECK_VAR(VARIABLE, MODULE, CONFIG-VARIABLE,
+# [ACTION-IF-FOUND], [ACTION-IF-NOT-FOUND])
+# -------------------------------------------
+# Retrieves the value of the pkg-config variable for the given module.
+# PKG_CHECK_VAR
+
+
 
 # We define, separately, PTHREAD_CFLAGS, _LDFLAGS and _LIBS
 # even though currently we don't set them very separately.
@@ -3649,29 +3704,6 @@ ovmf=$ax_cv_ovmf
 
 
 
-# Check whether --enable-rombios was given.
-if test "${enable_rombios+set}" = set; then :
-  enableval=$enable_rombios;
-fi
-
-
-if test "x$enable_rombios" = "xno"; then :
-
-    ax_cv_rombios="n"
-
-elif test "x$enable_rombios" = "xyes"; then :
-
-    ax_cv_rombios="y"
-
-elif test -z $ax_cv_rombios; then :
-
-    ax_cv_rombios="y"
-
-fi
-rombios=$ax_cv_rombios
-
-
-
 # Check whether --enable-seabios was given.
 if test "${enable_seabios+set}" = set; then :
   enableval=$enable_seabios;
@@ -3741,6 +3773,33 @@ blktap1=$ax_cv_blktap1
 
 
 
+# Check whether --enable-blktap2 was given.
+if test "${enable_blktap2+set}" = set; then :
+  enableval=$enable_blktap2;
+else
+
+    case "$host_os" in
+        linux*)
+           enable_blktap2="yes";;
+        *) enable_blktap2="no";;
+    esac
+
+fi
+
+if test "x$enable_blktap2" = "xyes"; then :
+
+
+$as_echo "#define HAVE_BLKTAP2 1" >>confdefs.h
+
+    blktap2=y
+else
+
+    blktap2=n
+
+fi
+
+
+
 # Check whether --enable-qemu-traditional was given.
 if test "${enable_qemu_traditional+set}" = set; then :
   enableval=$enable_qemu_traditional;
@@ -3751,6 +3810,11 @@ else
            enable_qemu_traditional="yes";;
         *) enable_qemu_traditional="no";;
     esac
+    case "$host_os" in
+        freebsd*)
+           enable_qemu_traditional="no";;
+    esac
+
 
 fi
 
@@ -3763,6 +3827,36 @@ $as_echo "#define HAVE_QEMU_TRADITIONAL 1" >>confdefs.h
 else
 
     qemu_traditional=n
+
+fi
+
+
+# Check whether --enable-rombios was given.
+if test "${enable_rombios+set}" = set; then :
+  enableval=$enable_rombios;
+else
+
+    if test "x$enable_qemu_traditional" = "xyes"; then :
+
+        enable_rombios="yes"
+
+else
+
+        enable_rombios="no"
+
+fi
+
+fi
+
+if test "x$enable_rombios" = "xyes"; then :
+
+
+$as_echo "#define HAVE_ROMBIOS 1" >>confdefs.h
+
+    rombios=y
+else
+
+    rombios=n
 
 fi
 
@@ -3818,6 +3912,19 @@ if test "${with_system_ovmf+set}" = set; then :
     case $withval in
         no) ovmf_path= ;;
         *)  ovmf_path=$withval ;;
+    esac
+
+fi
+
+
+
+
+# Check whether --with-extra-qemuu-configure-args was given.
+if test "${with_extra_qemuu_configure_args+set}" = set; then :
+  withval=$with_extra_qemuu_configure_args;
+    case $withval in
+        no) EXTRA_QEMUU_CONFIGURE_ARGS= ;;
+        *)  EXTRA_QEMUU_CONFIGURE_ARGS=$withval ;;
     esac
 
 fi
@@ -6604,6 +6711,8 @@ LDLFAGS=$ac_previous_ldflags
 
 fi
 
+if ! $rump; then
+
 # Extract the first word of "xgettext", so it can be a program name with args.
 set dummy xgettext; ac_word=$2
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking for $ac_word" >&5
@@ -7025,6 +7134,7 @@ fi
 
 
 
+
 if test "x$ac_cv_env_PKG_CONFIG_set" != "xset"; then
 	if test -n "$ac_tool_prefix"; then
   # Extract the first word of "${ac_tool_prefix}pkg-config", so it can be a program name with args.
@@ -7153,6 +7263,7 @@ if test -n "$glib_CFLAGS"; then
   $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
   test $ac_status = 0; }; then
   pkg_cv_glib_CFLAGS=`$PKG_CONFIG --cflags "glib-2.0 >= 2.12" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
 else
   pkg_failed=yes
 fi
@@ -7169,6 +7280,7 @@ if test -n "$glib_LIBS"; then
   $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
   test $ac_status = 0; }; then
   pkg_cv_glib_LIBS=`$PKG_CONFIG --libs "glib-2.0 >= 2.12" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
 else
   pkg_failed=yes
 fi
@@ -7188,9 +7300,9 @@ else
         _pkg_short_errors_supported=no
 fi
         if test $_pkg_short_errors_supported = yes; then
-	        glib_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors "glib-2.0 >= 2.12" 2>&1`
+	        glib_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "glib-2.0 >= 2.12" 2>&1`
         else
-	        glib_PKG_ERRORS=`$PKG_CONFIG --print-errors "glib-2.0 >= 2.12" 2>&1`
+	        glib_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "glib-2.0 >= 2.12" 2>&1`
         fi
 	# Put the nasty error message in config.log where it belongs
 	echo "$glib_PKG_ERRORS" >&5
@@ -7473,6 +7585,8 @@ fi
 
 
 
+if test "x$enable_blktap1" = "xyes" || test "x$enable_blktap2" = "xyes"; then :
+
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking for io_setup in -laio" >&5
 $as_echo_n "checking for io_setup in -laio... " >&6; }
 if ${ac_cv_lib_aio_io_setup+:} false; then :
@@ -7520,6 +7634,8 @@ else
   as_fn_error $? "Could not find libaio" "$LINENO" 5
 fi
 
+
+fi
 
 { $as_echo "$as_me:${as_lineno-$LINENO}: checking for MD5 in -lcrypto" >&5
 $as_echo_n "checking for MD5 in -lcrypto... " >&6; }
@@ -8039,7 +8155,7 @@ fi
 esac
 
 # Checks for header files.
-for ac_header in yajl/yajl_version.h sys/eventfd.h
+for ac_header in yajl/yajl_version.h sys/eventfd.h valgrind/memcheck.h utmp.h
 do :
   as_ac_Header=`$as_echo "ac_cv_header_$ac_header" | $as_tr_sh`
 ac_fn_c_check_header_mongrel "$LINENO" "$ac_header" "$as_ac_Header" "$ac_includes_default"
@@ -8052,6 +8168,8 @@ fi
 
 done
 
+
+fi # ! $rump
 
 cat >confcache <<\_ACEOF
 # This file is a shell script that caches the results of configure

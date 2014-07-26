@@ -218,37 +218,59 @@ XEN_EXTFILES_URL ?= http://xenbits.xen.org/xen-extfiles
 # the internet.  The original download URL is preserved as a comment
 # near the place in the Xen Makefiles where the file is used.
 
-ifeq ($(GIT_HTTP),y)
-QEMU_REMOTE ?= http://xenbits.xen.org/git-http/qemu-xen-unstable.git
-else
-QEMU_REMOTE ?= git://xenbits.xen.org/qemu-xen-unstable.git
+# Where to look for inlined subtrees (for example, from a tarball)
+QEMU_UPSTREAM_INTREE ?= $(XEN_ROOT)/tools/qemu-xen
+QEMU_TRADITIONAL_INTREE ?= $(XEN_ROOT)/tools/qemu-xen-traditional
+
+
+# Handle legacy options
+ifneq (,$(SEABIOS_UPSTREAM_TAG))
+SEABIOS_UPSTREAM_REVISION ?= $(SEABIOS_UPSTREAM_TAG)
+endif
+ifneq (,$(QEMU_REMOTE))
+QEMU_TRADITIONAL_URL ?= $(QEMU_REMOTE)
+endif
+ifneq (,$(CONFIG_QEMU))
+QEMU_TRADITIONAL_LOC ?= $(CONFIG_QEMU)
+endif
+ifneq (,$(QEMU_TAG))
+QEMU_TRADITIONAL_REVISION ?= $(QEMU_TAG)
 endif
 
 ifeq ($(GIT_HTTP),y)
 OVMF_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/ovmf.git
 QEMU_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/qemu-upstream-unstable.git
+QEMU_TRADITIONAL_URL ?= http://xenbits.xen.org/git-http/qemu-xen-unstable.git
 SEABIOS_UPSTREAM_URL ?= http://xenbits.xen.org/git-http/seabios.git
 else
 OVMF_UPSTREAM_URL ?= git://xenbits.xen.org/ovmf.git
 QEMU_UPSTREAM_URL ?= git://xenbits.xen.org/qemu-upstream-unstable.git
+QEMU_TRADITIONAL_URL ?= git://xenbits.xen.org/qemu-xen-unstable.git
 SEABIOS_UPSTREAM_URL ?= git://xenbits.xen.org/seabios.git
 endif
 OVMF_UPSTREAM_REVISION ?= 447d264115c476142f884af0be287622cd244423
 QEMU_UPSTREAM_REVISION ?= master
-SEABIOS_UPSTREAM_TAG ?= rel-1.7.3.1
-# Fri Aug 2 14:12:09 2013 -0400
-# Fix bug in CBFS file walking with compressed files.
+SEABIOS_UPSTREAM_REVISION ?= rel-1.7.5
+# Thu May 22 16:59:16 2014 -0400
+# python3 fixes for vgabios and csm builds.
 
 ETHERBOOT_NICS ?= rtl8139 8086100e
 
+
+QEMU_TRADITIONAL_REVISION ?= d0395cc49b2ec6d1723c01f1daf2394b9264ca29
+# Tue Apr 8 16:50:06 2014 +0000
+# qemu-xen-trad: free all the pirqs for msi/msix when driver unloads
+
 # Specify which qemu-dm to use. This may be `ioemu' to use the old
 # Mercurial in-tree version, or a local directory, or a git URL.
-# CONFIG_QEMU ?= `pwd`/$(XEN_ROOT)/../qemu-xen.git
-CONFIG_QEMU ?= $(QEMU_REMOTE)
+# QEMU_UPSTREAM_LOC ?= `pwd`/$(XEN_ROOT)/../qemu-xen.git
 
-QEMU_TAG ?= 7f5b3c338e0f8938ba575dec18255dcbee0c2ee2
-# Wed Dec 18 15:25:14 2013 +0000
-# qemu-traditional: Fix build warnings on Wheezy
+# Defaults for subtree locations
+QEMU_TRADITIONAL_LOC ?= $(or $(wildcard $(QEMU_TRADITIONAL_INTREE)),\
+                        $(QEMU_TRADITIONAL_URL))
+
+QEMU_UPSTREAM_LOC ?= $(or $(wildcard $(QEMU_UPSTREAM_INTREE)),\
+                        $(QEMU_UPSTREAM_URL))
 
 # Short answer -- do not enable this unless you know what you are
 # doing and are prepared for some pain.

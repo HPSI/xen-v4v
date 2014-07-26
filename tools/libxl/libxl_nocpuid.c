@@ -14,6 +14,11 @@
 
 #include "libxl_internal.h"
 
+int libxl__cpuid_policy_is_empty(libxl_cpuid_policy_list *pl)
+{
+    return 1;
+}
+
 void libxl_cpuid_dispose(libxl_cpuid_policy_list *p_cpuid_list)
 {
 }
@@ -42,6 +47,19 @@ yajl_gen_status libxl_cpuid_policy_list_gen_json(yajl_gen hand,
                                 libxl_cpuid_policy_list *pcpuid)
 {
     return 0;
+}
+
+int libxl__cpuid_policy_list_parse_json(libxl__gc *gc,
+                                        const libxl__json_object *o,
+                                        libxl_cpuid_policy_list *p)
+{
+    return 0;
+}
+
+void libxl_cpuid_policy_list_copy(libxl_ctx *ctx,
+                                  libxl_cpuid_policy_list *dst,
+                                  libxl_cpuid_policy_list *src)
+{
 }
 
 /*

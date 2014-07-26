@@ -5,7 +5,7 @@
 XEN_ROOT = $(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
-MAJOR = 4.4
+MAJOR = 4.5
 MINOR = 0
 
 XLUMAJOR = 4.3
@@ -52,8 +52,12 @@ else
 ifeq ($(CONFIG_Linux),y)
 LIBXL_OBJS-y += libxl_linux.o
 else
+ifeq ($(CONFIG_FreeBSD),y)
+LIBXL_OBJS-y += libxl_freebsd.o
+else
 $(error Your Operating System is not supported by libxenlight, \
 please check libxl_linux.c and libxl_netbsd.c to see how to get it ported)
+endif
 endif
 endif
 
@@ -77,6 +81,7 @@ LIBXL_OBJS = flexarray.o libxl.o libxl_create.o libxl_dm.o libxl_pci.o \
 			libxl_json.o libxl_aoutils.o libxl_numa.o \
 			libxl_save_callout.o _libxl_save_msgs_callout.o \
 			libxl_qmp.o libxl_event.o libxl_fork.o $(LIBXL_OBJS-y)
+LIBXL_OBJS += libxl_genid.o
 LIBXL_OBJS += _libxl_types.o libxl_flask.o _libxl_types_internal.o
 
 LIBXL_TESTS += timedereg
@@ -171,7 +176,7 @@ _libxl_save_msgs_helper.h _libxl_save_msgs_callout.h: \
 
 libxl.h: _libxl_types.h
 libxl_json.h: _libxl_types_json.h
-libxl_internal.h: _libxl_types_internal.h _paths.h
+libxl_internal.h: _libxl_types_internal.h _libxl_types_private.h _libxl_types_internal_private.h _paths.h
 libxl_internal_json.h: _libxl_types_internal_json.h
 xl.h: _paths.h
 
@@ -179,17 +184,19 @@ $(LIBXL_OBJS) $(LIBXL_TEST_OBJS) $(LIBXLU_OBJS) \
 	$(XL_OBJS) $(TEST_PROG_OBJS) $(SAVE_HELPER_OBJS): libxl.h
 $(LIBXL_OBJS) $(LIBXL_TEST_OBJS): libxl_internal.h
 
-_libxl_type%.h _libxl_type%_json.h _libxl_type%.c: libxl_type%.idl gentypes.py idl.py
-	$(PYTHON) gentypes.py libxl_type$*.idl __libxl_type$*.h __libxl_type$*_json.h __libxl_type$*.c
+_libxl_type%.h _libxl_type%_json.h _libxl_type%_private.h _libxl_type%.c: libxl_type%.idl gentypes.py idl.py
+	$(PYTHON) gentypes.py libxl_type$*.idl __libxl_type$*.h __libxl_type$*_private.h \
+		__libxl_type$*_json.h  __libxl_type$*.c
 	$(call move-if-changed,__libxl_type$*.h,_libxl_type$*.h)
+	$(call move-if-changed,__libxl_type$*_private.h,_libxl_type$*_private.h)
 	$(call move-if-changed,__libxl_type$*_json.h,_libxl_type$*_json.h)
 	$(call move-if-changed,__libxl_type$*.c,_libxl_type$*.c)
 
 libxenlight.so: libxenlight.so.$(MAJOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 libxenlight.so.$(MAJOR): libxenlight.so.$(MAJOR).$(MINOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 libxenlight.so.$(MAJOR).$(MINOR): $(LIBXL_OBJS)
 	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenlight.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(LIBXL_LIBS) $(APPEND_LDFLAGS)
@@ -201,10 +208,10 @@ libxenlight.a: $(LIBXL_OBJS)
 	$(AR) rcs libxenlight.a $^
 
 libxlutil.so: libxlutil.so.$(XLUMAJOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 libxlutil.so.$(XLUMAJOR): libxlutil.so.$(XLUMAJOR).$(XLUMINOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 libxlutil.so.$(XLUMAJOR).$(XLUMINOR): $(LIBXLU_OBJS)
 	$(CC) $(LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxlutil.so.$(XLUMAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(LIBXLU_LIBS) $(APPEND_LDFLAGS)
@@ -233,13 +240,13 @@ install: all
 	$(INSTALL_DIR) $(DESTDIR)$(PRIVATE_BINDIR)
 	$(INSTALL_PROG) xl $(DESTDIR)$(SBINDIR)
 	$(INSTALL_PROG) libxl-save-helper $(DESTDIR)$(PRIVATE_BINDIR)
-	$(INSTALL_PROG) libxenlight.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
-	ln -sf libxenlight.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenlight.so.$(MAJOR)
-	ln -sf libxenlight.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenlight.so
+	$(INSTALL_SHLIB) libxenlight.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
+	$(SYMLINK_SHLIB) libxenlight.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenlight.so.$(MAJOR)
+	$(SYMLINK_SHLIB) libxenlight.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenlight.so
 	$(INSTALL_DATA) libxenlight.a $(DESTDIR)$(LIBDIR)
-	$(INSTALL_PROG) libxlutil.so.$(XLUMAJOR).$(XLUMINOR) $(DESTDIR)$(LIBDIR)
-	ln -sf libxlutil.so.$(XLUMAJOR).$(XLUMINOR) $(DESTDIR)$(LIBDIR)/libxlutil.so.$(XLUMAJOR)
-	ln -sf libxlutil.so.$(XLUMAJOR) $(DESTDIR)$(LIBDIR)/libxlutil.so
+	$(INSTALL_SHLIB) libxlutil.so.$(XLUMAJOR).$(XLUMINOR) $(DESTDIR)$(LIBDIR)
+	$(SYMLINK_SHLIB) libxlutil.so.$(XLUMAJOR).$(XLUMINOR) $(DESTDIR)$(LIBDIR)/libxlutil.so.$(XLUMAJOR)
+	$(SYMLINK_SHLIB) libxlutil.so.$(XLUMAJOR) $(DESTDIR)$(LIBDIR)/libxlutil.so
 	$(INSTALL_DATA) libxlutil.a $(DESTDIR)$(LIBDIR)
 	$(INSTALL_DATA) libxl.h libxl_event.h libxl_json.h _libxl_types.h _libxl_types_json.h _libxl_list.h libxl_utils.h libxl_uuid.h $(DESTDIR)$(INCLUDEDIR)
 	$(INSTALL_DATA) bash-completion $(DESTDIR)$(BASH_COMPLETION_DIR)/xl.sh

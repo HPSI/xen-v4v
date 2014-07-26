@@ -73,6 +73,10 @@
 #define MATTR_DEV     0x1
 #define MATTR_MEM     0xf
 
+/* Flags for get_page_from_gva, gvirt_to_maddr etc */
+#define GV2M_READ  (0u<<0)
+#define GV2M_WRITE (1u<<0)
+
 #ifndef __ASSEMBLY__
 
 #include <xen/types.h>
@@ -260,9 +264,9 @@ extern size_t cacheline_bytes;
 /* Functions for flushing medium-sized areas.
  * if 'range' is large enough we might want to use model-specific
  * full-cache flushes. */
-static inline void clean_xen_dcache_va_range(void *p, unsigned long size)
+static inline void clean_xen_dcache_va_range(const void *p, unsigned long size)
 {
-    void *end;
+    const void *end;
     dsb(sy);           /* So the CPU issues all writes to the range */
     for ( end = p + size; p < end; p += cacheline_bytes )
         asm volatile (__clean_xen_dcache_one(0) : : "r" (p));
@@ -270,9 +274,9 @@ static inline void clean_xen_dcache_va_range(void *p, unsigned long size)
 }
 
 static inline void clean_and_invalidate_xen_dcache_va_range
-    (void *p, unsigned long size)
+    (const void *p, unsigned long size)
 {
-    void *end;
+    const void *end;
     dsb(sy);         /* So the CPU issues all writes to the range */
     for ( end = p + size; p < end; p += cacheline_bytes )
         asm volatile (__clean_and_invalidate_xen_dcache_one(0) : : "r" (p));

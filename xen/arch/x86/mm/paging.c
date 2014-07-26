@@ -168,6 +168,15 @@ int paging_log_dirty_enable(struct domain *d, bool_t log_global)
 {
     int ret;
 
+    if ( need_iommu(d) && log_global )
+    {
+        /*
+         * Refuse to turn on global log-dirty mode
+         * if the domain is using the IOMMU.
+         */
+        return -EINVAL;
+    }
+
     if ( paging_mode_log_dirty(d) )
         return -EINVAL;
 
@@ -469,12 +478,8 @@ void paging_log_dirty_range(struct domain *d,
     p2m_lock(p2m);
 
     for ( i = 0, pfn = begin_pfn; pfn < begin_pfn + nr; i++, pfn++ )
-    {
-        p2m_type_t pt;
-        pt = p2m_change_type(d, pfn, p2m_ram_rw, p2m_ram_logdirty);
-        if ( pt == p2m_ram_rw )
+        if ( !p2m_change_type_one(d, pfn, p2m_ram_rw, p2m_ram_logdirty) )
             dirty_bitmap[i >> 3] |= (1 << (i & 7));
-    }
 
     p2m_unlock(p2m);
 

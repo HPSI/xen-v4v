@@ -1,3 +1,8 @@
+CONFIG_RUMP         := @CONFIG_RUMP@
+ifeq ($(CONFIG_RUMP),y)
+XEN_OS              := NetBSDRump
+endif
+
 # Prefix and install folder
 prefix              := @prefix@
 PREFIX              := $(prefix)
@@ -54,7 +59,9 @@ CONFIG_SEABIOS      := @seabios@
 CONFIG_QEMU_TRAD    := @qemu_traditional@
 CONFIG_QEMU_XEN     := @qemu_xen@
 CONFIG_BLKTAP1      := @blktap1@
+CONFIG_BLKTAP2      := @blktap2@
 CONFIG_VTPM         := @vtpm@
+CONFIG_QEMUU_EXTRA_ARGS:= @EXTRA_QEMUU_CONFIGURE_ARGS@
 
 #System options
 ZLIB                := @zlib@

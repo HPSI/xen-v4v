@@ -74,7 +74,7 @@ u64 vmx_ept_vpid_cap __read_mostly;
 static DEFINE_PER_CPU_READ_MOSTLY(struct vmcs_struct *, vmxon_region);
 static DEFINE_PER_CPU(struct vmcs_struct *, current_vmcs);
 static DEFINE_PER_CPU(struct list_head, active_vmcs_list);
-static DEFINE_PER_CPU(bool_t, vmxon);
+DEFINE_PER_CPU(bool_t, vmxon);
 
 static u32 vmcs_revision_id __read_mostly;
 u64 __read_mostly vmx_basic_msr;
@@ -824,8 +824,12 @@ void virtual_vmcs_enter(void *vvmcs)
 
 void virtual_vmcs_exit(void *vvmcs)
 {
+    struct vmcs_struct *cur = this_cpu(current_vmcs);
+
     __vmpclear(pfn_to_paddr(domain_page_map_to_mfn(vvmcs)));
-    __vmptrld(virt_to_maddr(this_cpu(current_vmcs)));
+    if ( cur )
+        __vmptrld(virt_to_maddr(cur));
+
 }
 
 u64 virtual_vmcs_vmread(void *vvmcs, u32 vmcs_encoding)

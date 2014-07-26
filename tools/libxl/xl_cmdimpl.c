@@ -88,9 +88,6 @@ xlchild children[child_max];
 static const char *common_domname;
 static int fd_lock = -1;
 
-/* Stash for specific vcpu to pcpu mappping */
-static int *vcpu_to_pcpu;
-
 static const char savefileheader_magic[32]=
     "Xen saved domain, xl format\n \0 \r";
 
@@ -157,38 +154,6 @@ struct domain_create {
     char **migration_domname_r; /* from malloc */
 };
 
-
-
-static int qualifier_to_id(const char *p, uint32_t *id_r)
-{
-    int i, alldigit;
-
-    alldigit = 1;
-    for (i = 0; p[i]; i++) {
-        if (!isdigit((uint8_t)p[i])) {
-            alldigit = 0;
-            break;
-        }
-    }
-
-    if (i > 0 && alldigit) {
-        *id_r = strtoul(p, NULL, 10);
-        return 0;
-    } else {
-        /* check here if it's a uuid and do proper conversion */
-    }
-    return 1;
-}
-
-static int cpupool_qualifier_to_cpupoolid(const char *p, uint32_t *poolid_r,
-                                     int *was_name_r)
-{
-    int was_name;
-
-    was_name = qualifier_to_id(p, poolid_r);
-    if (was_name_r) *was_name_r = was_name;
-    return was_name ? libxl_name_to_cpupoolid(ctx, p, poolid_r) : 0;
-}
 
 static uint32_t find_domain(const char *p) __attribute__((warn_unused_result));
 static uint32_t find_domain(const char *p)
@@ -728,16 +693,14 @@ static void parse_top_level_sdl_options(XLU_Config *config,
 static void parse_config_data(const char *config_source,
                               const char *config_data,
                               int config_len,
-                              libxl_domain_config *d_config,
-                              struct domain_create *dom_info)
-
+                              libxl_domain_config *d_config)
 {
     const char *buf;
     long l;
     XLU_Config *config;
     XLU_ConfigList *cpus, *vbds, *nics, *pcis, *cvfbs, *cpuids, *vtpms;
     XLU_ConfigList *ioports, *irqs, *iomem;
-    int num_ioports, num_irqs, num_iomem;
+    int num_ioports, num_irqs, num_iomem, num_cpus;
     int pci_power_mgmt = 0;
     int pci_msitranslate = 0;
     int pci_permissive = 0;
@@ -759,35 +722,17 @@ static void parse_config_data(const char *config_source,
         exit(1);
     }
 
-    if (!xlu_cfg_get_string (config, "init_seclabel", &buf, 0)) {
-        e = libxl_flask_context_to_sid(ctx, (char *)buf, strlen(buf),
-                                    &c_info->ssidref);
-        if (e) {
-            if (errno == ENOSYS) {
-                fprintf(stderr, "XSM Disabled: init_seclabel not supported\n");
-            } else {
-                fprintf(stderr, "Invalid init_seclabel: %s\n", buf);
-                exit(1);
-            }
-        }
-    }
+    if (!xlu_cfg_get_string (config, "init_seclabel", &buf, 0))
+        xlu_cfg_replace_string(config, "init_seclabel",
+                               &c_info->ssid_label, 0);
 
     if (!xlu_cfg_get_string (config, "seclabel", &buf, 0)) {
-        uint32_t ssidref;
-        e = libxl_flask_context_to_sid(ctx, (char *)buf, strlen(buf),
-                                    &ssidref);
-        if (e) {
-            if (errno == ENOSYS) {
-                fprintf(stderr, "XSM Disabled: seclabel not supported\n");
-            } else {
-                fprintf(stderr, "Invalid seclabel: %s\n", buf);
-                exit(1);
-            }
-        } else if (c_info->ssidref) {
-            b_info->exec_ssidref = ssidref;
-        } else {
-            c_info->ssidref = ssidref;
-        }
+        if (c_info->ssid_label)
+            xlu_cfg_replace_string(config, "seclabel",
+                                   &b_info->exec_ssid_label, 0);
+        else
+            xlu_cfg_replace_string(config, "seclabel",
+                                   &c_info->ssid_label, 0);
     }
 
     libxl_defbool_set(&c_info->run_hotplug_scripts, run_hotplug_scripts);
@@ -815,14 +760,8 @@ static void parse_config_data(const char *config_source,
 
     xlu_cfg_get_defbool(config, "oos", &c_info->oos, 0);
 
-    if (!xlu_cfg_get_string (config, "pool", &buf, 0)) {
-        c_info->poolid = -1;
-        cpupool_qualifier_to_cpupoolid(buf, &c_info->poolid, NULL);
-    }
-    if (!libxl_cpupoolid_is_valid(ctx, c_info->poolid)) {
-        fprintf(stderr, "Illegal pool specified\n");
-        exit(1);
-    }
+    if (!xlu_cfg_get_string (config, "pool", &buf, 0))
+        xlu_cfg_replace_string(config, "pool", &c_info->pool_name, 0);
 
     libxl_domain_build_info_init_type(b_info, c_info->type);
     if (blkdev_start)
@@ -858,43 +797,32 @@ static void parse_config_data(const char *config_source,
     if (!xlu_cfg_get_long (config, "maxvcpus", &l, 0))
         b_info->max_vcpus = l;
 
-    if (!xlu_cfg_get_list (config, "cpus", &cpus, 0, 1)) {
-        int n_cpus = 0;
+    if (!xlu_cfg_get_list (config, "cpus", &cpus, &num_cpus, 1)) {
+        int j = 0;
 
-        if (libxl_cpu_bitmap_alloc(ctx, &b_info->cpumap, 0)) {
-            fprintf(stderr, "Unable to allocate cpumap\n");
-            exit(1);
-        }
+        /* Silently ignore values corresponding to non existing vcpus */
+        if (num_cpus > b_info->max_vcpus)
+            num_cpus = b_info->max_vcpus;
 
-        /* Prepare the array for single vcpu to pcpu mappings */
-        vcpu_to_pcpu = xmalloc(sizeof(int) * b_info->max_vcpus);
-        memset(vcpu_to_pcpu, -1, sizeof(int) * b_info->max_vcpus);
+        b_info->vcpu_hard_affinity = xmalloc(num_cpus * sizeof(libxl_bitmap));
 
-        /*
-         * Idea here is to let libxl think all the domain's vcpus
-         * have cpu affinity with all the pcpus on the list.
-         * It is then us, here in xl, that matches each single vcpu
-         * to its pcpu (and that's why we need to stash such info in
-         * the vcpu_to_pcpu array now) after the domain has been created.
-         * Doing it like this saves the burden of passing to libxl
-         * some big array hosting the single mappings. Also, using
-         * the cpumap derived from the list ensures memory is being
-         * allocated on the proper nodes anyway.
-         */
-        libxl_bitmap_set_none(&b_info->cpumap);
-        while ((buf = xlu_cfg_get_listitem(cpus, n_cpus)) != NULL) {
+        while ((buf = xlu_cfg_get_listitem(cpus, j)) != NULL && j < num_cpus) {
             i = atoi(buf);
-            if (!libxl_bitmap_cpu_valid(&b_info->cpumap, i)) {
-                fprintf(stderr, "cpu %d illegal\n", i);
+
+            libxl_bitmap_init(&b_info->vcpu_hard_affinity[j]);
+            if (libxl_cpu_bitmap_alloc(ctx,
+                                       &b_info->vcpu_hard_affinity[j], 0)) {
+                fprintf(stderr, "Unable to allocate cpumap for vcpu %d\n", j);
                 exit(1);
             }
-            libxl_bitmap_set(&b_info->cpumap, i);
-            if (n_cpus < b_info->max_vcpus)
-                vcpu_to_pcpu[n_cpus] = i;
-            n_cpus++;
-        }
+            libxl_bitmap_set_none(&b_info->vcpu_hard_affinity[j]);
+            libxl_bitmap_set(&b_info->vcpu_hard_affinity[j], i);
 
-        /* We have a cpumap, disable automatic placement */
+            j++;
+        }
+        b_info->num_vcpu_hard_affinity = num_cpus;
+
+        /* We have a list of cpumaps, disable automatic placement */
         libxl_defbool_set(&b_info->numa_placement, false);
     }
     else if (!xlu_cfg_get_string (config, "cpus", &buf, 0)) {
@@ -988,12 +916,9 @@ static void parse_config_data(const char *config_source,
     if (!xlu_cfg_get_long(config, "rtc_timeoffset", &l, 0))
         b_info->rtc_timeoffset = l;
 
-    if (dom_info && !xlu_cfg_get_long(config, "vncviewer", &l, 0)) {
-        /* Command line arguments must take precedence over what's
-         * specified in the configuration file. */
-        if (!dom_info->vnc)
-            dom_info->vnc = l;
-    }
+    if (!xlu_cfg_get_long(config, "vncviewer", &l, 0))
+        fprintf(stderr, "WARNING: ignoring \"vncviewer\" option. "
+                "Use \"-V\" option of \"xl create\" to automatically spawn vncviewer.\n");
 
     xlu_cfg_get_defbool(config, "localtime", &b_info->localtime, 0);
 
@@ -1058,6 +983,21 @@ static void parse_config_data(const char *config_source,
                                &b_info->u.hvm.smbios_firmware, 0);
         xlu_cfg_replace_string(config, "acpi_firmware",
                                &b_info->u.hvm.acpi_firmware, 0);
+
+        if (!xlu_cfg_get_string(config, "ms_vm_genid", &buf, 0)) {
+            if (!strcmp(buf, "generate")) {
+                e = libxl_ms_vm_genid_generate(ctx, &b_info->u.hvm.ms_vm_genid);
+                if (e) {
+                    fprintf(stderr, "ERROR: failed to generate a VM Generation ID\n");
+                    exit(1);
+                }
+            } else if (!strcmp(buf, "none")) {
+                ;
+            } else {
+                    fprintf(stderr, "ERROR: \"ms_vm_genid\" option must be \"generate\" or \"none\"\n");
+                    exit(1);
+            }
+        }
         break;
     case LIBXL_DOMAIN_TYPE_PV:
     {
@@ -1614,20 +1554,10 @@ skip_vfb:
                          &b_info->device_model_stubdomain, 0);
 
     if (!xlu_cfg_get_string (config, "device_model_stubdomain_seclabel",
-                             &buf, 0)) {
-        e = libxl_flask_context_to_sid(ctx, (char *)buf, strlen(buf),
-                                    &b_info->device_model_ssidref);
-        if (e) {
-            if (errno == ENOSYS) {
-                fprintf(stderr, "XSM Disabled:"
-                        " device_model_stubdomain_seclabel not supported\n");
-            } else {
-                fprintf(stderr, "Invalid device_model_stubdomain_seclabel:"
-                        " %s\n", buf);
-                exit(1);
-            }
-        }
-    }
+                             &buf, 0))
+        xlu_cfg_replace_string(config, "device_model_stubdomain_seclabel",
+                               &b_info->device_model_ssid_label, 0);
+
 #define parse_extra_args(type)                                            \
     e = xlu_cfg_get_list_as_string_list(config, "device_model_args"#type, \
                                     &b_info->extra##type, 0);            \
@@ -2186,7 +2116,7 @@ static uint32_t create_domain(struct domain_create *dom_info)
     if (!dom_info->quiet)
         printf("Parsing config from %s\n", config_source);
 
-    parse_config_data(config_source, config_data, config_len, &d_config, dom_info);
+    parse_config_data(config_source, config_data, config_len, &d_config);
 
     if (migrate_fd >= 0) {
         if (d_config.c_info.name) {
@@ -2253,33 +2183,6 @@ start:
     }
     if ( ret )
         goto error_out;
-
-    /* If single vcpu to pcpu mapping was requested, honour it */
-    if (vcpu_to_pcpu) {
-        libxl_bitmap vcpu_cpumap;
-
-        ret = libxl_cpu_bitmap_alloc(ctx, &vcpu_cpumap, 0);
-        if (ret)
-            goto error_out;
-        for (i = 0; i < d_config.b_info.max_vcpus; i++) {
-
-            if (vcpu_to_pcpu[i] != -1) {
-                libxl_bitmap_set_none(&vcpu_cpumap);
-                libxl_bitmap_set(&vcpu_cpumap, vcpu_to_pcpu[i]);
-            } else {
-                libxl_bitmap_set_any(&vcpu_cpumap);
-            }
-            if (libxl_set_vcpuaffinity(ctx, domid, i, &vcpu_cpumap)) {
-                fprintf(stderr, "setting affinity failed on vcpu `%d'.\n", i);
-                libxl_bitmap_dispose(&vcpu_cpumap);
-                free(vcpu_to_pcpu);
-                ret = ERROR_FAIL;
-                goto error_out;
-            }
-        }
-        libxl_bitmap_dispose(&vcpu_cpumap);
-        free(vcpu_to_pcpu); vcpu_to_pcpu = NULL;
-    }
 
     ret = libxl_userdata_store(ctx, domid, "xl",
                                     config_data, config_len);
@@ -2388,7 +2291,7 @@ start:
                 libxl_domain_config_dispose(&d_config);
                 libxl_domain_config_init(&d_config);
                 parse_config_data(config_source, config_data, config_len,
-                                  &d_config, dom_info);
+                                  &d_config);
 
                 /*
                  * XXX FIXME: If this sleep is not there then domain
@@ -3199,7 +3102,7 @@ static void list_domains_details(const libxl_dominfo *info, int nb_domain)
             continue;
         CHK_SYSCALL(asprintf(&config_source, "<domid %d data>", info[i].domid));
         libxl_domain_config_init(&d_config);
-        parse_config_data(config_source, (char *)data, len, &d_config, NULL);
+        parse_config_data(config_source, (char *)data, len, &d_config);
         if (default_output_format == OUTPUT_FORMAT_JSON)
             s = printf_info_one_json(hand, info[i].domid, &d_config);
         else
@@ -3339,15 +3242,8 @@ static void list_domains(int verbose, int context, int claim, int numa,
         }
         if (claim)
             printf(" %5lu", (unsigned long)info[i].outstanding_memkb / 1024);
-        if (verbose || context) {
-            int rc;
-            size_t size;
-            char *buf = NULL;
-            rc = libxl_flask_sid_to_context(ctx, info[i].ssidref, &buf,
-                                            &size);
-            printf(" %16s", rc < 0 ? "-" : buf);
-            free(buf);
-        }
+        if (verbose || context)
+            printf(" %16s", info[i].ssid_label ? : "-");
         if (numa) {
             libxl_domain_get_nodeaffinity(ctx, info[i].domid, &nodemap);
 
@@ -4507,7 +4403,7 @@ int main_config_update(int argc, char **argv)
 
     libxl_domain_config_init(&d_config);
 
-    parse_config_data(filename, config_data, config_len, &d_config, NULL);
+    parse_config_data(filename, config_data, config_len, &d_config);
 
     if (debug || dryrun_only)
         printf_info(default_output_format, -1, &d_config);
@@ -4700,7 +4596,7 @@ static int vcpupin(uint32_t domid, const char *vcpu, char *cpu)
     }
 
     if (vcpuid != -1) {
-        if (libxl_set_vcpuaffinity(ctx, domid, vcpuid, &cpumap) == -1) {
+        if (libxl_set_vcpuaffinity(ctx, domid, vcpuid, &cpumap, NULL)) {
             fprintf(stderr, "Could not set affinity for vcpu `%u'.\n", vcpuid);
             goto out;
         }
@@ -4712,7 +4608,7 @@ static int vcpupin(uint32_t domid, const char *vcpu, char *cpu)
         }
         for (i = 0; i < nb_vcpu; i++) {
             if (libxl_set_vcpuaffinity(ctx, domid, vcpuinfo[i].vcpuid,
-                                       &cpumap) == -1) {
+                                       &cpumap, NULL)) {
                 fprintf(stderr, "libxl_set_vcpuaffinity failed"
                                 " on vcpu `%u'.\n", vcpuinfo[i].vcpuid);
             }
@@ -5223,7 +5119,7 @@ static int sched_domain_output(libxl_scheduler sched, int (*output)(int),
     int rc = 0;
 
     if (cpupool) {
-        if (cpupool_qualifier_to_cpupoolid(cpupool, &poolid, NULL) ||
+        if (libxl_cpupool_qualifier_to_cpupoolid(ctx, cpupool, &poolid, NULL) ||
             !libxl_cpupoolid_is_valid(ctx, poolid)) {
             fprintf(stderr, "unknown cpupool \'%s\'\n", cpupool);
             return -ERROR_FAIL;
@@ -5343,7 +5239,8 @@ int main_sched_credit(int argc, char **argv)
         uint32_t poolid = 0;
 
         if (cpupool) {
-            if (cpupool_qualifier_to_cpupoolid(cpupool, &poolid, NULL) ||
+            if (libxl_cpupool_qualifier_to_cpupoolid(ctx, cpupool,
+                                                     &poolid, NULL) ||
                 !libxl_cpupoolid_is_valid(ctx, poolid)) {
                 fprintf(stderr, "unknown cpupool \'%s\'\n", cpupool);
                 return -ERROR_FAIL;
@@ -6560,7 +6457,7 @@ int main_tmem_freeable(int argc, char **argv)
     int opt;
     int mb;
 
-    SWITCH_FOREACH_OPT(opt, "", NULL, "tmem-freeale", 0) {
+    SWITCH_FOREACH_OPT(opt, "", NULL, "tmem-freeable", 0) {
         /* No options */
     }
 
@@ -6811,27 +6708,21 @@ int main_cpupoollist(int argc, char **argv)
 
     for (p = 0; p < n_pools; p++) {
         if (!ret && (!pool || (poolinfo[p].poolid == poolid))) {
-            name = libxl_cpupoolid_to_name(ctx, poolinfo[p].poolid);
-            if (!name) {
-                fprintf(stderr, "error getting cpupool info\n");
-                ret = -ERROR_NOMEM;
-            } else {
-                printf("%-19s", name);
-                free(name);
-                n = 0;
-                libxl_for_each_bit(c, poolinfo[p].cpumap)
-                    if (libxl_bitmap_test(&poolinfo[p].cpumap, c)) {
-                        if (n && opt_cpus) printf(",");
-                        if (opt_cpus) printf("%d", c);
-                        n++;
-                    }
-                if (!opt_cpus) {
-                    printf("%3d %9s       y       %4d", n,
-                           libxl_scheduler_to_string(poolinfo[p].sched),
-                           poolinfo[p].n_dom);
+            name = poolinfo[p].pool_name;
+            printf("%-19s", name);
+            n = 0;
+            libxl_for_each_bit(c, poolinfo[p].cpumap)
+                if (libxl_bitmap_test(&poolinfo[p].cpumap, c)) {
+                    if (n && opt_cpus) printf(",");
+                    if (opt_cpus) printf("%d", c);
+                    n++;
                 }
-                printf("\n");
+            if (!opt_cpus) {
+                printf("%3d %9s       y       %4d", n,
+                       libxl_scheduler_to_string(poolinfo[p].sched),
+                       poolinfo[p].n_dom);
             }
+            printf("\n");
         }
     }
 
@@ -6852,7 +6743,7 @@ int main_cpupooldestroy(int argc, char **argv)
 
     pool = argv[optind];
 
-    if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+    if (libxl_cpupool_qualifier_to_cpupoolid(ctx, pool, &poolid, NULL) ||
         !libxl_cpupoolid_is_valid(ctx, poolid)) {
         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
         return -ERROR_FAIL;
@@ -6874,7 +6765,7 @@ int main_cpupoolrename(int argc, char **argv)
 
     pool = argv[optind++];
 
-    if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+    if (libxl_cpupool_qualifier_to_cpupoolid(ctx, pool, &poolid, NULL) ||
         !libxl_cpupoolid_is_valid(ctx, poolid)) {
         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
         return -ERROR_FAIL;
@@ -6912,7 +6803,7 @@ int main_cpupoolcpuadd(int argc, char **argv)
         cpu = atoi(argv[optind]);
     }
 
-    if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+    if (libxl_cpupool_qualifier_to_cpupoolid(ctx, pool, &poolid, NULL) ||
         !libxl_cpupoolid_is_valid(ctx, poolid)) {
         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
         return -ERROR_FAIL;
@@ -6957,7 +6848,7 @@ int main_cpupoolcpuremove(int argc, char **argv)
         cpu = atoi(argv[optind]);
     }
 
-    if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+    if (libxl_cpupool_qualifier_to_cpupoolid(ctx, pool, &poolid, NULL) ||
         !libxl_cpupoolid_is_valid(ctx, poolid)) {
         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
         return -ERROR_FAIL;
@@ -7001,7 +6892,7 @@ int main_cpupoolmigrate(int argc, char **argv)
         return -ERROR_FAIL;
     }
 
-    if (cpupool_qualifier_to_cpupoolid(pool, &poolid, NULL) ||
+    if (libxl_cpupool_qualifier_to_cpupoolid(ctx, pool, &poolid, NULL) ||
         !libxl_cpupoolid_is_valid(ctx, poolid)) {
         fprintf(stderr, "unknown cpupool \'%s\'\n", pool);
         return -ERROR_FAIL;

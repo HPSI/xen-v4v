@@ -71,6 +71,20 @@
 
 /* Coprocessor 14 */
 
+/* CP14 0: Debug Register interface */
+#define DBGDIDR         p14,0,c0,c0,0   /* Debug ID Register */
+#define DBGDSCRINT      p14,0,c0,c1,0   /* Debug Status and Control Internal */
+#define DBGDSCREXT      p14,0,c0,c2,2   /* Debug Status and Control External */
+#define DBGVCR          p14,0,c0,c7,0   /* Vector Catch */
+#define DBGBVR0         p14,0,c0,c0,4   /* Breakpoint Value 0 */
+#define DBGBCR0         p14,0,c0,c0,5   /* Breakpoint Control 0 */
+#define DBGWVR0         p14,0,c0,c0,6   /* Watchpoint Value 0 */
+#define DBGWCR0         p14,0,c0,c0,7   /* Watchpoint Control 0 */
+#define DBGBVR1         p14,0,c0,c1,4   /* Breakpoint Value 1 */
+#define DBGBCR1         p14,0,c0,c1,5   /* Breakpoint Control 1 */
+#define DBGOSLAR        p14,0,c1,c0,4   /* OS Lock Access */
+#define DBGOSDLR        p14,0,c1,c3,4   /* OS Double Lock */
+
 /* CP14 CR0: */
 #define TEECR           p14,6,c0,c0,0   /* ThumbEE Configuration Register */
 
@@ -198,7 +212,22 @@
 #define TLBIMVAH        p15,4,c8,c7,1   /* Invalidate Unified Hyp. TLB by MVA */
 #define TLBIALLNSNH     p15,4,c8,c7,4   /* Invalidate Entire Non-Secure Non-Hyp. Unified TLB */
 
-/* CP15 CR9: */
+/* CP15 CR9: Performance monitors */
+#define PMCR            p15,0,c9,c12,0  /* Perf. Mon. Control Register */
+#define PMCNTENSET      p15,0,c9,c12,1  /* Perf. Mon. Count Enable Set register */
+#define PMCNTENCLR      p15,0,c9,c12,2  /* Perf. Mon. Count Enable Clear register */
+#define PMOVSR          p15,0,c9,c12,3  /* Perf. Mon. Overflow Flag Status Register */
+#define PMSWINC         p15,0,c9,c12,4  /* Perf. Mon. Software Increment register */
+#define PMSELR          p15,0,c9,c12,5  /* Perf. Mon. Event Counter Selection Register */
+#define PMCEID0         p15,0,c9,c12,6  /* Perf. Mon. Common Event Identification register 0 */
+#define PMCEID1         p15,0,c9,c12,7  /* Perf. Mon. Common Event Identification register 1 */
+#define PMCCNTR         p15,0,c9,c13,0  /* Perf. Mon. Cycle Count Register */
+#define PMXEVCNTR       p15,0,c9,c13,1  /* Perf. Mon. Event Type Select Register */
+#define PMXEVCNR        p15,0,c9,c13,2  /* Perf. Mon. Event Count Register */
+#define PMUSERENR       p15,0,c9,c14,0  /* Perf. Mon. User Enable Register */
+#define PMINTENSET      p15,0,c9,c14,1  /* Perf. Mon. Interrupt Enable Set Register */
+#define PMINTENCLR      p15,0,c9,c14,2  /* Perf. Mon. Interrupt Enable Clear Register */
+#define PMOVSSET        p15,0,c9,c14,3  /* Perf. Mon. Overflow Flag Status Set register */
 
 /* CP15 CR10: */
 #define MAIR0           p15,0,c10,c2,0  /* Memory Attribute Indirection Register 0 AKA PRRR */

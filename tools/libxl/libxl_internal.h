@@ -960,8 +960,6 @@ typedef struct {
     uint32_t console_domid;
     unsigned long console_mfn;
 
-    unsigned long vm_generationid_addr;
-
     char *saved_state;
 
     libxl__file_reference pv_kernel;
@@ -1551,6 +1549,8 @@ struct libxl__xen_console_reader {
 _hidden int libxl__parse_mac(const char *s, libxl_mac mac);
 /* compare mac address @a and @b. 0 if the same, -ve if a<b and +ve if a>b */
 _hidden int libxl__compare_macs(libxl_mac *a, libxl_mac *b);
+/* return true if mac address is all zero (the default value) */
+_hidden int libxl__mac_is_default(libxl_mac *mac);
 /* init a recursive mutex */
 _hidden int libxl__init_recursive_mutex(libxl_ctx *ctx, pthread_mutex_t *lock);
 
@@ -1613,16 +1613,16 @@ _hidden yajl_gen_status libxl__yajl_gen_asciiz(yajl_gen hand, const char *str);
 _hidden yajl_gen_status libxl__yajl_gen_enum(yajl_gen hand, const char *str);
 
 typedef enum {
-    JSON_NULL,
-    JSON_BOOL,
-    JSON_INTEGER,
-    JSON_DOUBLE,
+    JSON_NULL    = (1 << 0),
+    JSON_BOOL    = (1 << 1),
+    JSON_INTEGER = (1 << 2),
+    JSON_DOUBLE  = (1 << 3),
     /* number is store in string, it's too big to be a long long or a double */
-    JSON_NUMBER,
-    JSON_STRING,
-    JSON_MAP,
-    JSON_ARRAY,
-    JSON_ANY
+    JSON_NUMBER  = (1 << 4),
+    JSON_STRING  = (1 << 5),
+    JSON_MAP     = (1 << 6),
+    JSON_ARRAY   = (1 << 7),
+    JSON_ANY     = 255 /* this is a mask of all values above, adjust as needed */
 } libxl__json_node_type;
 
 typedef struct libxl__json_object {
@@ -1640,6 +1640,14 @@ typedef struct libxl__json_object {
     struct libxl__json_object *parent;
 } libxl__json_object;
 
+typedef int (*libxl__json_parse_callback)(libxl__gc *gc,
+                                          libxl__json_object *o,
+                                          void *p);
+_hidden int libxl__object_from_json(libxl_ctx *ctx, const char *type,
+                                    libxl__json_parse_callback parse,
+                                    void *p,
+                                    const char *s);
+
 typedef struct {
     char *map_key;
     libxl__json_object *obj;
@@ -1647,6 +1655,10 @@ typedef struct {
 
 typedef struct libxl__yajl_ctx libxl__yajl_ctx;
 
+static inline bool libxl__json_object_is_null(const libxl__json_object *o)
+{
+    return o != NULL && o->type == JSON_NULL;
+}
 static inline bool libxl__json_object_is_bool(const libxl__json_object *o)
 {
     return o != NULL && o->type == JSON_BOOL;
@@ -1658,6 +1670,14 @@ static inline bool libxl__json_object_is_string(const libxl__json_object *o)
 static inline bool libxl__json_object_is_integer(const libxl__json_object *o)
 {
     return o != NULL && o->type == JSON_INTEGER;
+}
+static inline bool libxl__json_object_is_double(const libxl__json_object *o)
+{
+    return o != NULL && o->type == JSON_DOUBLE;
+}
+static inline bool libxl__json_object_is_number(const libxl__json_object *o)
+{
+    return o != NULL && o->type == JSON_NUMBER;
 }
 static inline bool libxl__json_object_is_map(const libxl__json_object *o)
 {
@@ -1679,6 +1699,14 @@ static inline
 const char *libxl__json_object_get_string(const libxl__json_object *o)
 {
     if (libxl__json_object_is_string(o))
+        return o->u.string;
+    else
+        return NULL;
+}
+static inline
+const char *libxl__json_object_get_number(const libxl__json_object *o)
+{
+    if (libxl__json_object_is_number(o))
         return o->u.string;
     else
         return NULL;
@@ -1715,7 +1743,7 @@ _hidden libxl__json_object *libxl__json_object_alloc(libxl__gc *gc_opt,
                                                      libxl__json_node_type type);
 _hidden int libxl__json_object_append_to(libxl__gc *gc_opt,
                                          libxl__json_object *obj,
-                                         libxl__json_object *dst);
+                                         libxl__yajl_ctx *ctx);
 _hidden libxl__json_object *libxl__json_array_get(const libxl__json_object *o,
                                                   int i);
 _hidden
@@ -2030,6 +2058,33 @@ _hidden const char *libxl__xen_script_dir_path(void);
 _hidden const char *libxl__lock_dir_path(void);
 _hidden const char *libxl__run_dir_path(void);
 
+/*----- subprocess execution with timeout -----*/
+
+typedef struct libxl__async_exec_state libxl__async_exec_state;
+
+typedef void libxl__async_exec_callback(libxl__egc *egc,
+                        libxl__async_exec_state *aes, int status);
+
+struct libxl__async_exec_state {
+    /* caller must fill these in */
+    libxl__ao *ao;
+    const char *what; /* for error msgs, what we're executing */
+    int timeout_ms;
+    libxl__async_exec_callback *callback;
+    /* caller must fill in; as for libxl__exec */
+    int stdfds[3];
+    char **args; /* execution arguments */
+    char **env; /* execution environment */
+
+    /* private */
+    libxl__ev_time time;
+    libxl__ev_child child;
+};
+
+void libxl__async_exec_init(libxl__async_exec_state *aes);
+int libxl__async_exec_start(libxl__gc *gc, libxl__async_exec_state *aes);
+bool libxl__async_exec_inuse(const libxl__async_exec_state *aes);
+
 /*----- device addition/removal -----*/
 
 typedef struct libxl__ao_device libxl__ao_device;
@@ -2066,14 +2121,13 @@ struct libxl__ao_device {
     libxl__multidev *multidev; /* reference to the containing multidev */
     /* private for add/remove implementation */
     libxl__ev_devstate backend_ds;
-    /* Bodge for Qemu devices, also used for timeout of hotplug execution */
+    /* Bodge for Qemu devices */
     libxl__ev_time timeout;
     /* xenstore watch for backend path of driver domains */
     libxl__ev_xswatch xs_watch;
-    /* device hotplug execution */
-    const char *what;
     int num_exec;
-    libxl__ev_child child;
+    /* for calling hotplug scripts */
+    libxl__async_exec_state aes;
 };
 
 /*
@@ -2737,8 +2791,7 @@ _hidden void libxl__domain_suspend(libxl__egc *egc,
 
 
 /* calls libxl__xc_domain_suspend_done when done */
-_hidden void libxl__xc_domain_save(libxl__egc*, libxl__domain_suspend_state*,
-                                   unsigned long vm_generationid_addr);
+_hidden void libxl__xc_domain_save(libxl__egc*, libxl__domain_suspend_state*);
 /* If rc==0 then retval is the return value from xc_domain_save
  * and errnoval is the errno value it provided.
  * If rc!=0, retval and errnoval are undefined. */
@@ -2762,8 +2815,7 @@ _hidden int libxl__toolstack_save(uint32_t domid, uint8_t **buf,
 /* calls libxl__xc_domain_restore_done when done */
 _hidden void libxl__xc_domain_restore(libxl__egc *egc,
                                       libxl__domain_create_state *dcs,
-                                      int hvm, int pae, int superpages,
-                                      int no_incr_generationid);
+                                      int hvm, int pae, int superpages);
 /* If rc==0 then retval is the return value from xc_domain_save
  * and errnoval is the errno value it provided.
  * If rc!=0, retval and errnoval are undefined. */
@@ -3036,6 +3088,22 @@ void libxl__numa_candidate_put_nodemap(libxl__gc *gc,
     libxl_bitmap_copy(CTX, &cndt->nodemap, nodemap);
 }
 
+_hidden int libxl__ms_vm_genid_set(libxl__gc *gc, uint32_t domid,
+                                   const libxl_ms_vm_genid *id);
+
+
+/* Som handy macros for defbool type. */
+#define LIBXL__DEFBOOL_DEFAULT     (0)
+#define LIBXL__DEFBOOL_FALSE       (-1)
+#define LIBXL__DEFBOOL_TRUE        (1)
+#define LIBXL__DEFBOOL_STR_DEFAULT "<default>"
+#define LIBXL__DEFBOOL_STR_FALSE   "False"
+#define LIBXL__DEFBOOL_STR_TRUE    "True"
+static inline int libxl__defbool_is_default(libxl_defbool *db)
+{
+    return !db->val;
+}
+
 /*
  * Inserts "elm_new" into the sorted list "head".
  *
@@ -3085,6 +3153,71 @@ void libxl__numa_candidate_put_nodemap(libxl__gc *gc,
  */
 #define CTYPE(isfoo,c) (isfoo((unsigned char)(c)))
 
+int libxl__defbool_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                              libxl_defbool *p);
+int libxl__bool_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                           bool *p);
+int libxl__mac_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                          libxl_mac *p);
+int libxl__bitmap_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                             libxl_bitmap *p);
+int libxl__uuid_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                           libxl_uuid *p);
+int libxl__cpuid_policy_list_parse_json(libxl__gc *gc,
+                                        const libxl__json_object *o,
+                                        libxl_cpuid_policy_list *p);
+int libxl__string_list_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                                  libxl_string_list *p);
+int libxl__key_value_list_parse_json(libxl__gc *gc,
+                                     const libxl__json_object *o,
+                                     libxl_key_value_list *p);
+int libxl__hwcap_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                            libxl_hwcap *p);
+int libxl__ms_vm_genid_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                                  libxl_ms_vm_genid *p);
+int libxl__int_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                          void *p);
+int libxl__uint8_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                            void *p);
+int libxl__uint16_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                             void *p);
+int libxl__uint32_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                             void *p);
+int libxl__uint64_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                             void *p);
+int libxl__string_parse_json(libxl__gc *gc, const libxl__json_object *o,
+                             char **p);
+
+int libxl__random_bytes(libxl__gc *gc, uint8_t *buf, size_t len);
+
+/*
+ * Compile time assertion
+ */
+#if __GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6)
+#define BUILD_BUG_ON(p) ({ _Static_assert(!(p), "!(" #p ")"); })
+#else
+#define BUILD_BUG_ON(p) ((void)sizeof(char[1 - 2 * !!(p)]))
+#endif
+#include "_libxl_types_private.h"
+#include "_libxl_types_internal_private.h"
+
+/* This always return false, there's no "default value" for hw cap */
+static inline int libxl__hwcap_is_default(libxl_hwcap *hwcap)
+{
+    return 0;
+}
+
+static inline int libxl__string_list_is_empty(libxl_string_list *psl)
+{
+    return !libxl_string_list_length(psl);
+}
+
+static inline int libxl__key_value_list_is_empty(libxl_key_value_list *pkvl)
+{
+    return !libxl_key_value_list_length(pkvl);
+}
+
+int libxl__cpuid_policy_is_empty(libxl_cpuid_policy_list *pl);
 
 #endif
 

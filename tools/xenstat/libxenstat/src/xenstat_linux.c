@@ -64,14 +64,12 @@ static const char PROCNETDEV_HEADER[] =
 
 /* We need to get the name of the bridge interface for use with bonding interfaces */
 /* Use excludeName parameter to avoid adding bridges we don't care about, eg. virbr0 */
-char *getBridge(char *excludeName)
+void getBridge(char *excludeName, char *result, size_t resultLen)
 {
 	struct dirent *de;
 	DIR *d;
 
-	char tmp[256] = { 0 }, *bridge;
-
-	bridge = (char *)malloc(16 * sizeof(char));
+	char tmp[256] = { 0 };
 
 	d = opendir("/sys/class/net");
 	while ((de = readdir(d)) != NULL) {
@@ -79,14 +77,14 @@ char *getBridge(char *excludeName)
 			&& (strstr(de->d_name, excludeName) == NULL)) {
 				sprintf(tmp, "/sys/class/net/%s/bridge", de->d_name);
 
-				if (access(tmp, F_OK) == 0)
-					bridge = de->d_name;
+				if (access(tmp, F_OK) == 0) {
+					strncpy(result, de->d_name, resultLen - 1);
+					result[resultLen - 1] = 0;
+				}
 		}
 	}
 
 	closedir(d);
-
-	return bridge;
 }
 
 /* parseNetLine provides regular expression based parsing for lines from /proc/net/dev, all the */
@@ -235,6 +233,29 @@ int parseNetDevLine(char *line, char *iface, unsigned long long *rxBytes, unsign
 	return 0;
 }
 
+/* Find out the domid and network number given an interface name.
+ * Return 0 if the iface cannot be recognized as a Xen VIF. */
+static int get_iface_domid_network(const char *iface, unsigned int *domid_p, unsigned int *netid_p)
+{
+	char nodename_path[48];
+	FILE * nodename_file;
+	int ret;
+
+	snprintf(nodename_path, 48, "/sys/class/net/%s/device/nodename", iface);
+	nodename_file = fopen(nodename_path, "r");
+	if (nodename_file != NULL) {
+		ret = fscanf(nodename_file, "backend/vif/%u/%u", domid_p, netid_p);
+		fclose(nodename_file);
+		if (ret == 2)
+			return 1;
+	}
+
+	if (sscanf(iface, "vif%u.%u", domid_p, netid_p) == 2)
+		return 1;
+
+	return 0;
+}
+
 /* Collect information about networks */
 int xenstat_collect_networks(xenstat_node * node)
 {
@@ -279,7 +300,7 @@ int xenstat_collect_networks(xenstat_node * node)
 	      SEEK_SET);
 
 	/* We get the bridge devices for use with bonding interface to get bonding interface stats */
-	snprintf(devBridge, 16, "%s", getBridge("vir"));
+	getBridge("vir", devBridge, sizeof(devBridge));
 	snprintf(devNoBridge, 16, "p%s", devBridge);
 
 	while (fgets(line, 512, priv->procnetdev)) {
@@ -311,8 +332,7 @@ int xenstat_collect_networks(xenstat_node * node)
 			}
 		}
 		else /* Otherwise we need to preserve old behaviour */
-		if (strstr(iface, "vif") != NULL) {
-			sscanf(iface, "vif%u.%u", &domid, &net.id);
+		if (get_iface_domid_network(iface, &domid, &net.id)) {
 
 			net.tbytes = txBytes;
 			net.tpackets = txPackets;

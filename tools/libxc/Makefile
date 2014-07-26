@@ -1,7 +1,7 @@
 XEN_ROOT = $(CURDIR)/../..
 include $(XEN_ROOT)/tools/Rules.mk
 
-MAJOR    = 4.4
+MAJOR    = 4.5
 MINOR    = 0
 
 CTRL_SRCS-y       :=
@@ -36,6 +36,7 @@ CTRL_SRCS-y       += xtl_core.c
 CTRL_SRCS-y       += xtl_logger_stdio.c
 CTRL_SRCS-$(CONFIG_X86) += xc_pagetab.c
 CTRL_SRCS-$(CONFIG_Linux) += xc_linux.c xc_linux_osdep.c
+CTRL_SRCS-$(CONFIG_FreeBSD) += xc_freebsd.c xc_freebsd_osdep.c
 CTRL_SRCS-$(CONFIG_SunOS) += xc_solaris.c
 CTRL_SRCS-$(CONFIG_NetBSD) += xc_netbsd.c
 CTRL_SRCS-$(CONFIG_MiniOS) += xc_minios.c
@@ -104,17 +105,20 @@ GUEST_PIC_OBJS := $(patsubst %.c,%.opic,$(GUEST_SRCS-y))
 OSDEP_LIB_OBJS := $(patsubst %.c,%.o,$(OSDEP_SRCS-y))
 OSDEP_PIC_OBJS := $(patsubst %.c,%.opic,$(OSDEP_SRCS-y))
 
+$(CTRL_LIB_OBJS) $(GUEST_LIB_OBJS) $(OSDEP_LIB_OBJS) \
+$(CTRL_PIC_OBJS) $(GUEST_PIC_OBJS) $(OSDEP_PIC_OBJS) : CFLAGS += -include $(XEN_ROOT)/tools/config.h
+
 LIB := libxenctrl.a
-ifneq ($(stubdom),y)
+ifneq ($(nosharedlibs),y)
 LIB += libxenctrl.so libxenctrl.so.$(MAJOR) libxenctrl.so.$(MAJOR).$(MINOR)
 endif
 
 LIB += libxenguest.a
-ifneq ($(stubdom),y)
+ifneq ($(nosharedlibs),y)
 LIB += libxenguest.so libxenguest.so.$(MAJOR) libxenguest.so.$(MAJOR).$(MINOR)
 endif
 
-ifneq ($(stubdom),y)
+ifneq ($(nosharedlibs),y)
 LIB += xenctrl_osdep_ENOSYS.so
 endif
 
@@ -132,15 +136,15 @@ libs: $(LIB)
 install: build
 	$(INSTALL_DIR) $(DESTDIR)$(LIBDIR)
 	$(INSTALL_DIR) $(DESTDIR)$(INCLUDEDIR)
-	$(INSTALL_PROG) libxenctrl.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
+	$(INSTALL_SHLIB) libxenctrl.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
 	$(INSTALL_DATA) libxenctrl.a $(DESTDIR)$(LIBDIR)
-	ln -sf libxenctrl.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenctrl.so.$(MAJOR)
-	ln -sf libxenctrl.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenctrl.so
+	$(SYMLINK_SHLIB) libxenctrl.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenctrl.so.$(MAJOR)
+	$(SYMLINK_SHLIB) libxenctrl.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenctrl.so
 	$(INSTALL_DATA) xenctrl.h xenctrlosdep.h xentoollog.h $(DESTDIR)$(INCLUDEDIR)
-	$(INSTALL_PROG) libxenguest.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
+	$(INSTALL_SHLIB) libxenguest.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)
 	$(INSTALL_DATA) libxenguest.a $(DESTDIR)$(LIBDIR)
-	ln -sf libxenguest.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenguest.so.$(MAJOR)
-	ln -sf libxenguest.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenguest.so
+	$(SYMLINK_SHLIB) libxenguest.so.$(MAJOR).$(MINOR) $(DESTDIR)$(LIBDIR)/libxenguest.so.$(MAJOR)
+	$(SYMLINK_SHLIB) libxenguest.so.$(MAJOR) $(DESTDIR)$(LIBDIR)/libxenguest.so
 	$(INSTALL_DATA) xenguest.h $(DESTDIR)$(INCLUDEDIR)
 
 .PHONY: TAGS
@@ -170,9 +174,9 @@ libxenctrl.a: $(CTRL_LIB_OBJS)
 	$(AR) rc $@ $^
 
 libxenctrl.so: libxenctrl.so.$(MAJOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 libxenctrl.so.$(MAJOR): libxenctrl.so.$(MAJOR).$(MINOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 libxenctrl.so.$(MAJOR).$(MINOR): $(CTRL_PIC_OBJS)
 	$(CC) $(LDFLAGS) $(PTHREAD_LDFLAGS) -Wl,$(SONAME_LDFLAG) -Wl,libxenctrl.so.$(MAJOR) $(SHLIB_LDFLAGS) -o $@ $^ $(DLOPEN_LIBS) $(PTHREAD_LIBS) $(APPEND_LDFLAGS)
@@ -183,9 +187,9 @@ libxenguest.a: $(GUEST_LIB_OBJS)
 	$(AR) rc $@ $^
 
 libxenguest.so: libxenguest.so.$(MAJOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 libxenguest.so.$(MAJOR): libxenguest.so.$(MAJOR).$(MINOR)
-	ln -sf $< $@
+	$(SYMLINK_SHLIB) $< $@
 
 ifeq ($(CONFIG_MiniOS),y)
 zlib-options =

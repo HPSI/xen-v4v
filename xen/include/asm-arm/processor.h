@@ -251,6 +251,14 @@ extern struct cpuinfo_arm cpu_data[];
 extern u32 __cpu_logical_map[];
 #define cpu_logical_map(cpu) __cpu_logical_map[cpu]
 
+/* HSR data abort size definition */
+enum dabt_size {
+    DABT_BYTE        = 0,
+    DABT_HALF_WORD   = 1,
+    DABT_WORD        = 2,
+    DABT_DOUBLE_WORD = 3,
+};
+
 union hsr {
     uint32_t bits;
     struct {
@@ -267,6 +275,15 @@ union hsr {
         unsigned long len:1;   /* Instruction length */
         unsigned long ec:6;    /* Exception Class */
     } cond;
+
+    struct hsr_wfi_wfe {
+        unsigned long ti:1;    /* Trapped instruction */
+        unsigned long sbzp:19;
+        unsigned long cc:4;    /* Condition Code */
+        unsigned long ccvalid:1;/* CC Valid */
+        unsigned long len:1;   /* Instruction length */
+        unsigned long ec:6;    /* Exception Class */
+    } wfi_wfe;
 
     /* reg, reg0, reg1 are 4 bits on AArch32, the fifth bit is sbzp. */
     struct hsr_cp32 {
@@ -294,6 +311,17 @@ union hsr {
         unsigned long len:1;    /* Instruction length */
         unsigned long ec:6;     /* Exception Class */
     } cp64; /* HSR_EC_CP15_64, HSR_EC_CP14_64 */
+
+     struct hsr_cp {
+        unsigned long coproc:4; /* Number of coproc accessed */
+        unsigned long sbz0p:1;
+        unsigned long tas:1;    /* Trapped Advanced SIMD */
+        unsigned long res0:14;
+        unsigned long cc:4;     /* Condition Code */
+        unsigned long ccvalid:1;/* CC Valid */
+        unsigned long len:1;    /* Instruction length */
+        unsigned long ec:6;     /* Exception Class */
+    } cp; /* HSR_EC_CP */
 
 #ifdef CONFIG_ARM_64
     struct hsr_sysreg {
@@ -473,10 +501,6 @@ void vcpu_regs_hyp_to_user(const struct vcpu *vcpu,
                            struct vcpu_guest_core_regs *regs);
 void vcpu_regs_user_to_hyp(struct vcpu *vcpu,
                            const struct vcpu_guest_core_regs *regs);
-
-struct cpuinfo_x86 {
-    uint32_t pfr32[2];
-};
 
 #endif /* __ASSEMBLY__ */
 #endif /* __ASM_ARM_PROCESSOR_H */

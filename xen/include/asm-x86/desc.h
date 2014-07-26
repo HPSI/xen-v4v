@@ -98,6 +98,14 @@
 
 #ifndef __ASSEMBLY__
 
+/* System Descriptor types for GDT and IDT entries. */
+#define SYS_DESC_ldt          2
+#define SYS_DESC_tss_avail    9
+#define SYS_DESC_tss_busy     11
+#define SYS_DESC_call_gate    12
+#define SYS_DESC_irq_gate     14
+#define SYS_DESC_trap_gate    15
+
 struct desc_struct {
     u32 a, b;
 };
@@ -191,7 +199,6 @@ DECLARE_PER_CPU(struct desc_struct *, gdt_table);
 extern struct desc_struct boot_cpu_compat_gdt_table[];
 DECLARE_PER_CPU(struct desc_struct *, compat_gdt_table);
 
-extern void set_intr_gate(unsigned int irq, void * addr);
 extern void load_TR(void);
 
 #endif /* !__ASSEMBLY__ */

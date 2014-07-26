@@ -449,7 +449,7 @@ int do_mem_event_op(int op, uint32_t domain, void *arg)
     if ( ret )
         return ret;
 
-    ret = xsm_mem_event_op(XSM_TARGET, d, op);
+    ret = xsm_mem_event_op(XSM_DM_PRIV, d, op);
     if ( ret )
         goto out;
 
@@ -538,6 +538,12 @@ int mem_event_domctl(struct domain *d, xen_domctl_mem_event_op_t *mec,
         case XEN_DOMCTL_MEM_EVENT_OP_PAGING_ENABLE:
         {
             struct p2m_domain *p2m = p2m_get_hostp2m(d);
+
+            rc = -EOPNOTSUPP;
+            /* pvh fixme: p2m_is_foreign types need addressing */
+            if ( is_pvh_vcpu(current) || is_pvh_domain(hardware_domain) )
+                break;
+
             rc = -ENODEV;
             /* Only HAP is supported */
             if ( !hap_enabled(d) )
@@ -620,6 +626,11 @@ int mem_event_domctl(struct domain *d, xen_domctl_mem_event_op_t *mec,
         {
         case XEN_DOMCTL_MEM_EVENT_OP_SHARING_ENABLE:
         {
+            rc = -EOPNOTSUPP;
+            /* pvh fixme: p2m_is_foreign types need addressing */
+            if ( is_pvh_vcpu(current) || is_pvh_domain(hardware_domain) )
+                break;
+
             rc = -ENODEV;
             /* Only HAP is supported */
             if ( !hap_enabled(d) )

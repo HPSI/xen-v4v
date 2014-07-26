@@ -43,7 +43,6 @@ void unbind_all_ports(void)
     int cpu = 0;
     shared_info_t *s = HYPERVISOR_shared_info;
     vcpu_info_t   *vcpu_info = &s->vcpu_info[cpu];
-    int rc;
 
     for ( i = 0; i < NR_EVS; i++ )
     {
@@ -53,14 +52,8 @@ void unbind_all_ports(void)
 
         if ( test_and_clear_bit(i, bound_ports) )
         {
-            struct evtchn_close close;
             printk("port %d still bound!\n", i);
-            mask_evtchn(i);
-            close.port = i;
-            rc = HYPERVISOR_event_channel_op(EVTCHNOP_close, &close);
-            if ( rc )
-                printk("WARN: close_port %s failed rc=%d. ignored\n", i, rc);
-            clear_evtchn(i);
+	    unbind_evtchn(i);
         }
     }
     vcpu_info->evtchn_upcall_pending = 0;
@@ -109,24 +102,23 @@ evtchn_port_t bind_evtchn(evtchn_port_t port, evtchn_handler_t handler,
 
 void unbind_evtchn(evtchn_port_t port )
 {
-	struct evtchn_close close;
+    struct evtchn_close close;
     int rc;
 
-	if ( ev_actions[port].handler == default_handler )
-		printk("WARN: No handler for port %d when unbinding\n", port);
-	mask_evtchn(port);
-	clear_evtchn(port);
+    if ( ev_actions[port].handler == default_handler )
+        printk("WARN: No handler for port %d when unbinding\n", port);
+    mask_evtchn(port);
+    clear_evtchn(port);
 
-	ev_actions[port].handler = default_handler;
-	wmb();
-	ev_actions[port].data = NULL;
-	clear_bit(port, bound_ports);
+    ev_actions[port].handler = default_handler;
+    wmb();
+    ev_actions[port].data = NULL;
+    clear_bit(port, bound_ports);
 
-	close.port = port;
-	rc = HYPERVISOR_event_channel_op(EVTCHNOP_close, &close);
+    close.port = port;
+    rc = HYPERVISOR_event_channel_op(EVTCHNOP_close, &close);
     if ( rc )
-        printk("WARN: close_port %s failed rc=%d. ignored\n", port, rc);
-        
+        printk("WARN: close_port %d failed rc=%d. ignored\n", port, rc);
 }
 
 evtchn_port_t bind_virq(uint32_t virq, evtchn_handler_t handler, void *data)
@@ -138,7 +130,8 @@ evtchn_port_t bind_virq(uint32_t virq, evtchn_handler_t handler, void *data)
 	op.virq = virq;
 	op.vcpu = smp_processor_id();
 
-	if ( (rc = HYPERVISOR_event_channel_op(EVTCHNOP_bind_virq, &op)) != 0 )
+	rc = HYPERVISOR_event_channel_op(EVTCHNOP_bind_virq, &op);
+	if (rc != 0)
 	{
 		printk("Failed to bind virtual IRQ %d with rc=%d\n", virq, rc);
 		return -1;
@@ -166,44 +159,29 @@ evtchn_port_t bind_pirq(uint32_t pirq, int will_share,
 	return op.port;
 }
 
-#if defined(__x86_64__)
-char irqstack[2 * STACK_SIZE];
-
-static struct pda
-{
-    int irqcount;       /* offset 0 (used in x86_64.S) */
-    char *irqstackptr;  /*        8 */
-} cpu0_pda;
-#endif
-
 /*
  * Initially all events are without a handler and disabled
  */
 void init_events(void)
 {
     int i;
-#if defined(__x86_64__)
-    asm volatile("movl %0,%%fs ; movl %0,%%gs" :: "r" (0));
-    wrmsrl(0xc0000101, &cpu0_pda); /* 0xc0000101 is MSR_GS_BASE */
-    cpu0_pda.irqcount = -1;
-    cpu0_pda.irqstackptr = (void*) (((unsigned long)irqstack + 2 * STACK_SIZE)
-                                    & ~(STACK_SIZE - 1));
-#endif
+
     /* initialize event handler */
     for ( i = 0; i < NR_EVS; i++ )
 	{
         ev_actions[i].handler = default_handler;
         mask_evtchn(i);
     }
+
+    arch_init_events();
 }
 
 void fini_events(void)
 {
     /* Dealloc all events */
+    arch_unbind_ports();
     unbind_all_ports();
-#if defined(__x86_64__)
-    wrmsrl(0xc0000101, NULL); /* 0xc0000101 is MSR_GS_BASE */
-#endif
+    arch_fini_events();
 }
 
 void default_handler(evtchn_port_t port, struct pt_regs *regs, void *ignore)

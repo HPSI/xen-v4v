@@ -34,16 +34,61 @@
 #include <public/grant_table.h>
 #include <public/hvm/params.h>
 #include <public/hvm/save.h>
+#include <public/hvm/hvm_op.h>
 
 struct hvm_ioreq_page {
-    spinlock_t lock;
+    unsigned long gmfn;
     struct page_info *page;
     void *va;
 };
 
-struct hvm_domain {
+struct hvm_ioreq_vcpu {
+    struct list_head list_entry;
+    struct vcpu      *vcpu;
+    evtchn_port_t    ioreq_evtchn;
+};
+
+#define NR_IO_RANGE_TYPES (HVMOP_IO_RANGE_PCI + 1)
+#define MAX_NR_IO_RANGES  256
+
+struct hvm_ioreq_server {
+    struct list_head       list_entry;
+    struct domain          *domain;
+
+    /* Lock to serialize toolstack modifications */
+    spinlock_t             lock;
+
+    /* Domain id of emulating domain */
+    domid_t                domid;
+    ioservid_t             id;
     struct hvm_ioreq_page  ioreq;
-    struct hvm_ioreq_page  buf_ioreq;
+    struct list_head       ioreq_vcpu_list;
+    struct hvm_ioreq_page  bufioreq;
+
+    /* Lock to serialize access to buffered ioreq ring */
+    spinlock_t             bufioreq_lock;
+    evtchn_port_t          bufioreq_evtchn;
+    struct rangeset        *range[NR_IO_RANGE_TYPES];
+    bool_t                 enabled;
+};
+
+struct hvm_domain {
+    /* Guest page range used for non-default ioreq servers */
+    struct {
+        unsigned long base;
+        unsigned long mask;
+    } ioreq_gmfn;
+
+    /* Lock protects all other values in the sub-struct and the default */
+    struct {
+        spinlock_t       lock;
+        ioservid_t       id;
+        struct list_head list;
+    } ioreq_server;
+    struct hvm_ioreq_server *default_ioreq_server;
+
+    /* Cached CF8 for guest PCI config cycles */
+    uint32_t                pci_cf8;
 
     struct pl_time         pl_time;
 
@@ -106,3 +151,12 @@ struct hvm_domain {
 
 #endif /* __ASM_X86_HVM_DOMAIN_H__ */
 
+/*
+ * Local variables:
+ * mode: C
+ * c-file-style: "BSD"
+ * c-basic-offset: 4
+ * tab-width: 4
+ * indent-tabs-mode: nil
+ * End:
+ */

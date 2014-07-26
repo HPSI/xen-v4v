@@ -52,7 +52,7 @@ def gen_rand_init(ty, v, indent = "    ", parent = None):
             s += "    break;\n"
         s += "}\n"
     elif isinstance(ty, idl.Struct) \
-     and (parent is None or ty.json_fn is None):
+     and (parent is None or ty.json_gen_fn is None):
         for f in [f for f in ty.fields if not f.const]:
             (nparent,fexpr) = ty.member(v, f, parent is None)
             s += gen_rand_init(f.type, fexpr, "", nparent)
@@ -60,7 +60,7 @@ def gen_rand_init(ty, v, indent = "    ", parent = None):
         s += "%s(%s);\n" % (ty.rand_init,
                             ty.pass_arg(v, isref=parent is None,
                                         passby=idl.PASS_BY_REFERENCE))
-    elif ty.typename in ["libxl_uuid", "libxl_mac", "libxl_hwcap"]:
+    elif ty.typename in ["libxl_uuid", "libxl_mac", "libxl_hwcap", "libxl_ms_vm_genid"]:
         s += "rand_bytes((uint8_t *)%s, sizeof(*%s));\n" % (v,v)
     elif ty.typename in ["libxl_domid", "libxl_devid"] or isinstance(ty, idl.Number):
         s += "%s = rand() %% (sizeof(%s)*8);\n" % \
@@ -225,10 +225,11 @@ int main(int argc, char **argv)
 """)
 
     for ty in types:
-        f.write("    %s %s_val;\n" % (ty.typename, ty.typename))
+        f.write("    %s %s_val, %s_val_new;\n" % \
+                (ty.typename, ty.typename, ty.typename))
     f.write("""
     int rc;
-    char *s;
+    char *s, *new_s;
     xentoollog_logger_stdiostream *logger;
     libxl_ctx *ctx;
 
@@ -240,22 +241,75 @@ int main(int argc, char **argv)
         exit(1);
     }
 """)
-    f.write("    printf(\"Testing TYPE_to_json()\\n\");\n")
+    f.write("    printf(\"Testing TYPE_to/from_json()\\n\");\n")
     f.write("    printf(\"----------------------\\n\");\n")
     f.write("    printf(\"\\n\");\n")
-    for ty in [t for t in types if t.json_fn is not None]:
+    for ty in [t for t in types if t.json_gen_fn is not None]:
         arg = ty.typename + "_val"
         f.write("    %s_rand_init(%s);\n" % (ty.typename, \
             ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
+        if not isinstance(ty, idl.Enumeration):
+            f.write("    %s_init(%s_new);\n" % (ty.typename, \
+                ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
         f.write("    s = %s_to_json(ctx, %s);\n" % \
                 (ty.typename, ty.pass_arg(arg, isref=False)))
         f.write("    printf(\"%%s: %%s\\n\", \"%s\", s);\n" % ty.typename)
         f.write("    if (s == NULL) abort();\n")
+        f.write("    rc = %s_from_json(ctx, &%s_val_new, s);\n" % \
+                (ty.typename, ty.typename))
+        f.write("    if (rc) abort();\n")
+        f.write("    new_s = %s_to_json(ctx, %s_new);\n" % \
+                (ty.typename, ty.pass_arg(arg, isref=False)))
+        f.write("    if (new_s == NULL) abort();\n")
+        f.write("    if (strcmp(s, new_s)) {\n")
+        f.write("        printf(\"Huh? Regenerated string different from original string.\\n\");\n")
+        f.write("        printf(\"Regenerated string: %s\\n\", new_s);\n")
+        f.write("        abort();\n")
+        f.write("    }\n")
         f.write("    free(s);\n")
+        f.write("    free(new_s);\n")
         if ty.dispose_fn is not None:
             f.write("    %s(&%s_val);\n" % (ty.dispose_fn, ty.typename))
+            f.write("    %s(&%s_val_new);\n" % (ty.dispose_fn, ty.typename))
         f.write("\n")
 
+    f.write("    printf(\"Testing TYPE_copy()\\n\");\n")
+    f.write("    printf(\"----------------------\\n\");\n")
+    f.write("    printf(\"\\n\");\n")
+    for ty in [t for t in types if t.copy_fn is not None]:
+        f.write("    printf(\"Testing %s_copy, \");\n" % ty.typename)
+        arg = ty.typename + "_val"
+        f.write("    %s_init(%s);\n" % (ty.typename, \
+            ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
+        f.write("    %s_rand_init(%s);\n" % (ty.typename, \
+            ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
+        f.write("    %s_init(%s_new);\n" % (ty.typename, \
+            ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
+        f.write("    %s_copy(ctx, %s_new, %s);\n" % (ty.typename, \
+            ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE), \
+            ty.pass_arg(arg, isref=False, passby=idl.PASS_BY_REFERENCE)))
+        f.write("    s = %s_to_json(ctx, %s);\n" % \
+                (ty.typename, ty.pass_arg(arg, isref=False)))
+        f.write("    if (s == NULL) abort();\n")
+        f.write("    new_s = %s_to_json(ctx, %s_new);\n" % \
+                (ty.typename, ty.pass_arg(arg, isref=False)))
+        f.write("    if (new_s == NULL) abort();\n")
+        f.write("    if (strcmp(s, new_s)) {\n")
+        f.write("        printf(\"Huh? Deep copy for %s failed. Regenerated string different from original string.\\n\");\n" \
+                % ty.typename)
+        f.write("        printf(\"Original string: %s\\n\", s);\n")
+        f.write("        printf(\"Regenerated string: %s\\n\", new_s);\n")
+        f.write("        abort();\n")
+        f.write("    }\n")
+        f.write("    free(s);\n")
+        f.write("    free(new_s);\n")
+        if ty.dispose_fn is not None:
+            f.write("    %s(&%s_val);\n" % (ty.dispose_fn, ty.typename))
+            f.write("    %s(&%s_val_new);\n" % (ty.dispose_fn, ty.typename))
+        f.write("    printf(\"done\\n\");\n")
+        f.write("\n")
+
+    f.write("    printf(\"\\n\");\n")
     f.write("    printf(\"Testing Enumerations\\n\");\n")
     f.write("    printf(\"--------------------\\n\");\n")
     f.write("    printf(\"\\n\");\n")

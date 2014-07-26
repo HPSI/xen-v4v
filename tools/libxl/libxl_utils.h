@@ -23,6 +23,9 @@ unsigned long libxl_get_required_shadow_memory(unsigned long maxmem_kb, unsigned
 int libxl_name_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
 int libxl_domain_qualifier_to_domid(libxl_ctx *ctx, const char *name, uint32_t *domid);
 char *libxl_domid_to_name(libxl_ctx *ctx, uint32_t domid);
+int libxl_cpupool_qualifier_to_cpupoolid(libxl_ctx *ctx, const char *p,
+                                         uint32_t *poolid_r,
+                                         int *was_name_r);
 int libxl_name_to_cpupoolid(libxl_ctx *ctx, const char *name, uint32_t *poolid);
 char *libxl_cpupoolid_to_name(libxl_ctx *ctx, uint32_t poolid);
 int libxl_cpupoolid_is_valid(libxl_ctx *ctx, uint32_t poolid);
@@ -73,6 +76,8 @@ int libxl_devid_to_device_vtpm(libxl_ctx *ctx, uint32_t domid,
 int libxl_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *bitmap, int n_bits);
     /* Allocated bimap is from malloc, libxl_bitmap_dispose() to be
      * called by the application when done. */
+void libxl_bitmap_copy_alloc(libxl_ctx *ctx, libxl_bitmap *dptr,
+                             const libxl_bitmap *sptr);
 void libxl_bitmap_copy(libxl_ctx *ctx, libxl_bitmap *dptr,
                        const libxl_bitmap *sptr);
 int libxl_bitmap_is_full(const libxl_bitmap *bitmap);
@@ -98,6 +103,31 @@ static inline int libxl_bitmap_cpu_valid(libxl_bitmap *bitmap, int bit)
 #define libxl_for_each_set_bit(v, m) for (v = 0; v < (m).size * 8; v++) \
                                              if (libxl_bitmap_test(&(m), v))
 
+/*
+ * Compares two bitmaps bit by bit, up to nr_bits or, if nr_bits is 0, up
+ * to the size of the largest bitmap. If sizes does not match, bits past the
+ * of a bitmap are considered as being 0, which matches with the semantic and
+ * implementation of libxl_bitmap_test I think().
+ *
+ * So, basically, [0,1,0] and [0,1] are considered equal, while [0,1,1] and
+ * [0,1] are different.
+ */
+static inline int libxl_bitmap_equal(const libxl_bitmap *ba,
+                                     const libxl_bitmap *bb,
+                                     int nr_bits)
+{
+    int i;
+
+    if (nr_bits == 0)
+        nr_bits = ba->size > bb->size ? ba->size * 8 : bb->size * 8;
+
+    for (i = 0; i < nr_bits; i++) {
+        if (libxl_bitmap_test(ba, i) != libxl_bitmap_test(bb, i))
+            return 0;
+    }
+    return 1;
+}
+
 int libxl_cpu_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *cpumap, int max_cpus);
 int libxl_node_bitmap_alloc(libxl_ctx *ctx, libxl_bitmap *nodemap,
                             int max_nodes);
@@ -117,6 +147,8 @@ int libxl_cpumap_to_nodemap(libxl_ctx *ctx,
  static inline uint32_t libxl__sizekb_to_mb(uint32_t s) {
     return (s + 1023) / 1024;
 }
+
+void libxl_string_copy(libxl_ctx *ctx, char **dst, char **src);
 
 #endif
 
